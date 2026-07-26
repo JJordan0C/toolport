@@ -161,14 +161,23 @@ impl JobExecutor for BoundedJobExecutor {
             let promise = self.promise_jobs.borrow_mut().pop_front();
             if let Some(job) = promise {
                 self.jobs_run.set(self.jobs_run.get() + 1);
-                job.call(context)?;
+                if let Err(err) = job.call(context) {
+                    // Match SimpleJobExecutor: drop remaining jobs on first failure.
+                    self.clear();
+                    return Err(err);
+                }
+                context.clear_kept_objects();
                 continue;
             }
 
             let generic = self.generic_jobs.borrow_mut().pop_front();
             if let Some(job) = generic {
                 self.jobs_run.set(self.jobs_run.get() + 1);
-                job.call(context)?;
+                if let Err(err) = job.call(context) {
+                    self.clear();
+                    return Err(err);
+                }
+                context.clear_kept_objects();
                 continue;
             }
 
