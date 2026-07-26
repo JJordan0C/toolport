@@ -1953,6 +1953,9 @@ pub struct HttpTransport {
     /// raw token or the authentication failure is surfaced.
     refresh: Option<RefreshFn>,
     server_handler: Option<ServerRequestHandler>,
+    /// Fan `notifications/resources/updated` seen mid-SSE to subscribed
+    /// upstream clients (SOU-394 follow-up for remote downstreams).
+    resource_updated: Option<ResourceUpdatedSink>,
 }
 
 impl HttpTransport {
@@ -1996,7 +1999,14 @@ impl HttpTransport {
             auth,
             refresh,
             server_handler: None,
+            resource_updated: None,
         }
+    }
+
+    /// Wire the gateway sink for `notifications/resources/updated` seen on SSE
+    /// response streams (SOU-394).
+    pub fn set_resource_updated_sink(&mut self, sink: Option<ResourceUpdatedSink>) {
+        self.resource_updated = sink;
     }
 
     /// Answer a server-initiated JSON-RPC request inline (SSE mid-stream or
@@ -2121,6 +2131,14 @@ impl HttpTransport {
                 let Ok(v) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
+                // Resource updates may arrive mid-stream alongside the response
+                // (SOU-394). Fan them out before treating the frame as a result.
+                if let Some(sink) = &self.resource_updated {
+                    if let Some(uri) = resource_updated_uri(data) {
+                        sink(uri);
+                        continue;
+                    }
+                }
                 if self.handle_inline_server_request(&v)? {
                     continue;
                 }

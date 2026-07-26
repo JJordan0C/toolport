@@ -66,12 +66,68 @@ const MAX_RESOURCE_SUBS_PER_SESSION: usize = 256;
 /// Process-wide cap on concurrent resource subscriptions (SOU-394).
 const MAX_RESOURCE_SUBS_TOTAL: usize = 4096;
 
+/// Coordinates concurrent first-subscriber races for one URI.
+struct OpenGate {
+    /// `None` while the leader's downstream subscribe is in flight.
+    result: Mutex<Option<Result<(), String>>>,
+    cv: Condvar,
+}
+
+impl OpenGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            result: Mutex::new(None),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn finish(&self, outcome: Result<(), String>) {
+        let mut guard = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(outcome);
+        self.cv.notify_all();
+    }
+
+    fn wait(&self) -> Result<(), String> {
+        let mut guard = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while guard.is_none() {
+            guard = self
+                .cv
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        match guard.as_ref() {
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) => Err(e.clone()),
+            None => unreachable!("loop exits only when result is set"),
+        }
+    }
+}
+
+/// Outcome of [`ResourceSubscriptionTable::begin_subscribe`].
+enum BeginSubscribe {
+    /// This session already holds the URI (idempotent).
+    AlreadyLocal,
+    /// Session joined an already-open downstream subscription.
+    Joined,
+    /// This session is the first; must open downstream then call finish_open_*.
+    Lead(Arc<OpenGate>),
+    /// Another session is opening; wait on the gate then call begin again.
+    Wait(Arc<OpenGate>),
+}
+
 /// Per-session / per-URI resource subscription tracking for SOU-394.
 ///
 /// Policy: always-on proxy. The gateway advertises `resources.subscribe` and
 /// fails closed when no owner can subscribe (unknown URI, out of scope, or
 /// downstream reject). Downstream subscribe is reference-counted: first
 /// upstream session for a URI opens the downstream sub; last close drops it.
+/// Concurrent first-subscribers single-flight via [`OpenGate`].
 #[derive(Default)]
 struct ResourceSubscriptionTable {
     /// session_id -> subscribed URIs
@@ -80,6 +136,8 @@ struct ResourceSubscriptionTable {
     by_uri: HashMap<String, HashSet<String>>,
     /// uri -> owning downstream server id (set when the first session subscribes)
     uri_owner: HashMap<String, String>,
+    /// uri -> gate while the first downstream subscribe is in flight
+    opening: HashMap<String, Arc<OpenGate>>,
 }
 
 impl ResourceSubscriptionTable {
@@ -87,18 +145,7 @@ impl ResourceSubscriptionTable {
         self.by_uri.values().map(|s| s.len()).sum()
     }
 
-    /// Register local interest. `Ok(true)` when this is the first session for
-    /// `uri` (caller must open the downstream subscription). `Ok(false)` when
-    /// the session was already subscribed or another session already holds it.
-    fn add(&mut self, session: &str, uri: &str, owner: &str) -> Result<bool, String> {
-        if self
-            .by_session
-            .get(session)
-            .is_some_and(|s| s.contains(uri))
-        {
-            // Idempotent re-subscribe for the same session.
-            return Ok(false);
-        }
+    fn check_limits(&self, session: &str) -> Result<(), String> {
         let session_count = self.by_session.get(session).map(|s| s.len()).unwrap_or(0);
         if session_count >= MAX_RESOURCE_SUBS_PER_SESSION {
             return Err(format!(
@@ -110,11 +157,10 @@ impl ResourceSubscriptionTable {
                 "global subscription limit ({MAX_RESOURCE_SUBS_TOTAL}) reached"
             ));
         }
-        let first_global = self
-            .by_uri
-            .get(uri)
-            .map(|s| s.is_empty())
-            .unwrap_or(true);
+        Ok(())
+    }
+
+    fn insert_local(&mut self, session: &str, uri: &str, owner: &str) {
         self.by_session
             .entry(session.to_string())
             .or_default()
@@ -123,11 +169,86 @@ impl ResourceSubscriptionTable {
             .entry(uri.to_string())
             .or_default()
             .insert(session.to_string());
-        if first_global {
-            self.uri_owner
-                .insert(uri.to_string(), owner.to_string());
+        self.uri_owner
+            .entry(uri.to_string())
+            .or_insert_with(|| owner.to_string());
+    }
+
+    /// Register local interest without coordinating an opening race (tests /
+    /// simple paths). `Ok(true)` when this is the first session for `uri`.
+    fn add(&mut self, session: &str, uri: &str, owner: &str) -> Result<bool, String> {
+        if self
+            .by_session
+            .get(session)
+            .is_some_and(|s| s.contains(uri))
+        {
+            return Ok(false);
         }
+        self.check_limits(session)?;
+        let first_global = !self.uri_owner.contains_key(uri);
+        self.insert_local(session, uri, owner);
         Ok(first_global)
+    }
+
+    /// Begin a subscribe with single-flight for the first downstream open.
+    fn begin_subscribe(
+        &mut self,
+        session: &str,
+        uri: &str,
+        owner: &str,
+    ) -> Result<BeginSubscribe, String> {
+        if self
+            .by_session
+            .get(session)
+            .is_some_and(|s| s.contains(uri))
+        {
+            return Ok(BeginSubscribe::AlreadyLocal);
+        }
+        self.check_limits(session)?;
+        if let Some(gate) = self.opening.get(uri) {
+            return Ok(BeginSubscribe::Wait(Arc::clone(gate)));
+        }
+        if self.uri_owner.contains_key(uri) {
+            // Downstream already open for other sessions.
+            self.insert_local(session, uri, owner);
+            return Ok(BeginSubscribe::Joined);
+        }
+        // First global subscriber: claim leadership.
+        let gate = OpenGate::new();
+        self.opening.insert(uri.to_string(), Arc::clone(&gate));
+        self.insert_local(session, uri, owner);
+        Ok(BeginSubscribe::Lead(gate))
+    }
+
+    /// Downstream open succeeded; release waiters.
+    fn finish_open_ok(&mut self, uri: &str, gate: &OpenGate) {
+        self.opening.remove(uri);
+        gate.finish(Ok(()));
+    }
+
+    /// Downstream open failed; drop every local holder for `uri` and release
+    /// waiters with the error so they must retry rather than stay half-subscribed.
+    fn finish_open_err(&mut self, uri: &str, gate: &OpenGate, err: String) {
+        self.clear_uri(uri);
+        self.opening.remove(uri);
+        gate.finish(Err(err));
+    }
+
+    /// After a successful wait, join the now-open subscription.
+    fn join_open(&mut self, session: &str, uri: &str, owner: &str) -> Result<(), String> {
+        if self
+            .by_session
+            .get(session)
+            .is_some_and(|s| s.contains(uri))
+        {
+            return Ok(());
+        }
+        if !self.uri_owner.contains_key(uri) {
+            return Err("downstream resource subscription is not open".to_string());
+        }
+        self.check_limits(session)?;
+        self.insert_local(session, uri, owner);
+        Ok(())
     }
 
     /// Remove one subscription. Returns the owner when this was the last session
@@ -149,6 +270,7 @@ impl ResourceSubscriptionTable {
             sessions.remove(session);
             if sessions.is_empty() {
                 self.by_uri.remove(uri);
+                self.opening.remove(uri);
                 return self.uri_owner.remove(uri);
             }
         }
@@ -167,6 +289,7 @@ impl ResourceSubscriptionTable {
                 sessions.remove(session);
                 if sessions.is_empty() {
                     self.by_uri.remove(&uri);
+                    self.opening.remove(&uri);
                     if let Some(owner) = self.uri_owner.remove(&uri) {
                         need_unsub.push((uri, owner));
                     }
@@ -176,11 +299,50 @@ impl ResourceSubscriptionTable {
         need_unsub
     }
 
+    /// Drop all local state for `uri` (failed open / lost ownership).
+    fn clear_uri(&mut self, uri: &str) {
+        if let Some(sessions) = self.by_uri.remove(uri) {
+            for sid in sessions {
+                if let Some(set) = self.by_session.get_mut(&sid) {
+                    set.remove(uri);
+                    if set.is_empty() {
+                        self.by_session.remove(&sid);
+                    }
+                }
+            }
+        }
+        self.uri_owner.remove(uri);
+        self.opening.remove(uri);
+    }
+
     fn sessions_for_uri(&self, uri: &str) -> Vec<String> {
         self.by_uri
             .get(uri)
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Every tracked `(uri, owner)` pair for re-subscribe after rebuild.
+    fn tracked_uri_owners(&self) -> Vec<(String, String)> {
+        self.uri_owner
+            .iter()
+            .map(|(u, o)| (u.clone(), o.clone()))
+            .collect()
+    }
+
+    /// URIs currently tracked for a given owner server id (reconnect path).
+    fn uris_for_owner(&self, owner: &str) -> Vec<String> {
+        self.uri_owner
+            .iter()
+            .filter(|(_, o)| o.as_str() == owner)
+            .map(|(u, _)| u.clone())
+            .collect()
+    }
+
+    fn set_owner(&mut self, uri: &str, owner: &str) {
+        if self.uri_owner.contains_key(uri) {
+            self.uri_owner.insert(uri.to_string(), owner.to_string());
+        }
     }
 }
 
@@ -4033,6 +4195,8 @@ fn build_router(
     root: Option<&str>,
     // Optional sink for downstream `notifications/resources/updated` (SOU-394).
     resource_updated: Option<ResourceUpdatedSink>,
+    // Live subscription table so reconnect factories re-issue resources/subscribe.
+    resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
 ) -> Router {
     // In HTTP mode one process serves every registered client, so connect the
     // union of all their profiles (per-request filtering scopes each one down).
@@ -4140,17 +4304,24 @@ fn build_router(
         if let Ok((server, dirty, resource_updated, Some(ds))) = handle.join() {
             // The same `connect_one` used for the initial spawn is the reconnect
             // factory, so a re-spawn re-injects keychain secrets and re-handshakes
-            // exactly like a fresh connect.
+            // exactly like a fresh connect, then re-issues resource subscriptions
+            // this server still owns.
             let handler = Arc::clone(&server_handler);
             let root_c = root_owned.clone();
+            let subs = resource_subs.clone();
+            let server_id = server.id.clone();
             let reconnect: Reconnect = Box::new(move || {
-                connect_one(
+                let mut ds = connect_one(
                     &server,
                     &dirty,
                     Arc::clone(&handler),
                     root_c.as_deref(),
                     resource_updated.clone(),
-                )
+                )?;
+                if let Some(ref table) = subs {
+                    resubscribe_server_resources(&mut ds, &server_id, table);
+                }
+                Some(ds)
             });
             router.add_with_reconnect(ds, Some(reconnect));
         }
@@ -4212,7 +4383,11 @@ fn connect_one(
             Err(e) => Err(e),
         }
     } else if server.url.is_some() {
-        remote::connect_remote_with_handler(server, Some(Arc::clone(&server_handler)))
+        remote::connect_remote_with_handler(
+            server,
+            Some(Arc::clone(&server_handler)),
+            resource_updated,
+        )
     } else {
         Err("no command or url".to_string())
     };
@@ -4373,7 +4548,9 @@ fn active_resource_session_id() -> String {
 }
 
 /// Handle `resources/subscribe` / `resources/unsubscribe` with ownership routing,
-/// HTTP scope, and fail-closed downstream proxying (SOU-394).
+/// HTTP scope, and fail-closed downstream proxying (SOU-394). Concurrent first
+/// subscribers single-flight so followers never report success without an open
+/// downstream sub.
 fn handle_resource_subscription(
     state: &GatewayState,
     router: &Router,
@@ -4413,36 +4590,69 @@ fn handle_resource_subscription(
     let session = active_resource_session_id();
     match method {
         "resources/subscribe" => {
-            let first = {
-                let mut table = state
-                    .resource_subs
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match table.add(&session, uri, &owner) {
-                    Ok(first) => first,
-                    Err(e) => return Some(error(id, -32602, &format!("Toolport: {e}"))),
-                }
-            };
-            if first {
-                if let Err(e) = router.subscribe_resource(uri) {
-                    // Fail closed: roll back local tracking when the owner cannot
-                    // open a real subscription.
+            // Single-flight loop: leaders open downstream; waiters re-enter after
+            // the gate resolves so they either join or see a fail-closed error.
+            loop {
+                let begin = {
                     let mut table = state
                         .resource_subs
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let _ = table.remove(&session, uri);
-                    return Some(error(
-                        id,
-                        -32602,
-                        &format!(
-                            "Toolport: {}",
-                            integrity::defend_error_text(uri, &e)
-                        ),
-                    ));
+                    match table.begin_subscribe(&session, uri, &owner) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return Some(error(id, -32602, &format!("Toolport: {e}")));
+                        }
+                    }
+                };
+                match begin {
+                    BeginSubscribe::AlreadyLocal | BeginSubscribe::Joined => {
+                        return Some(success(id, json!({})));
+                    }
+                    BeginSubscribe::Lead(gate) => {
+                        match router.subscribe_resource(uri) {
+                            Ok(_) => {
+                                let mut table = state
+                                    .resource_subs
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                table.finish_open_ok(uri, &gate);
+                                return Some(success(id, json!({})));
+                            }
+                            Err(e) => {
+                                let msg = integrity::defend_error_text(uri, &e);
+                                let mut table = state
+                                    .resource_subs
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                table.finish_open_err(uri, &gate, msg.clone());
+                                return Some(error(
+                                    id,
+                                    -32602,
+                                    &format!("Toolport: {msg}"),
+                                ));
+                            }
+                        }
+                    }
+                    BeginSubscribe::Wait(gate) => match gate.wait() {
+                        Ok(()) => {
+                            let mut table = state
+                                .resource_subs
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            match table.join_open(&session, uri, &owner) {
+                                Ok(()) => return Some(success(id, json!({}))),
+                                Err(e) => {
+                                    return Some(error(id, -32602, &format!("Toolport: {e}")));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return Some(error(id, -32602, &format!("Toolport: {e}")));
+                        }
+                    },
                 }
             }
-            Some(success(id, json!({})))
         }
         "resources/unsubscribe" => {
             let last_owner = {
@@ -4465,6 +4675,75 @@ fn handle_resource_subscription(
             Some(success(id, json!({})))
         }
         _ => Some(error(id, -32601, &format!("Method not found: {method}"))),
+    }
+}
+
+/// Re-issue `resources/subscribe` for every tracked URI against a live router
+/// (after full rebuild). Fail closed per URI: drop local tracking when the
+/// owner is gone or the downstream rejects the re-subscribe.
+fn reestablish_all_resource_subscriptions(
+    router: &Router,
+    subs: &Arc<Mutex<ResourceSubscriptionTable>>,
+) {
+    let tracked = {
+        let table = subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        table.tracked_uri_owners()
+    };
+    if tracked.is_empty() {
+        return;
+    }
+    for (uri, old_owner) in tracked {
+        match router.resource_server(&uri) {
+            Some(owner) => {
+                if owner != old_owner {
+                    let mut table = subs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    table.set_owner(&uri, owner);
+                }
+                if let Err(e) = router.subscribe_resource(&uri) {
+                    eprintln!(
+                        "toolport: re-subscribe '{uri}' after rebuild failed: {e}; dropping local holders"
+                    );
+                    let mut table = subs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    table.clear_uri(&uri);
+                }
+            }
+            None => {
+                eprintln!(
+                    "toolport: resource '{uri}' no longer owned after rebuild; dropping subscriptions"
+                );
+                let mut table = subs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                table.clear_uri(&uri);
+            }
+        }
+    }
+}
+
+/// After reconnecting one downstream, re-subscribe URIs that server owns.
+fn resubscribe_server_resources(
+    ds: &mut DownstreamServer,
+    server_id: &str,
+    subs: &Arc<Mutex<ResourceSubscriptionTable>>,
+) {
+    let uris = {
+        let table = subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        table.uris_for_owner(server_id)
+    };
+    for uri in uris {
+        if let Err(e) = ds.subscribe_resource(&uri) {
+            eprintln!(
+                "toolport: re-subscribe '{uri}' on '{server_id}' after reconnect failed: {e}"
+            );
+        }
     }
 }
 
@@ -4914,6 +5193,8 @@ fn watch_registry(
     mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
     // Resource-updated sink re-wired into rebuilds after registry reload (SOU-394).
     resource_updated: Option<ResourceUpdatedSink>,
+    // Subscription table so rebuilds re-issue resources/subscribe.
+    resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
 ) {
     eprintln!("toolport: watching registry at {}", path.display());
     let mut state = WatchLoopState {
@@ -4943,6 +5224,7 @@ fn watch_registry(
             &client_root,
             Some(&mcp_sessions),
             resource_updated.as_ref(),
+            resource_subs.as_ref(),
             &mut state,
         );
     }
@@ -4970,6 +5252,7 @@ fn watch_tick(
     client_root: &Arc<Mutex<Option<String>>>,
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
     resource_updated: Option<&ResourceUpdatedSink>,
+    resource_subs: Option<&Arc<Mutex<ResourceSubscriptionTable>>>,
     state: &mut WatchLoopState,
 ) -> TickOutcome {
     // Re-approving a tool rewrites quarantine.json, which is NOT the registry file
@@ -5074,7 +5357,12 @@ fn watch_tick(
             Arc::clone(server_handler),
             root.as_deref(),
             resource_updated.cloned(),
+            resource_subs.cloned(),
         );
+        // Re-issue tracked resource subscriptions against the fresh connections.
+        if let Some(subs) = resource_subs {
+            reestablish_all_resource_subscriptions(&new_router, subs);
+        }
         let server_count = new_router.server_count();
         let tools = new_router.aggregated_tools();
         *registry
@@ -5856,7 +6144,9 @@ fn rebuild_router_for_root(state: &GatewayState) {
         Arc::clone(&state.server_handler),
         root.as_deref(),
         state.resource_updated_sink.clone(),
+        Some(Arc::clone(&state.resource_subs)),
     );
+    reestablish_all_resource_subscriptions(&new_router, &state.resource_subs);
     let tools = new_router.aggregated_tools();
     *state
         .router
@@ -6088,8 +6378,10 @@ fn process_request(
                 Arc::clone(&state.server_handler),
                 root.as_deref(),
                 state.resource_updated_sink.clone(),
+                Some(Arc::clone(&state.resource_subs)),
             );
             if built.server_count() > 0 {
+                reestablish_all_resource_subscriptions(&built, &state.resource_subs);
                 let tools = built.aggregated_tools();
                 *state
                     .router
@@ -8164,6 +8456,7 @@ fn main() {
         let rebuild_lock = Arc::clone(&rebuild_lock);
         let mcp_sessions = Arc::clone(&mcp_sessions);
         let resource_updated = resource_updated_sink.clone();
+        let resource_subs_for_build = Arc::clone(&resource_subs);
         std::thread::spawn(move || {
             let reg = registry
                 .lock()
@@ -8191,6 +8484,9 @@ fn main() {
                 server_handler,
                 root.as_deref(),
                 resource_updated,
+                // Cold start: no upstream clients yet; reconnect factories still
+                // capture the shared table for later re-subscribes.
+                Some(resource_subs_for_build),
             );
             let tools = built.aggregated_tools();
             glog(&format!(
@@ -8231,6 +8527,7 @@ fn main() {
         let client_root = Arc::clone(&client_root);
         let mcp_sessions = Arc::clone(&mcp_sessions);
         let resource_updated = resource_updated_sink.clone();
+        let resource_subs_watch = Arc::clone(&resource_subs);
         std::thread::spawn(move || {
             watch_registry(
                 path,
@@ -8247,6 +8544,7 @@ fn main() {
                 client_root,
                 mcp_sessions,
                 resource_updated,
+                Some(resource_subs_watch),
             )
         });
     }
@@ -11000,6 +11298,66 @@ mod tests {
     }
 
     #[test]
+    fn resource_subscription_begin_subscribe_single_flights_first_open() {
+        let mut table = ResourceSubscriptionTable::default();
+        let lead = match table
+            .begin_subscribe("s1", "file://x", "alpha")
+            .expect("lead")
+        {
+            BeginSubscribe::Lead(g) => g,
+            _ => panic!("expected Lead, got non-lead"),
+        };
+        // Concurrent second session must wait, not join as if already open.
+        match table
+            .begin_subscribe("s2", "file://x", "alpha")
+            .expect("wait")
+        {
+            BeginSubscribe::Wait(g) => assert!(Arc::ptr_eq(&lead, &g)),
+            _ => panic!("expected Wait while leader opens"),
+        }
+        // Leader succeeds: waiters may join.
+        table.finish_open_ok("file://x", &lead);
+        table
+            .join_open("s2", "file://x", "alpha")
+            .expect("join after open");
+        assert_eq!(table.sessions_for_uri("file://x").len(), 2);
+
+        // Failed open clears everyone and surfaces the error to waiters.
+        let mut table2 = ResourceSubscriptionTable::default();
+        let lead2 = match table2
+            .begin_subscribe("a", "file://y", "beta")
+            .expect("lead2")
+        {
+            BeginSubscribe::Lead(g) => g,
+            _ => panic!("expected Lead"),
+        };
+        let wait_gate = match table2
+            .begin_subscribe("b", "file://y", "beta")
+            .expect("wait2")
+        {
+            BeginSubscribe::Wait(g) => g,
+            _ => panic!("expected Wait"),
+        };
+        table2.finish_open_err("file://y", &lead2, "downstream refused".into());
+        assert!(table2.sessions_for_uri("file://y").is_empty());
+        assert_eq!(wait_gate.wait().unwrap_err(), "downstream refused");
+    }
+
+    #[test]
+    fn resource_subscription_tracked_uris_and_clear() {
+        let mut table = ResourceSubscriptionTable::default();
+        table.add("s1", "file://a", "alpha").unwrap();
+        table.add("s1", "file://b", "alpha").unwrap();
+        table.add("s2", "file://a", "alpha").unwrap();
+        let tracked = table.tracked_uri_owners();
+        assert_eq!(tracked.len(), 2);
+        assert_eq!(table.uris_for_owner("alpha").len(), 2);
+        table.clear_uri("file://a");
+        assert!(table.sessions_for_uri("file://a").is_empty());
+        assert_eq!(table.sessions_for_uri("file://b").len(), 1);
+    }
+
+    #[test]
     fn deliver_resource_updated_reaches_only_subscribed_http_sessions() {
         let state = http_state(false);
         let s1 = match mint_mcp_session(&state, None) {
@@ -11494,6 +11852,7 @@ mod tests {
             &client_root,
             None,
             None,
+            None,
             &mut state,
         );
         assert!(
@@ -11522,6 +11881,7 @@ mod tests {
             &client_root,
             None,
             None,
+            None,
             &mut state,
         );
         assert!(steady.idle_after_quarantine);
@@ -11542,6 +11902,7 @@ mod tests {
             &downstream_dirty,
             &server_handler,
             &client_root,
+            None,
             None,
             None,
             &mut state,
