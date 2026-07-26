@@ -1118,13 +1118,28 @@ impl Router {
         self.call_with_retry(&slot, |server| server.subscribe_resource(uri))
     }
 
-    /// Unsubscribe from resource-updated notifications on the owning downstream.
+    /// Unsubscribe from resource-updated notifications on the owning downstream
+    /// (resolved from current aggregation). Prefer
+    /// [`unsubscribe_resource_on_server`] when the original owner was recorded
+    /// at subscribe time so rebuild ownership drift cannot redirect the unsub.
     pub fn unsubscribe_resource(&self, uri: &str) -> Result<Value, String> {
         let server_id = self
             .resource_server(uri)
             .ok_or_else(|| format!("no server owns resource '{uri}'"))?
             .to_string();
-        let slot = self.slot_for(&server_id)?;
+        self.unsubscribe_resource_on_server(&server_id, uri)
+    }
+
+    /// Unsubscribe on a specific downstream server id (the owner recorded when
+    /// the first upstream client subscribed). Used for session cleanup and
+    /// last-holder unsub so a later ownership change cannot leave a live sub
+    /// on the original server or hit the wrong one.
+    pub fn unsubscribe_resource_on_server(
+        &self,
+        server_id: &str,
+        uri: &str,
+    ) -> Result<Value, String> {
+        let slot = self.slot_for(server_id)?;
         self.call_with_retry(&slot, |server| server.unsubscribe_resource(uri))
     }
 
@@ -1939,6 +1954,16 @@ mod tests {
         assert_eq!(sub["via"], "postgres");
         let unsub = router.unsubscribe_resource("postgres://item/42").unwrap();
         assert_eq!(unsub["via"], "postgres");
+        // Owner-pinned unsub (recorded at subscribe time) hits that server even
+        // without re-resolving the URI.
+        let unsub_on = router
+            .unsubscribe_resource_on_server("postgres", "postgres://item/42")
+            .unwrap();
+        assert_eq!(unsub_on["via"], "postgres");
+        // Unknown server id fails closed.
+        assert!(router
+            .unsubscribe_resource_on_server("no-such-server", "postgres://item/42")
+            .is_err());
     }
 
     #[test]

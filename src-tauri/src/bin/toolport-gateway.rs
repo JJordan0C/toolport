@@ -4667,12 +4667,14 @@ fn handle_resource_subscription(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 table.remove(&session, uri)
             };
-            if let Some(_owner) = last_owner {
+            if let Some(owner) = last_owner {
                 // Best-effort: local bookkeeping already dropped; a downstream
                 // unsubscribe failure must not leave the client stuck subscribed.
-                if let Err(e) = router.unsubscribe_resource(uri) {
+                // Use the owner recorded at subscribe time so rebuild ownership
+                // drift cannot redirect the unsub to a different server.
+                if let Err(e) = router.unsubscribe_resource_on_server(&owner, uri) {
                     eprintln!(
-                        "toolport: downstream resources/unsubscribe failed for '{uri}': {e}"
+                        "toolport: downstream resources/unsubscribe failed for '{uri}' on '{owner}': {e}"
                     );
                 }
             }
@@ -4732,6 +4734,9 @@ fn reestablish_all_resource_subscriptions(
 }
 
 /// After reconnecting one downstream, re-subscribe URIs that server owns.
+/// Fail closed: if the fresh connection rejects a re-subscribe, drop local
+/// holders for that URI so clients are not left half-subscribed (asymmetric
+/// with rebuild until this path cleared tracking on error).
 fn resubscribe_server_resources(
     ds: &mut DownstreamServer,
     server_id: &str,
@@ -4746,13 +4751,18 @@ fn resubscribe_server_resources(
     for uri in uris {
         if let Err(e) = ds.subscribe_resource(&uri) {
             eprintln!(
-                "toolport: re-subscribe '{uri}' on '{server_id}' after reconnect failed: {e}"
+                "toolport: re-subscribe '{uri}' on '{server_id}' after reconnect failed: {e}; dropping local holders"
             );
+            let mut table = subs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            table.clear_uri(&uri);
         }
     }
 }
 
 /// Best-effort downstream unsubscribes after a session disconnect (SOU-394).
+/// Uses the owner recorded at subscribe time, not live URI re-resolution.
 fn cleanup_resource_subs_for_session(state: &GatewayState, session: &str) {
     let need_unsub = {
         let mut table = state
@@ -4769,10 +4779,10 @@ fn cleanup_resource_subs_for_session(state: &GatewayState, session: &str) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    for (uri, _owner) in need_unsub {
-        if let Err(e) = router.unsubscribe_resource(&uri) {
+    for (uri, owner) in need_unsub {
+        if let Err(e) = router.unsubscribe_resource_on_server(&owner, &uri) {
             eprintln!(
-                "toolport: cleanup resources/unsubscribe failed for '{uri}': {e}"
+                "toolport: cleanup resources/unsubscribe failed for '{uri}' on '{owner}': {e}"
             );
         }
     }
@@ -11417,6 +11427,35 @@ mod tests {
         table.clear_uri("file://a");
         assert!(table.sessions_for_uri("file://a").is_empty());
         assert_eq!(table.sessions_for_uri("file://b").len(), 1);
+    }
+
+    #[test]
+    fn resource_subscription_remove_returns_recorded_owner_not_current_route() {
+        // Last-holder unsub must hand back the owner stored at subscribe time
+        // so cleanup can target that server even if aggregation ownership drifts.
+        let mut table = ResourceSubscriptionTable::default();
+        table.add("s1", "file://x", "alpha").unwrap();
+        table.set_owner("file://x", "alpha");
+        assert_eq!(table.remove("s1", "file://x").as_deref(), Some("alpha"));
+        // Drop session returns (uri, owner) pairs for owner-aware unsub.
+        table.add("http-1", "file://y", "beta").unwrap();
+        table.add("http-1", "file://z", "gamma").unwrap();
+        let dropped = table.drop_session("http-1");
+        assert!(dropped.contains(&("file://y".into(), "beta".into())));
+        assert!(dropped.contains(&("file://z".into(), "gamma".into())));
+    }
+
+    #[test]
+    fn resubscribe_failure_clears_local_holders_like_rebuild() {
+        // Mirrors resubscribe_server_resources fail-closed: after a failed
+        // re-subscribe the URI must not remain tracked.
+        let mut table = ResourceSubscriptionTable::default();
+        table.add("s1", "file://a", "srv").unwrap();
+        table.add("s2", "file://a", "srv").unwrap();
+        assert_eq!(table.sessions_for_uri("file://a").len(), 2);
+        table.clear_uri("file://a");
+        assert!(table.sessions_for_uri("file://a").is_empty());
+        assert!(table.uris_for_owner("srv").is_empty());
     }
 
     #[test]
