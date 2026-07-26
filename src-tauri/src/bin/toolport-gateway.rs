@@ -544,20 +544,21 @@ fn run_script_tool_def() -> Value {
         "name": "toolport_run_script",
         "description": "Run ONE JavaScript orchestration script server-side instead of making \
             many separate tool calls. Inside the script, call downstream tools with \
-            `toolport.call(name, args)` (name = the exact tool name from toolport_search_tools, \
-            args = its arguments object); it returns that tool's result as a value. Loop, branch, \
-            and combine results, then `return` a single aggregated value - only the returned value \
-            comes back, so intermediate results never fill your context and a multi-step task \
-            costs one round-trip. Each call still passes the same gates as toolport_call_tool \
-            (scope, human approval). Synchronous: call tools one after another (no await / \
-            Promises). Best when you already know the steps; use toolport_search_tools + \
-            toolport_call_tool while you are still exploring.",
+            `toolport.call(name, args)` (sync) or `toolport.callAsync(name, args)` (Promise; \
+            fan out with `Promise.all` / `await`, bounded parallel host calls). \
+            `toolport.callAll([{name, args}, ...])` is Promise.all sugar. \
+            name = the exact tool name from toolport_search_tools; args = its arguments object. \
+            Loop, branch, and combine results, then `return` a single aggregated value - only the \
+            returned value comes back, so intermediate results never fill your context and a \
+            multi-step task costs one round-trip. Top-level `await` works. Each call still passes \
+            the same gates as toolport_call_tool (scope, human approval). Best when you already \
+            know the steps; use toolport_search_tools + toolport_call_tool while exploring.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "script": {
                     "type": "string",
-                    "description": "JavaScript body. Call tools with toolport.call(name, args) and `return` the final value. The optional `data` payload below is available as the global `data`."
+                    "description": "JavaScript body. Use toolport.call / callAsync / callAll and `return` the final value (top-level await ok). The optional `data` payload below is available as the global `data`."
                 },
                 "data": {
                     "type": "object",
@@ -3266,8 +3267,9 @@ fn run_script_dispatch(
     let allowed_owned = allowed.cloned();
     let cancel_owned = cancel;
 
-    let call: std::rc::Rc<dyn Fn(&str, Value) -> Value> =
-        std::rc::Rc::new(move |name: &str, args: Value| {
+    // Arc + Send + Sync so independent callAsync work can run on a small host thread pool.
+    let call: codemode::CallBinding =
+        Arc::new(move |name: &str, args: Value| {
             execute_call(
                 &reg_owned,
                 &router_owned,
