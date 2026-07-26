@@ -3226,6 +3226,11 @@ fn defend_and_shape(
 
 /// Exposed tool names for code-mode `servers.*` stubs: full catalog minus gateway
 /// meta-tools, optionally filtered to the client's allowed server prefixes.
+///
+/// Scope matching uses [`server_in_allowed_scope`] (SOU-327) so hyphenated server ids
+/// sanitize the same way as `execute_call` / tools-list filtering. Bare names (no
+/// `server__tool` separator) are dropped: they cannot become `servers.*` stubs and must
+/// not appear in `listTools` as if they were catalog entries.
 fn script_catalog_tools(
     cached: &[Value],
     allowed: Option<&std::collections::HashSet<String>>,
@@ -3235,13 +3240,14 @@ fn script_catalog_tools(
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
         .filter(|n| !codemode::is_code_mode_meta_tool(n))
         .filter(|n| {
-            let Some(set) = allowed else {
-                return true;
+            let Some((server, tool)) = codemode::split_exposed_name(n) else {
+                return false;
             };
-            match codemode::split_exposed_name(n) {
-                Some((server, _)) => set.contains(server),
-                // No `server__tool` shape: still allow through so string-form call works;
-                // stubs simply won't group it under servers.*.
+            if server.is_empty() || tool.is_empty() {
+                return false;
+            }
+            match allowed {
+                Some(set) => server_in_allowed_scope(server, set),
                 None => true,
             }
         })
@@ -9299,6 +9305,7 @@ mod tests {
             json!({ "name": "s__big" }),
             json!({ "name": "other__thing" }),
             json!({ "name": "toolport_status" }),
+            json!({ "name": "bare_override" }), // no server__tool shape
         ];
         let args = json!({
             "script": "return { \
@@ -9323,6 +9330,31 @@ mod tests {
         assert_eq!(v["tools"], json!(["other__thing"]));
         assert_eq!(v["hasS"], json!("undefined"));
         assert_eq!(v["hasOther"], json!("object"));
+    }
+
+    /// SOU-327 / CodeRabbit #481: catalog scope must sanitize like tools-list filtering.
+    /// Allowed stores sanitize_segment form; raw or already-sanitized server segments match.
+    #[test]
+    fn script_catalog_tools_uses_server_in_allowed_scope() {
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("file_system".to_string());
+        let cached = vec![
+            json!({ "name": "file_system__read" }),
+            json!({ "name": "other__tool" }),
+            json!({ "name": "toolport_call_tool" }),
+            json!({ "name": "no_separator" }),
+        ];
+        let names = script_catalog_tools(&cached, Some(&allowed));
+        assert_eq!(names, vec!["file_system__read".to_string()]);
+        // Unscoped sees every namespaced non-meta tool, still drops bare + meta.
+        let all = script_catalog_tools(&cached, None);
+        assert_eq!(
+            all,
+            vec![
+                "file_system__read".to_string(),
+                "other__tool".to_string(),
+            ]
+        );
     }
 
     /// End-to-end: a typed stub routes through execute_call like toolport.call.

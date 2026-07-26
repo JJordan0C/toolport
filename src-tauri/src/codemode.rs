@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use boa_engine::builtins::promise::{PromiseState, ResolvingFunctions};
+use boa_engine::job::{GenericJob, Job, JobExecutor, PromiseJob};
 use boa_engine::object::builtins::JsPromise;
 use boa_engine::property::Attribute;
 use boa_engine::{
@@ -57,6 +58,9 @@ pub struct Limits {
     pub wall_clock: Duration,
     /// Max concurrent host tool calls when scripts fan out with `callAsync` / `Promise.all`.
     pub max_parallel: usize,
+    /// Max promise/microtask jobs drained during one script (bounds a self-requeuing
+    /// `Promise.resolve().then(loop)` chain that would otherwise pin `run_jobs` forever).
+    pub max_promise_jobs: usize,
     /// Max total loop iterations across the script (boa runtime limit); bounds a pure-JS
     /// `while(true){}` that never calls a tool.
     pub loop_iteration_limit: u64,
@@ -70,9 +74,115 @@ impl Default for Limits {
             max_calls: 64,
             wall_clock: Duration::from_secs(60),
             max_parallel: 8,
+            max_promise_jobs: 100_000,
             loop_iteration_limit: 10_000_000,
             recursion_limit: 400,
         }
+    }
+}
+
+/// Job executor that drains promise/generic jobs with wall-clock + job-count caps.
+///
+/// Default boa `SimpleJobExecutor` runs until the queue is empty, so a malicious or buggy
+/// script that keeps enqueueing microtasks can pin the gateway thread past the script
+/// wall-clock (CodeRabbit #480). This executor checks the deadline between jobs.
+struct BoundedJobExecutor {
+    promise_jobs: RefCell<VecDeque<PromiseJob>>,
+    generic_jobs: RefCell<VecDeque<GenericJob>>,
+    /// Async/timeout jobs are rare in code-mode scripts; we refuse them fail-closed rather
+    /// than reimplement boa's full async drain (keeps this executor small and deadline-safe).
+    rejected_unsupported: Cell<bool>,
+    deadline: Instant,
+    max_jobs: usize,
+    jobs_run: Cell<usize>,
+}
+
+impl BoundedJobExecutor {
+    fn new(deadline: Instant, max_jobs: usize) -> Self {
+        Self {
+            promise_jobs: RefCell::new(VecDeque::new()),
+            generic_jobs: RefCell::new(VecDeque::new()),
+            rejected_unsupported: Cell::new(false),
+            deadline,
+            max_jobs: max_jobs.max(1),
+            jobs_run: Cell::new(0),
+        }
+    }
+
+    fn clear(&self) {
+        self.promise_jobs.borrow_mut().clear();
+        self.generic_jobs.borrow_mut().clear();
+    }
+
+    fn check_budget(&self) -> Result<(), JsError> {
+        if Instant::now() >= self.deadline {
+            self.clear();
+            return Err(JsError::from_native(JsNativeError::error().with_message(
+                "toolport script wall-clock deadline exceeded during promise jobs",
+            )));
+        }
+        if self.jobs_run.get() >= self.max_jobs {
+            self.clear();
+            return Err(JsError::from_native(JsNativeError::error().with_message(
+                format!(
+                    "toolport script promise-job budget exceeded ({} jobs)",
+                    self.max_jobs
+                ),
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl JobExecutor for BoundedJobExecutor {
+    fn enqueue_job(self: Rc<Self>, job: Job, _context: &mut Context) {
+        match job {
+            Job::PromiseJob(p) => self.promise_jobs.borrow_mut().push_back(p),
+            Job::GenericJob(g) => self.generic_jobs.borrow_mut().push_back(g),
+            // Async/timer (and any future Job variants): code mode does not host timers;
+            // refuse rather than hang the drain loop.
+            Job::AsyncJob(_) | Job::TimeoutJob(_) | _ => {
+                self.rejected_unsupported.set(true);
+            }
+        }
+    }
+
+    fn run_jobs(self: Rc<Self>, context: &mut Context) -> Result<(), JsError> {
+        if self.rejected_unsupported.get() {
+            self.clear();
+            return Err(JsError::from_native(JsNativeError::error().with_message(
+                "toolport script used unsupported async/timer jobs inside code mode",
+            )));
+        }
+
+        loop {
+            self.check_budget()?;
+
+            let promise = self.promise_jobs.borrow_mut().pop_front();
+            if let Some(job) = promise {
+                self.jobs_run.set(self.jobs_run.get() + 1);
+                job.call(context)?;
+                continue;
+            }
+
+            let generic = self.generic_jobs.borrow_mut().pop_front();
+            if let Some(job) = generic {
+                self.jobs_run.set(self.jobs_run.get() + 1);
+                job.call(context)?;
+                continue;
+            }
+
+            break;
+        }
+
+        if self.rejected_unsupported.get() {
+            self.clear();
+            return Err(JsError::from_native(JsNativeError::error().with_message(
+                "toolport script used unsupported async/timer jobs inside code mode",
+            )));
+        }
+
+        Ok(())
     }
 }
 
@@ -381,7 +491,18 @@ pub fn run_script(
 ) -> ScriptOutcome {
     let calls_made = Rc::new(Cell::new(0usize));
     let pending = Rc::new(RefCell::new(VecDeque::new()));
-    let mut context = Context::default();
+    let deadline = Instant::now() + limits.wall_clock;
+    let executor = Rc::new(BoundedJobExecutor::new(deadline, limits.max_promise_jobs));
+    let mut context = match Context::builder().job_executor(executor).build() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            return ScriptOutcome {
+                value: json!(null),
+                calls: 0,
+                error: Some(format!("toolport code mode: failed to create JS context: {e}")),
+            };
+        }
+    };
 
     // Pure-JS runaway guards (a script that loops/recurses forever without calling a tool).
     context
@@ -396,7 +517,7 @@ pub fn run_script(
         calls_made: calls_made.clone(),
         max_calls: limits.max_calls,
         max_parallel: limits.max_parallel.max(1),
-        deadline: Instant::now() + limits.wall_clock,
+        deadline,
         pending,
     };
 
@@ -1056,5 +1177,36 @@ mod tests {
         assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
         assert_eq!(out.value["a"], json!("s__create_refund"));
         assert_eq!(out.value["b"], json!("s__createRefund"));
+    }
+
+    #[test]
+    fn self_requeuing_promise_jobs_hit_budget() {
+        // CodeRabbit #480: unbounded Promise microtask chains must not pin run_jobs forever.
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let limits = Limits {
+            max_promise_jobs: 50,
+            wall_clock: StdDuration::from_secs(5),
+            ..Limits::default()
+        };
+        let out = run(
+            r#"
+                let n = 0;
+                function loop() {
+                    n += 1;
+                    return Promise.resolve().then(loop);
+                }
+                loop();
+                return new Promise(function () {}); // never settles
+            "#,
+            json!({}),
+            call,
+            limits,
+        );
+        assert_ne!(out.error, None, "expected promise-job budget error");
+        let err = out.error.unwrap();
+        assert!(
+            err.contains("promise-job budget") || err.contains("wall-clock"),
+            "unexpected error: {err}"
+        );
     }
 }
