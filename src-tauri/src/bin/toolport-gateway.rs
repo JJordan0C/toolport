@@ -2842,8 +2842,9 @@ impl RoutedCallProfiler {
 /// `confirm` is `Some` only on the interactive direct path, where a destructive tool can be
 /// held for the agent's `toolport_confirm` token replay. Inside a script that two-step
 /// handshake can't happen, so `confirm` is `None` and such a call fails closed rather than
-/// running unconfirmed. `confirmed` is true only when the call already came back through
+/// running unconfirmed. `opts.confirmed` is true only when the call already came back through
 /// `toolport_confirm` (skips the approval + confirm gates so it isn't re-intercepted).
+/// `opts.shape` controls byte-budget shaping (see [`CallOpts`]).
 #[allow(clippy::too_many_arguments)]
 fn execute_call(
     reg: &Registry,
@@ -2855,12 +2856,10 @@ fn execute_call(
     confirm: Option<&ConfirmGuard>,
     name: &str,
     arguments: Value,
-    mut confirmed: bool,
-    // When false, content defense still runs but result-shaping is skipped. Code-mode
-    // intermediate calls pass full bodies into the sandbox (they never enter model
-    // context); only the script's final aggregate is shaped for the client.
-    shape: bool,
+    opts: CallOpts,
 ) -> Value {
+    let mut confirmed = opts.confirmed;
+    let shape = opts.shape;
     let mut call_profiler = RoutedCallProfiler::start(name);
     // Resolve the call's real (server, original tool) from the router's route map,
     // NOT by splitting the exposed name on `__`. A renamed tool (via a tool override)
@@ -3176,6 +3175,17 @@ fn execute_call(
     }
 }
 
+/// Flags for [`execute_call`] that would otherwise be adjacent bools (easy to swap).
+#[derive(Clone, Copy)]
+struct CallOpts {
+    /// True after a successful `toolport_confirm` replay (skip re-approval/confirm).
+    confirmed: bool,
+    /// When false, content defense still runs but result-shaping is skipped. Code-mode
+    /// intermediate calls pass full bodies into the sandbox (they never enter model
+    /// context); only the script's final aggregate is shaped for the client.
+    shape: bool,
+}
+
 /// Run untrusted tool-call output through content defense and result shaping, then
 /// append a Toolport-authored trailer. Shared by the success and error branches of
 /// [`execute_call`] so they can't drift: a hostile server must not be able to bypass the
@@ -3331,8 +3341,10 @@ fn run_script_dispatch(
                 None,
                 name,
                 args,
-                false,
-                false,
+                CallOpts {
+                    confirmed: false,
+                    shape: false,
+                },
             )
         });
 
@@ -4040,8 +4052,10 @@ fn handle_request_with_cancel(
                     Some(confirm),
                     name.as_str(),
                     arguments,
-                    confirmed,
-                    true,
+                    CallOpts {
+                        confirmed,
+                        shape: true,
+                    },
                 ),
             ))
         }
