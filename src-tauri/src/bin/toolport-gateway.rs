@@ -3098,7 +3098,8 @@ fn handle_request_with_cancel(
                     "capabilities": {
                         "tools": { "listChanged": true },
                         "resources": { "listChanged": true },
-                        "prompts": { "listChanged": true }
+                        "prompts": { "listChanged": true },
+                        "completions": {}
                     },
                     "serverInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") }
                 }),
@@ -3676,17 +3677,39 @@ fn handle_request_with_cancel(
             let mut resources = router.aggregated_resources();
             // Scope to the client's allowed servers (a no-op when unscoped), so a
             // registered HTTP client can't list another server's resources.
+            // Compare sanitized server ids: `allowed` stores sanitize_segment form
+            // (SOU-327), same as the tools path.
             if let Some(set) = allowed {
                 resources.retain(|r| {
                     r.get("uri")
                         .and_then(|u| u.as_str())
                         .and_then(|uri| router.resource_server(uri))
-                        .map(|srv| set.contains(srv))
+                        .map(|srv| server_in_allowed_scope(srv, set))
                         .unwrap_or(false)
                 });
             }
             gtrace(&format!("resources/list -> {} resources", resources.len()));
             Some(success(id, json!({ "resources": resources })))
+        }
+        "resources/templates/list" => {
+            let mut templates = router.aggregated_resource_templates();
+            // Same server-scoping rules as resources/list (SOU-327).
+            if let Some(set) = allowed {
+                templates.retain(|t| {
+                    t.get("uriTemplate")
+                        .and_then(|u| u.as_str())
+                        .and_then(|uri| router.resource_template_server(uri))
+                        .map(|srv| server_in_allowed_scope(srv, set))
+                        .unwrap_or(false)
+                });
+            }
+            gtrace(&format!(
+                "resources/templates/list -> {} templates",
+                templates.len()
+            ));
+            // Backward compatible: full aggregated list in one response (no
+            // nextCursor), matching tools/resources/prompts list behavior.
+            Some(success(id, json!({ "resourceTemplates": templates })))
         }
         "resources/read" => {
             let uri = req
@@ -3700,7 +3723,7 @@ fn handle_request_with_cancel(
             if let Some(set) = allowed {
                 let in_scope = router
                     .resource_server(uri)
-                    .map(|srv| set.contains(srv))
+                    .map(|srv| server_in_allowed_scope(srv, set))
                     .unwrap_or(false);
                 if !in_scope {
                     return Some(error(id, -32602, &format!("Toolport: no server owns resource '{uri}'")));
@@ -3736,12 +3759,13 @@ fn handle_request_with_cancel(
         "prompts/list" => {
             let mut prompts = router.aggregated_prompts();
             // Scope to the client's allowed servers (a no-op when unscoped).
+            // Sanitize owner ids before comparing (SOU-327).
             if let Some(set) = allowed {
                 prompts.retain(|p| {
                     p.get("name")
                         .and_then(|n| n.as_str())
                         .and_then(|name| router.prompt_server(name))
-                        .map(|srv| set.contains(srv))
+                        .map(|srv| server_in_allowed_scope(srv, set))
                         .unwrap_or(false)
                 });
             }
@@ -3763,7 +3787,7 @@ fn handle_request_with_cancel(
             if let Some(set) = allowed {
                 let in_scope = router
                     .prompt_server(name)
-                    .map(|srv| set.contains(srv))
+                    .map(|srv| server_in_allowed_scope(srv, set))
                     .unwrap_or(false);
                 if !in_scope {
                     return Some(error(id, -32602, &format!("Toolport: no route for prompt '{name}'")));
@@ -3795,9 +3819,53 @@ fn handle_request_with_cancel(
                 )),
             }
         }
+        "completion/complete" => {
+            let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+            // Scope: resolve the owning server first, then check allowed (no leak of
+            // out-of-scope prompt/template names beyond a generic invalid-params error).
+            match router.resolve_completion(&params) {
+                Ok((server_id, _)) => {
+                    if let Some(set) = allowed {
+                        if !server_in_allowed_scope(&server_id, set) {
+                            return Some(error(
+                                id,
+                                -32602,
+                                "Toolport: completion reference is not in scope",
+                            ));
+                        }
+                    }
+                    match router.complete_with_cancel(params, cancel.clone()) {
+                        Ok(result) => Some(success(id, result)),
+                        Err(e) => Some(error(
+                            id,
+                            -32602,
+                            &format!(
+                                "Toolport: {}",
+                                integrity::defend_error_text("completion", &e)
+                            ),
+                        )),
+                    }
+                }
+                Err(e) => Some(error(
+                    id,
+                    -32602,
+                    &format!(
+                        "Toolport: {}",
+                        integrity::defend_error_text("completion", &e)
+                    ),
+                )),
+            }
+        }
         "ping" => Some(success(id, json!({}))),
         other => Some(error(id, -32601, &format!("Method not found: {other}"))),
     }
+}
+
+/// Whether a downstream server id is in a registered HTTP client's allowed set.
+/// `allowed` always stores [`sanitize_segment`] form (see tools scoping); raw
+/// server ids with hyphens must be sanitized before comparison (SOU-327).
+fn server_in_allowed_scope(server_id: &str, allowed: &std::collections::HashSet<String>) -> bool {
+    allowed.contains(sanitize_segment(server_id).as_str())
 }
 
 /// Fail-closed merge of every profile's `tool_scope` for the shared HTTP-bridge router.
@@ -4026,21 +4094,54 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-fn notify_tools_changed(stdout: &Arc<Mutex<std::io::Stdout>>) {
-    notify_list_changed(stdout, "notifications/tools/list_changed");
+fn notify_tools_changed(
+    stdout: &Arc<Mutex<std::io::Stdout>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
+) {
+    notify_list_changed(stdout, mcp_sessions, "notifications/tools/list_changed");
 }
 
 /// Emit a bare JSON-RPC `list_changed` notification to the client so it re-fetches
 /// the named list. Used for resources/prompts (which have no persisted cache) and,
-/// via `notify_tools_changed`, for tools.
-fn notify_list_changed(stdout: &Arc<Mutex<std::io::Stdout>>, method: &str) {
+/// via `notify_tools_changed`, for tools. Always writes stdio; when HTTP MCP
+/// sessions are present, also fans the same notification over every live session's
+/// SSE queue (SOU-328) so streamable-HTTP clients see list changes.
+fn notify_list_changed(
+    stdout: &Arc<Mutex<std::io::Stdout>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
+    method: &str,
+) {
+    let msg = json!({ "jsonrpc": "2.0", "method": method });
     let mut out = stdout
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = write_json_line(
-        &mut *out,
-        &json!({ "jsonrpc": "2.0", "method": method }),
-    );
+    let _ = write_json_line(&mut *out, &msg);
+    if let Some(sessions) = mcp_sessions {
+        fanout_mcp_notification(sessions, &msg);
+    }
+}
+
+/// Queue a server→client JSON-RPC notification on every non-expired HTTP MCP
+/// session (SOU-328). Best-effort: a full outbound queue drops that session's
+/// copy and continues so one stuck client cannot block the others.
+fn fanout_mcp_notification(
+    mcp_sessions: &Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    msg: &Value,
+) {
+    let Ok(json) = serde_json::to_string(msg) else {
+        return;
+    };
+    let sessions = mcp_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for session in sessions.values() {
+        if session.is_expired() || session.closed.load(Ordering::SeqCst) {
+            continue;
+        }
+        if !session.push_message(json.clone(), request_id_key(msg)) {
+            eprintln!("toolport: MCP session outbound queue full; list_changed dropped");
+        }
+    }
 }
 
 /// Persist a freshly built or refreshed catalog and tell the client it changed.
@@ -4222,15 +4323,16 @@ fn reconcile_to(
         // success path visible too.
         glog("quarantine set changed on disk; re-filtering exposed tools");
         eprintln!("toolport: quarantine set changed on disk; re-filtering exposed tools");
-        notify_tools_changed(stdout);
+        notify_tools_changed(stdout, None);
     }
     changed
 }
 
-fn persist_and_emit(
+fn persist_and_emit_with_sessions(
     tools: &[Value],
     cached_tools: &SharedCatalog,
     stdout: &Arc<Mutex<std::io::Stdout>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
     profile: Option<&str>,
 ) {
     if !tools.is_empty() {
@@ -4248,7 +4350,7 @@ fn persist_and_emit(
         ));
         save_tool_cache(tools, profile);
     }
-    notify_tools_changed(stdout);
+    notify_tools_changed(stdout, mcp_sessions);
 }
 
 /// Keep the always-on gateway log bounded; trimmed to roughly the back half once
@@ -4453,6 +4555,9 @@ fn watch_registry(
     // Shared ${ROOT} path (issue #239) so a registry-change rebuild keeps placing
     // ${ROOT} servers in the client's project root instead of resetting to fallback.
     client_root: Arc<Mutex<Option<String>>>,
+    // Live HTTP MCP sessions so list_changed notifications also fan out over SSE
+    // (SOU-328). Empty in pure-stdio mode; same Arc as GatewayState.
+    mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
 ) {
     eprintln!("toolport: watching registry at {}", path.display());
     let mut state = WatchLoopState {
@@ -4480,6 +4585,7 @@ fn watch_registry(
             &downstream_dirty,
             &server_handler,
             &client_root,
+            Some(&mcp_sessions),
             &mut state,
         );
     }
@@ -4505,6 +4611,7 @@ fn watch_tick(
     downstream_dirty: &Arc<AtomicU8>,
     server_handler: &ServerRequestHandler,
     client_root: &Arc<Mutex<Option<String>>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
     state: &mut WatchLoopState,
 ) -> TickOutcome {
     // Re-approving a tool rewrites quarantine.json, which is NOT the registry file
@@ -4618,7 +4725,13 @@ fn watch_tick(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(new_router);
         let tools = requarantine_if_needed(registry, router, tools, resolved.as_deref());
-        persist_and_emit(&tools, cached_tools, stdout, resolved.as_deref());
+        persist_and_emit_with_sessions(
+            &tools,
+            cached_tools,
+            stdout,
+            mcp_sessions,
+            resolved.as_deref(),
+        );
         let fmt_profile = |p: &Option<String>| match p {
             Some(name) => format!("'{name}'"),
             None => "(active profile / unscoped)".to_string(),
@@ -4667,7 +4780,13 @@ fn watch_tick(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
             let tools = requarantine_if_needed(registry, router, tools, resolved.as_deref());
-            persist_and_emit(&tools, cached_tools, stdout, resolved.as_deref());
+            persist_and_emit_with_sessions(
+                &tools,
+                cached_tools,
+                stdout,
+                mcp_sessions,
+                resolved.as_deref(),
+            );
             eprintln!("toolport: downstream tools/list_changed, refreshed + sent");
         }
         if downstream_changed & downstream::change::RESOURCES != 0 {
@@ -4677,11 +4796,17 @@ fn watch_tick(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (**guard).clone()
             };
+            // Also refreshes resource templates (MCP has no separate templates
+            // list_changed; they ride on resources/list_changed).
             next.refresh_resources();
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-            notify_list_changed(stdout, "notifications/resources/list_changed");
+            notify_list_changed(
+                stdout,
+                mcp_sessions,
+                "notifications/resources/list_changed",
+            );
             eprintln!("toolport: downstream resources/list_changed, refreshed + sent");
         }
         if downstream_changed & downstream::change::PROMPTS != 0 {
@@ -4695,7 +4820,7 @@ fn watch_tick(
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-            notify_list_changed(stdout, "notifications/prompts/list_changed");
+            notify_list_changed(stdout, mcp_sessions, "notifications/prompts/list_changed");
             eprintln!("toolport: downstream prompts/list_changed, refreshed + sent");
         }
     }
@@ -5373,7 +5498,13 @@ fn rebuild_router_for_root(state: &GatewayState) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(new_router);
     let tools = requarantine_if_needed(&state.registry, &state.router, tools, profile.as_deref());
-    persist_and_emit(&tools, &state.cached_tools, &state.stdout, profile.as_deref());
+    persist_and_emit_with_sessions(
+        &tools,
+        &state.cached_tools,
+        &state.stdout,
+        Some(&state.mcp_sessions),
+        profile.as_deref(),
+    );
     glog(&format!("toolport: ${{ROOT}} rebuild (root={root:?}, {} tools)", tools.len()));
 }
 
@@ -5525,7 +5656,13 @@ fn process_request(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .tools
             .is_empty(),
-        "tools/call" | "resources/list" | "resources/read" | "prompts/list" | "prompts/get" => true,
+        "tools/call"
+        | "resources/list"
+        | "resources/templates/list"
+        | "resources/read"
+        | "prompts/list"
+        | "prompts/get"
+        | "completion/complete" => true,
         _ => false,
     };
     if wait {
@@ -5607,7 +5744,7 @@ fn process_request(
                         .server_count(),
                     tools.len()
                 ));
-                notify_tools_changed(&state.stdout);
+                notify_tools_changed(&state.stdout, Some(&state.mcp_sessions));
             }
         }
     }
@@ -7624,6 +7761,7 @@ fn main() {
         let profile = Arc::clone(&profile);
         let client_root = Arc::clone(&client_root);
         let rebuild_lock = Arc::clone(&rebuild_lock);
+        let mcp_sessions = Arc::clone(&mcp_sessions);
         std::thread::spawn(move || {
             let reg = registry
                 .lock()
@@ -7673,7 +7811,7 @@ fn main() {
                 glog("background build was empty; keeping previous tool cache");
             }
             ready.store(true, Ordering::SeqCst);
-            notify_tools_changed(&stdout);
+            notify_tools_changed(&stdout, Some(&mcp_sessions));
         });
     }
 
@@ -7688,6 +7826,7 @@ fn main() {
         let client_id = client_id.clone();
         let env_profile = env_profile.clone();
         let client_root = Arc::clone(&client_root);
+        let mcp_sessions = Arc::clone(&mcp_sessions);
         std::thread::spawn(move || {
             watch_registry(
                 path,
@@ -7702,6 +7841,7 @@ fn main() {
                 downstream_dirty,
                 server_handler,
                 client_root,
+                mcp_sessions,
             )
         });
     }
@@ -9999,6 +10139,38 @@ mod tests {
     }
 
     #[test]
+    fn fanout_mcp_notification_reaches_every_live_session() {
+        // SOU-328: list_changed must fan over HTTP MCP sessions, not only stdio.
+        let state = http_state(true);
+        let sid_a = mint_mcp_session(&state, None).ok().unwrap();
+        let sid_b = mint_mcp_session(&state, None).ok().unwrap();
+        let msg = json!({"jsonrpc":"2.0","method":"notifications/resources/list_changed"});
+        fanout_mcp_notification(&state.mcp_sessions, &msg);
+        for sid in [sid_a, sid_b] {
+            let sessions = state.mcp_sessions.lock().unwrap();
+            let session = sessions.get(&sid).unwrap();
+            let mut reader = McpSseReader::new(Arc::clone(session));
+            let mut buf = [0u8; 512];
+            let n = reader.read(&mut buf).unwrap();
+            let chunk = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                chunk.contains("resources/list_changed"),
+                "session {sid} missing fanout: {chunk}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_in_allowed_scope_sanitizes_server_ids() {
+        // SOU-327: allowed set stores sanitize_segment form; raw hyphenated ids must match.
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("file_system".to_string());
+        assert!(server_in_allowed_scope("file-system", &allowed));
+        assert!(server_in_allowed_scope("file_system", &allowed));
+        assert!(!server_in_allowed_scope("other-server", &allowed));
+    }
+
+    #[test]
     fn mcp_session_outbound_queue_is_bounded() {
         let session = McpSession::new(None);
         for i in 0..MCP_SESSION_OUTBOUND_MAX {
@@ -10845,6 +11017,7 @@ mod tests {
             &downstream_dirty,
             &server_handler,
             &client_root,
+            None,
             &mut state,
         );
         assert!(
@@ -10871,6 +11044,7 @@ mod tests {
             &downstream_dirty,
             &server_handler,
             &client_root,
+            None,
             &mut state,
         );
         assert!(steady.idle_after_quarantine);
@@ -10891,6 +11065,7 @@ mod tests {
             &downstream_dirty,
             &server_handler,
             &client_root,
+            None,
             &mut state,
         );
         assert!(

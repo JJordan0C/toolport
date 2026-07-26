@@ -67,10 +67,19 @@ local gateways. `--check` enforces the deliberately generous regression ceilings
 ## Native MCP pagination regression (`mcp-native.mjs`)
 
 This end-to-end harness launches Toolport over stdio with a deterministic MCP
-fixture that paginates tools, resources, and prompts at two items per page. It
-verifies that Toolport discovers every downstream page, exposes the complete
-aggregated lists without forcing existing clients to paginate, and can invoke,
-read, and fetch entries that appeared only on the final page.
+fixture that paginates tools, resources, resource templates, and prompts at two
+items per page. It verifies that Toolport discovers every downstream page,
+exposes the complete aggregated lists without forcing existing clients to
+paginate, can invoke/read/fetch entries that appeared only on the final page,
+routes expanded template URIs, and forwards `completion/complete` for prompt
+and resource-template references (with namespaced prompt names remapped to the
+downstream name). It also checks first-writer collision ownership across
+servers and repeated-cursor safety.
+
+Resource templates refresh on `notifications/resources/list_changed` because
+MCP defines no separate templates list-change notification. Incomplete
+downstream pagination keeps the previous complete snapshot (covered in Rust
+unit tests and documented here).
 
 ```bash
 npm run build:gateway

@@ -2214,17 +2214,23 @@ impl Transport for HttpTransport {
 }
 
 /// One connected downstream server: its id, its transport, and its cached
-/// tools, resources, and prompts.
+/// tools, resources, resource templates, and prompts.
 pub struct DownstreamServer {
     pub id: String,
     transport: Box<dyn Transport>,
     pub tools: Vec<Value>,
     pub resources: Vec<Value>,
+    /// Parameterized resource URI templates (`resources/templates/list`).
+    /// Refreshed with concrete resources on `resources/list_changed` because
+    /// MCP defines no separate templates list-change notification.
+    pub resource_templates: Vec<Value>,
     pub prompts: Vec<Value>,
     /// Whether the server's `initialize` advertised resources / prompts. The
     /// actual lists are fetched lazily via `load_resources_prompts`.
     caps_resources: bool,
     caps_prompts: bool,
+    /// Whether the server's `initialize` advertised the completions utility.
+    caps_completions: bool,
 }
 
 impl DownstreamServer {
@@ -2252,6 +2258,7 @@ impl DownstreamServer {
         let caps = init.get("capabilities");
         let caps_resources = caps.and_then(|c| c.get("resources")).is_some();
         let caps_prompts = caps.and_then(|c| c.get("prompts")).is_some();
+        let caps_completions = caps.and_then(|c| c.get("completions")).is_some();
         transport.notify("notifications/initialized", json!({})).map_err(|e| e.to_string())?;
 
         // `initialize` answered, so any launcher download is done: the rest of the
@@ -2276,9 +2283,11 @@ impl DownstreamServer {
             transport,
             tools,
             resources: Vec::new(),
+            resource_templates: Vec::new(),
             prompts: Vec::new(),
             caps_resources,
             caps_prompts,
+            caps_completions,
         })
     }
 
@@ -2306,6 +2315,10 @@ impl DownstreamServer {
     /// announced a `resources/list_changed`. Mirrors [`refresh_tools`]; best-effort
     /// (an error keeps the previous list), and a no-op if the server never
     /// advertised resources.
+    ///
+    /// Also re-fetches resource templates on the same notification. MCP has no
+    /// separate `resources/templates/list_changed`; template catalogs change
+    /// under the resources capability, so this is the protocol-aligned trigger.
     pub fn refresh_resources(&mut self) {
         if !self.caps_resources {
             return;
@@ -2320,6 +2333,24 @@ impl DownstreamServer {
             ),
             Err(error) => eprintln!(
                 "toolport: keeping server '{}' previous resource catalog after refresh failed: {error}",
+                self.id
+            ),
+        }
+        // Templates share the resources capability and list-change signal.
+        // Incomplete/failed traversal keeps the previous complete snapshot.
+        match fetch_paginated_list(
+            &mut *self.transport,
+            "resources/templates/list",
+            "resourceTemplates",
+        ) {
+            Ok(listed) if listed.warning.is_none() => self.resource_templates = listed.items,
+            Ok(listed) => eprintln!(
+                "toolport: keeping server '{}' previous resource-template catalog after an incomplete refresh: {}",
+                self.id,
+                listed.warning.unwrap_or_default()
+            ),
+            Err(error) => eprintln!(
+                "toolport: keeping server '{}' previous resource-template catalog after refresh failed: {error}",
                 self.id
             ),
         }
@@ -2349,9 +2380,12 @@ impl DownstreamServer {
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
 
-    /// Fetch the resources and prompts the server advertised. Best-effort: an
-    /// error or empty response just leaves the list empty. Kept out of `connect`
-    /// so only the gateway (which actually proxies these) pays the cost.
+    /// Fetch the resources, resource templates, and prompts the server advertised.
+    /// Best-effort: an error or empty response just leaves the list empty. Kept
+    /// out of `connect` so only the gateway (which actually proxies these) pays
+    /// the cost. Templates are loaded whenever the server advertised resources;
+    /// a server that does not implement `resources/templates/list` simply leaves
+    /// the template catalog empty.
     pub fn load_resources_prompts(&mut self) {
         if self.caps_resources {
             if let Ok(listed) =
@@ -2364,6 +2398,19 @@ impl DownstreamServer {
                     );
                 }
                 self.resources = listed.items;
+            }
+            if let Ok(listed) = fetch_paginated_list(
+                &mut *self.transport,
+                "resources/templates/list",
+                "resourceTemplates",
+            ) {
+                if let Some(warning) = &listed.warning {
+                    eprintln!(
+                        "toolport: server '{}' returned a partial resource-template catalog: {warning}",
+                        self.id
+                    );
+                }
+                self.resource_templates = listed.items;
             }
         }
         if self.caps_prompts {
@@ -2428,6 +2475,26 @@ impl DownstreamServer {
             json!({ "name": name, "arguments": arguments }),
             cancel,
         )
+    }
+
+    /// Whether this server advertised the completions utility at initialize.
+    pub fn supports_completions(&self) -> bool {
+        self.caps_completions
+    }
+
+    /// Forward a `completion/complete` request. `params` must already use the
+    /// downstream's native reference names (prompt names un-namespaced).
+    pub fn complete(&mut self, params: Value) -> Result<Value, TransportError> {
+        self.complete_with_cancel(params, None)
+    }
+
+    pub fn complete_with_cancel(
+        &mut self,
+        params: Value,
+        cancel: Option<CancelContext>,
+    ) -> Result<Value, TransportError> {
+        self.transport
+            .request_with_cancel("completion/complete", params, cancel)
     }
 
     /// Forward a JSON-RPC notification to this downstream server.
@@ -2608,12 +2675,14 @@ mod tests {
     fn downstream_server_loads_all_tool_resource_and_prompt_pages() {
         let transport = PaginationTransport::new(vec![
             Ok(json!({
-                "capabilities": { "resources": {}, "prompts": {} }
+                "capabilities": { "resources": {}, "prompts": {}, "completions": {} }
             })),
             Ok(json!({"tools":[{"name":"one"}],"nextCursor":"tools-2"})),
             Ok(json!({"tools":[{"name":"two"}]})),
             Ok(json!({"resources":[{"uri":"one:"}],"nextCursor":"resources-2"})),
             Ok(json!({"resources":[{"uri":"two:"}]})),
+            Ok(json!({"resourceTemplates":[{"uriTemplate":"one://{id}"}],"nextCursor":"templates-2"})),
+            Ok(json!({"resourceTemplates":[{"uriTemplate":"two://{id}"}]})),
             Ok(json!({"prompts":[{"name":"one"}],"nextCursor":"prompts-2"})),
             Ok(json!({"prompts":[{"name":"two"}]})),
         ]);
@@ -2622,9 +2691,12 @@ mod tests {
         server.load_resources_prompts();
         assert_eq!(server.tools.len(), 2);
         assert_eq!(server.resources.len(), 2);
+        assert_eq!(server.resource_templates.len(), 2);
         assert_eq!(server.prompts.len(), 2);
+        assert!(server.supports_completions());
         assert_eq!(server.tools[1]["name"], "two");
         assert_eq!(server.resources[1]["uri"], "two:");
+        assert_eq!(server.resource_templates[1]["uriTemplate"], "two://{id}");
         assert_eq!(server.prompts[1]["name"], "two");
     }
 
@@ -2639,12 +2711,42 @@ mod tests {
             transport: Box::new(transport),
             tools: vec![json!({"name":"stable"})],
             resources: Vec::new(),
+            resource_templates: Vec::new(),
             prompts: Vec::new(),
             caps_resources: false,
             caps_prompts: false,
+            caps_completions: false,
         };
         server.refresh_tools();
         assert_eq!(server.tools, vec![json!({"name":"stable"})]);
+    }
+
+    #[test]
+    fn incomplete_template_refresh_keeps_the_previous_complete_catalog() {
+        // resources/list succeeds fully, but templates pagination is incomplete:
+        // keep the prior template snapshot rather than replacing it with a partial.
+        let transport = PaginationTransport::new(vec![
+            Ok(json!({"resources":[{"uri":"r:"}]})),
+            Ok(json!({"resourceTemplates":[{"uriTemplate":"partial://{id}"}],"nextCursor":"two"})),
+            Err(TransportError::Unavailable("page two timed out".to_string())),
+        ]);
+        let mut server = DownstreamServer {
+            id: "fixture".to_string(),
+            transport: Box::new(transport),
+            tools: Vec::new(),
+            resources: vec![json!({"uri":"stable-r:"})],
+            resource_templates: vec![json!({"uriTemplate":"stable://{id}"})],
+            prompts: Vec::new(),
+            caps_resources: true,
+            caps_prompts: false,
+            caps_completions: false,
+        };
+        server.refresh_resources();
+        assert_eq!(server.resources, vec![json!({"uri":"r:"})]);
+        assert_eq!(
+            server.resource_templates,
+            vec![json!({"uriTemplate":"stable://{id}"})]
+        );
     }
 
     /// Minimal FFI for getpgrp (test-only, avoids adding libc as a dependency).
