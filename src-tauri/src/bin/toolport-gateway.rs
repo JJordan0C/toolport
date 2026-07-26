@@ -2081,8 +2081,9 @@ struct PendingCall {
     name: String,
     /// The exact arguments from the preview call (serialized for replay).
     arguments: Value,
-    /// The registered HTTP client that created this confirmation. `None` covers
-    /// stdio and the legacy unscoped HTTP bearer, which each have one shared caller.
+    /// Stable security principal that created this confirmation (e.g.
+    /// `client:{id}`), never a display label. `None` covers stdio and the
+    /// legacy unscoped HTTP bearer, which each have one shared caller.
     owner: Option<String>,
     /// When this entry was created (for expiry).
     created: Instant,
@@ -2438,8 +2439,12 @@ struct McpSessionOwner {
     scope: Option<Vec<String>>,
 }
 
-/// Per-request HTTP attribution. The audit label stays human-readable while the
-/// session owner uses a stable id and effective scope for authorization checks.
+/// Per-request HTTP attribution.
+///
+/// * `audit_label` — human-readable name for Activity / audit display only.
+/// * `session_owner.identity` — stable security principal (`client:{id}`) for
+///   MCP sessions, confirm tokens, and shaped-result stash isolation (SOU-324).
+///   Two clients may share a display label; they must never share this identity.
 struct HttpCaller {
     audit_label: Option<String>,
     session_owner: McpSessionOwner,
@@ -7131,7 +7136,10 @@ fn handle_http(
     allowed: Option<&std::collections::HashSet<String>>,
     caller: Option<&HttpCaller>,
 ) -> HttpOut {
-    let client = caller.and_then(|value| value.audit_label.as_deref());
+    // SOU-324: confirm tokens and shaped-result stash must key on stable client
+    // identity, not the display label (labels are not unique across HTTP clients).
+    // Audit still receives this same id string; Activity may show `client:{id}`.
+    let client = caller.map(|value| value.session_owner.identity.as_str());
     let session_owner = caller.map(|value| &value.session_owner);
     if method == "OPTIONS" {
         return HttpOut::new(204, "text/plain", String::new());
@@ -10229,8 +10237,62 @@ mod tests {
             first.session_owner.identity, second.session_owner.identity,
             "duplicate display labels must not collapse distinct clients"
         );
+        assert_eq!(first.session_owner.identity, "client:c1");
+        assert_eq!(second.session_owner.identity, "client:c2");
         assert_eq!(first.session_owner.scope, Some(Vec::new()));
         assert_eq!(second.session_owner.scope, None);
+    }
+
+    #[test]
+    fn confirm_tokens_are_scoped_to_stable_identity_not_display_label() {
+        // SOU-324: two clients can share the label "Open WebUI"; tokens must not.
+        let confirm = ConfirmGuard::new();
+        let token = confirm.store(
+            "stripe__delete_customer".into(),
+            json!({ "id": "cus_x" }),
+            Some("client:c1"),
+        );
+        // Peer with a different stable id cannot redeem (and does not consume).
+        assert!(
+            confirm
+                .take(&token, Some("client:c2"))
+                .is_none(),
+            "same display label must not unlock another client's confirm token"
+        );
+        // Rightful owner still redeems.
+        let (name, args) = confirm
+            .take(&token, Some("client:c1"))
+            .expect("owner must redeem");
+        assert_eq!(name, "stripe__delete_customer");
+        assert_eq!(args["id"], "cus_x");
+    }
+
+    #[test]
+    fn http_security_owner_for_dispatch_is_stable_identity() {
+        // handle_http must pass session_owner.identity (not audit_label) into
+        // process_request so confirm/shaping match ConfirmGuard + shaping stash.
+        let mut reg = Registry::default();
+        reg.http_clients.push(registry::HttpClient {
+            id: "alpha".into(),
+            label: "Open WebUI".into(),
+            token_sha256: registry::sha256_hex("t-a"),
+            profile: String::new(),
+        });
+        reg.http_clients.push(registry::HttpClient {
+            id: "beta".into(),
+            label: "Open WebUI".into(),
+            token_sha256: registry::sha256_hex("t-b"),
+            profile: String::new(),
+        });
+        let (_, a) = resolve_http_caller(&reg, None, Some("t-a"), false).unwrap();
+        let (_, b) = resolve_http_caller(&reg, None, Some("t-b"), false).unwrap();
+        // What handle_http must pass into process_request (stable id, not label).
+        assert_eq!(a.session_owner.identity, "client:alpha");
+        assert_eq!(b.session_owner.identity, "client:beta");
+        assert_ne!(
+            a.session_owner.identity.as_str(),
+            a.audit_label.as_deref().unwrap()
+        );
     }
 
     #[test]

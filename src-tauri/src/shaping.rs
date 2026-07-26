@@ -253,12 +253,12 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
 pub fn fetch_result(cursor: &str, offset: usize, len: usize, requester: Option<&str>, projection: Option<&str>,) -> Value {
     let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
     sweep(&mut map);
-    // Scope: a cached result is readable only by the client that stashed it. A mismatch
-    // returns the SAME "unknown or expired" answer as a missing cursor, so a scoped
-    // client can't probe which cursors exist. This matters because the stash is
-    // process-global, and in HTTP mode one gateway serves every registered client;
-    // without this check a client could read another tenant's result by guessing the
-    // sequential `r{n}` cursor.
+    // Scope: a cached result is readable only by the client that stashed it. Owner
+    // must be a stable principal (e.g. client:{id}), never a shared display label
+    // (SOU-324). A mismatch returns the SAME "unknown or expired" answer as a
+    // missing cursor, so a scoped client can't probe which cursors exist. The
+    // stash is process-global; without this check one HTTP client could read
+    // another's result by guessing the sequential `r{n}` cursor.
     let c = match map.get(cursor) {
         Some(c) if c.owner.as_deref() == requester => c,
         _ => {
@@ -452,6 +452,28 @@ mod tests {
         // The owner still reads it.
         assert_ne!(
             fetch_result(&cursor, 0, 100, Some("alice"), None)["isError"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn fetch_scopes_by_stable_id_not_shared_display_label() {
+        // SOU-324: stash owners must be client:{id}-style principals. Two
+        // "Open WebUI" labels with different ids must not read each other.
+        let mut r = big_text_result(10_000);
+        assert!(shape_result(&mut r, 2048, Some("client:c1")));
+        let cursor = cursor_of(&r);
+        assert_eq!(
+            fetch_result(&cursor, 0, 100, Some("client:c2"), None)["isError"].as_bool(),
+            Some(true)
+        );
+        // A display label alone must never unlock a stash keyed by client id.
+        assert_eq!(
+            fetch_result(&cursor, 0, 100, Some("Open WebUI"), None)["isError"].as_bool(),
+            Some(true)
+        );
+        assert_ne!(
+            fetch_result(&cursor, 0, 100, Some("client:c1"), None)["isError"].as_bool(),
             Some(true)
         );
     }
