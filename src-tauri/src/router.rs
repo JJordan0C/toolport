@@ -43,10 +43,18 @@ pub fn sanitize_segment(s: &str) -> String {
         .collect()
 }
 
+/// Bound URI/template matching so a hostile client URI cannot blow the stack
+/// or dominate the request thread with pathological backtracking.
+const MAX_URI_MATCH_LEN: usize = 8_192;
+const MAX_TEMPLATE_MATCH_LEN: usize = 1_024;
+
 /// True when `uri` is an expansion of an RFC 6570 Level-1 URI template
 /// (`{var}` placeholders). Used to route `resources/read` for expanded
 /// template URIs that were never listed as concrete resources.
 pub fn uri_matches_template(uri: &str, template: &str) -> bool {
+    if uri.len() > MAX_URI_MATCH_LEN || template.len() > MAX_TEMPLATE_MATCH_LEN {
+        return false;
+    }
     if !template.contains('{') {
         return uri == template;
     }
@@ -95,53 +103,60 @@ fn regex_is_match(pattern: &str, text: &str) -> bool {
     match_simple_pattern(inner, text)
 }
 
-fn match_simple_pattern(pattern: &str, text: &str) -> bool {
-    // Recursive backtracking is fine: templates have a handful of variables.
-    if pattern.is_empty() {
-        return text.is_empty();
-    }
-    if let Some(rest) = pattern.strip_prefix("[^/]+") {
-        // Match one or more non-slash chars (greedy, then backtrack).
-        if text.is_empty() || text.starts_with('/') {
+fn match_simple_pattern(mut pattern: &str, mut text: &str) -> bool {
+    // Iterative literal consumption keeps recursion depth proportional to the
+    // number of placeholders, not the URI length. Variable branches still
+    // backtrack, but inputs are length-capped in uri_matches_template.
+    loop {
+        if pattern.is_empty() {
+            return text.is_empty();
+        }
+        if let Some(rest) = pattern.strip_prefix("[^/]+") {
+            // Match one or more non-slash chars (greedy, then backtrack).
+            if text.is_empty() || text.starts_with('/') {
+                return false;
+            }
+            let end = text.find('/').unwrap_or(text.len());
+            for take in (1..=end).rev() {
+                if match_simple_pattern(rest, &text[take..]) {
+                    return true;
+                }
+            }
             return false;
         }
-        let end = text.find('/').unwrap_or(text.len());
-        for take in (1..=end).rev() {
-            if match_simple_pattern(rest, &text[take..]) {
-                return true;
+        if let Some(rest) = pattern.strip_prefix(".+") {
+            if text.is_empty() {
+                return false;
             }
-        }
-        return false;
-    }
-    if let Some(rest) = pattern.strip_prefix(".+") {
-        if text.is_empty() {
+            for take in (1..=text.len()).rev() {
+                if match_simple_pattern(rest, &text[take..]) {
+                    return true;
+                }
+            }
             return false;
         }
-        for take in (1..=text.len()).rev() {
-            if match_simple_pattern(rest, &text[take..]) {
-                return true;
+        // Consume a run of literal characters without recursing.
+        let (pat_ch, pat_rest) = if let Some(rest) = pattern.strip_prefix('\\') {
+            let mut chars = rest.chars();
+            match chars.next() {
+                Some(c) => (c, chars.as_str()),
+                None => return false,
             }
+        } else {
+            let mut chars = pattern.chars();
+            match chars.next() {
+                Some(c) => (c, chars.as_str()),
+                None => return text.is_empty(),
+            }
+        };
+        let mut text_chars = text.chars();
+        match text_chars.next() {
+            Some(c) if c == pat_ch => {
+                pattern = pat_rest;
+                text = text_chars.as_str();
+            }
+            _ => return false,
         }
-        return false;
-    }
-    // Escaped literal or plain literal character.
-    let (pat_ch, pat_rest) = if let Some(rest) = pattern.strip_prefix('\\') {
-        let mut chars = rest.chars();
-        match chars.next() {
-            Some(c) => (c, chars.as_str()),
-            None => return false,
-        }
-    } else {
-        let mut chars = pattern.chars();
-        match chars.next() {
-            Some(c) => (c, chars.as_str()),
-            None => return text.is_empty(),
-        }
-    };
-    let mut text_chars = text.chars();
-    match text_chars.next() {
-        Some(c) if c == pat_ch => match_simple_pattern(pat_rest, text_chars.as_str()),
-        _ => false,
     }
 }
 

@@ -128,7 +128,11 @@ function completeValues(ref, argument, context) {
     const argDef = (prompt.arguments ?? []).find((a) => a.name === argName);
     pool = Array.isArray(argDef?.completionValues)
       ? argDef.completionValues
-      : [`${ref.name}-${argName}-alpha`, `${ref.name}-${argName}-beta`, `${ref.name}-${argName}-gamma`];
+      : [
+          `${ref.name}-${argName}-alpha`,
+          `${ref.name}-${argName}-beta`,
+          `${ref.name}-${argName}-gamma`,
+        ];
   } else if (ref?.type === "ref/resource") {
     const template = resourceTemplates.find((t) => t.uriTemplate === ref.uri);
     if (!template) return null;
@@ -236,11 +240,7 @@ rl.on("line", (line) => {
       break;
     }
     case "resources/templates/list": {
-      const listed = page(
-        resourceTemplates,
-        request.params?.cursor,
-        "resourceTemplates",
-      );
+      const listed = page(resourceTemplates, request.params?.cursor, "resourceTemplates");
       if (!listed) {
         error(request.id, -32602, "invalid fixture cursor");
         break;
@@ -250,9 +250,12 @@ rl.on("line", (line) => {
         break;
       }
       // Strip fixture-only completion metadata from the wire response.
-      const items = listed.items.map(
-        ({ completionValues, completionValuesByKind, ...rest }) => rest,
-      );
+      const items = listed.items.map((item) => {
+        const copy = { ...item };
+        delete copy.completionValues;
+        delete copy.completionValuesByKind;
+        return copy;
+      });
       result(request.id, {
         resourceTemplates: items,
         ...(listed.nextCursor ? { nextCursor: listed.nextCursor } : {}),
@@ -300,15 +303,16 @@ rl.on("line", (line) => {
         error(request.id, -32603, listed.fail);
         break;
       }
-      const items = listed.items.map(({ completionValues, ...rest }) => {
-        // completionValues lives on arguments; strip those extras for list.
-        if (!Array.isArray(rest.arguments)) return rest;
-        return {
-          ...rest,
-          arguments: rest.arguments.map(
-            ({ completionValues: _cv, ...arg }) => arg,
-          ),
-        };
+      // completionValues lives on arguments; strip those extras for list.
+      const items = listed.items.map((prompt) => {
+        const copy = { ...prompt };
+        if (!Array.isArray(copy.arguments)) return copy;
+        copy.arguments = copy.arguments.map((arg) => {
+          const argCopy = { ...arg };
+          delete argCopy.completionValues;
+          return argCopy;
+        });
+        return copy;
       });
       result(request.id, {
         prompts: items,

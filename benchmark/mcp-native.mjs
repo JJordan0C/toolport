@@ -131,9 +131,7 @@ function definitions(kind, count) {
       // policy collapses identical templates (cross-server and within-server).
       const isLater = index === count - 1;
       return {
-        uriTemplate: isLater
-          ? `fixture://later/{id}`
-          : `fixture://item/${suffix}/{id}`,
+        uriTemplate: isLater ? `fixture://later/{id}` : `fixture://item/${suffix}/{id}`,
         name: isLater ? `later_template` : `item_template_${suffix}`,
         description: isLater
           ? `Later-page template ${suffix}`
@@ -151,7 +149,11 @@ function definitions(kind, count) {
         {
           name: "topic",
           required: false,
-          completionValues: [`topic-${suffix}-a`, `topic-${suffix}-b`, `topic-${suffix}-c`],
+          completionValues: [
+            `topic-${suffix}-a`,
+            `topic-${suffix}-b`,
+            `topic-${suffix}-c`,
+          ],
         },
       ],
     };
@@ -387,10 +389,7 @@ async function main() {
     // Registry order: alpha first, then beta. First writer must own the URI.
     const collideReg = writeRegistry(
       dir,
-      [
-        fixtureServer("alpha", collideA),
-        fixtureServer("beta", collideB),
-      ],
+      [fixtureServer("alpha", collideA), fixtureServer("beta", collideB)],
       { registryName: "collide-registry.json" },
     );
     const collideData = mkdtempSync(join(tmpdir(), "toolport-mcp-collide-"));

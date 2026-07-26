@@ -4284,9 +4284,10 @@ fn reconcile_quarantine(
     router: &Arc<Mutex<Arc<Router>>>,
     stdout: &Arc<Mutex<std::io::Stdout>>,
     profile: Option<&str>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
 ) -> bool {
     match effective_quarantine(registry, profile) {
-        Some(want) => reconcile_to(router, stdout, want),
+        Some(want) => reconcile_to(router, stdout, mcp_sessions, want),
         // Store unreadable: keep enforcing the current set rather than weakening it.
         None => false,
     }
@@ -4299,6 +4300,7 @@ fn reconcile_quarantine(
 fn reconcile_to(
     router: &Arc<Mutex<Arc<Router>>>,
     stdout: &Arc<Mutex<std::io::Stdout>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
     want: BTreeSet<String>,
 ) -> bool {
     let changed = {
@@ -4323,7 +4325,9 @@ fn reconcile_to(
         // success path visible too.
         glog("quarantine set changed on disk; re-filtering exposed tools");
         eprintln!("toolport: quarantine set changed on disk; re-filtering exposed tools");
-        notify_tools_changed(stdout, None);
+        // Fan to HTTP MCP sessions too (SOU-328): quarantine/re-approval must not
+        // leave streamable-HTTP clients on a stale tools/list.
+        notify_tools_changed(stdout, mcp_sessions);
     }
     changed
 }
@@ -4623,7 +4627,7 @@ fn watch_tick(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        reconcile_quarantine(registry, router, stdout, p.as_deref())
+        reconcile_quarantine(registry, router, stdout, p.as_deref(), mcp_sessions)
     };
     // A live downstream server that changed its own tool set (sent
     // tools/list_changed) sets this. Swap before acting so a notification
@@ -10849,17 +10853,17 @@ mod tests {
         let (router, stdout) = reconcile_harness();
 
         // A drift quarantines a tool.
-        assert!(reconcile_to(&router, &stdout, set_of(&["srv__wipe"])));
+        assert!(reconcile_to(&router, &stdout, None, set_of(&["srv__wipe"])));
         assert_eq!(router.lock().unwrap().quarantined(), &set_of(&["srv__wipe"]));
 
         // The same set again is a no-op, so the gateway's own quarantine writes can't
         // churn the catalog or spam the client with list_changed.
-        assert!(!reconcile_to(&router, &stdout, set_of(&["srv__wipe"])));
+        assert!(!reconcile_to(&router, &stdout, None, set_of(&["srv__wipe"])));
 
         // The user re-approves and the set SHRINKS. This is the assertion that fails
         // without the fix.
         assert!(
-            reconcile_to(&router, &stdout, BTreeSet::new()),
+            reconcile_to(&router, &stdout, None, BTreeSet::new()),
             "a release must be reconciled into the live router"
         );
         assert!(
@@ -10868,7 +10872,7 @@ mod tests {
         );
 
         // Idempotent: the next watcher tick does nothing.
-        assert!(!reconcile_to(&router, &stdout, BTreeSet::new()));
+        assert!(!reconcile_to(&router, &stdout, None, BTreeSet::new()));
     }
 
     #[test]
@@ -10876,11 +10880,11 @@ mod tests {
         // Releasing one of several must still re-filter. A cheaper "is it empty vs
         // non-empty" check would miss this and leave the released tool blocked.
         let (router, stdout) = reconcile_harness();
-        assert!(reconcile_to(&router, &stdout, set_of(&["a__x", "b__y"])));
+        assert!(reconcile_to(&router, &stdout, None, set_of(&["a__x", "b__y"])));
 
-        assert!(reconcile_to(&router, &stdout, set_of(&["a__x"])));
+        assert!(reconcile_to(&router, &stdout, None, set_of(&["a__x"])));
         assert_eq!(router.lock().unwrap().quarantined(), &set_of(&["a__x"]));
-        assert!(!reconcile_to(&router, &stdout, set_of(&["a__x"])));
+        assert!(!reconcile_to(&router, &stdout, None, set_of(&["a__x"])));
     }
 
     #[test]
@@ -10929,7 +10933,7 @@ mod tests {
         let router = Arc::new(Mutex::new(Arc::new(Router::new())));
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
 
-        assert!(reconcile_quarantine(&registry, &router, &stdout, profile));
+        assert!(reconcile_quarantine(&registry, &router, &stdout, profile, None));
         assert!(router.lock().unwrap().quarantined().contains("srv__wipe"));
 
         // Corrupt the store underneath the running gateway.
@@ -10943,7 +10947,7 @@ mod tests {
             "an unreadable store must be reported as unknown, not as empty"
         );
         assert!(
-            !reconcile_quarantine(&registry, &router, &stdout, profile),
+            !reconcile_quarantine(&registry, &router, &stdout, profile, None),
             "a corrupt store must not trigger a re-filter"
         );
         assert!(
@@ -10953,7 +10957,7 @@ mod tests {
 
         // And it must recover once the store is readable again.
         std::fs::write(&path, "{}").unwrap();
-        assert!(reconcile_quarantine(&registry, &router, &stdout, profile));
+        assert!(reconcile_quarantine(&registry, &router, &stdout, profile, None));
         assert!(router.lock().unwrap().quarantined().is_empty());
 
         drop(_data_dir);
@@ -11118,15 +11122,15 @@ mod tests {
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
 
         // Picks the persisted set up off disk (effective_quarantine's ON branch).
-        assert!(reconcile_quarantine(&registry, &router, &stdout, profile));
+        assert!(reconcile_quarantine(&registry, &router, &stdout, profile, None));
         assert!(router.lock().unwrap().quarantined().contains("srv__wipe"));
 
         // Steady state: no churn while nothing changes.
-        assert!(!reconcile_quarantine(&registry, &router, &stdout, profile));
+        assert!(!reconcile_quarantine(&registry, &router, &stdout, profile, None));
 
         // The user re-approves. This is the SOU-292 regression, end to end.
         assert!(conduit_lib::integrity::release(profile, "srv__wipe"));
-        assert!(reconcile_quarantine(&registry, &router, &stdout, profile));
+        assert!(reconcile_quarantine(&registry, &router, &stdout, profile, None));
         assert!(
             router.lock().unwrap().quarantined().is_empty(),
             "a released tool must stop being enforced"
