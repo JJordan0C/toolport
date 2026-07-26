@@ -543,22 +543,22 @@ fn run_script_tool_def() -> Value {
     json!({
         "name": "toolport_run_script",
         "description": "Run ONE JavaScript orchestration script server-side instead of making \
-            many separate tool calls. Inside the script, call downstream tools with \
-            `toolport.call(name, args)` (sync) or `toolport.callAsync(name, args)` (Promise; \
-            fan out with `Promise.all` / `await`, bounded parallel host calls). \
-            `toolport.callAll([{name, args}, ...])` is Promise.all sugar. \
-            name = the exact tool name from toolport_search_tools; args = its arguments object. \
+            many separate tool calls. Prefer the typed surface when you know the server: \
+            `servers.stripe.create_refund({...})` (sync) or `servers.stripe.createRefund.async({...})` \
+            (Promise; fan out with Promise.all / await). CamelCase aliases are provided when they \
+            differ from the snake_case tool segment. Also: `toolport.call(name, args)`, \
+            `toolport.callAsync`, `toolport.callAll`, `toolport.listTools()`, `toolport.listServers()`. \
             Loop, branch, and combine results, then `return` a single aggregated value - only the \
-            returned value comes back, so intermediate results never fill your context and a \
-            multi-step task costs one round-trip. Top-level `await` works. Each call still passes \
-            the same gates as toolport_call_tool (scope, human approval). Best when you already \
-            know the steps; use toolport_search_tools + toolport_call_tool while exploring.",
+            returned value comes back, so intermediate results never fill your context. Top-level \
+            await works. Each call still passes the same gates as toolport_call_tool (scope, human \
+            approval). Best when you already know the steps; use toolport_search_tools + \
+            toolport_call_tool while exploring.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "script": {
                     "type": "string",
-                    "description": "JavaScript body. Use toolport.call / callAsync / callAll and `return` the final value (top-level await ok). The optional `data` payload below is available as the global `data`."
+                    "description": "JavaScript body. Prefer servers.<server>.<tool>(args) or toolport.call / callAsync / callAll; `return` the final value (top-level await ok). Global `data` is the optional payload below; toolport.listTools/listServers introspect the scoped catalog."
                 },
                 "data": {
                     "type": "object",
@@ -3224,6 +3224,34 @@ fn defend_and_shape(
     result
 }
 
+/// Exposed tool names for code-mode `servers.*` stubs: full catalog minus gateway
+/// meta-tools, optionally filtered to the client's allowed server prefixes.
+fn script_catalog_tools(
+    cached: &[Value],
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
+    let mut names: Vec<String> = cached
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .filter(|n| !codemode::is_code_mode_meta_tool(n))
+        .filter(|n| {
+            let Some(set) = allowed else {
+                return true;
+            };
+            match codemode::split_exposed_name(n) {
+                Some((server, _)) => set.contains(server),
+                // No `server__tool` shape: still allow through so string-form call works;
+                // stubs simply won't group it under servers.*.
+                None => true,
+            }
+        })
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Dispatch a `toolport_run_script` "code mode" call: run the agent's script in the boa
 /// sandbox with a `toolport.call()` binding that re-enters [`execute_call`] for each
 /// downstream call, so every call passes the identical scope + approval gates a direct call
@@ -3284,7 +3312,11 @@ fn run_script_dispatch(
             )
         });
 
-    let outcome = codemode::run_script(&script, data, call, codemode::Limits::default());
+    // Typed `servers.*` stubs from the client-scoped catalog (meta-tools excluded).
+    let catalog = script_catalog_tools(cached, allowed);
+
+    let outcome =
+        codemode::run_script(&script, data, call, codemode::Limits::default(), &catalog);
 
     // Account the round-trips this one call replaced (calls - 1), composing with the
     // lazy-discovery savings in the same log + counter.
@@ -9253,6 +9285,61 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not available to this client"));
+    }
+
+    /// Typed stubs only list tools on servers the client is scoped to; out-of-scope
+    /// servers are absent from `servers` / listServers even if present in the full cache.
+    #[test]
+    fn run_script_servers_stubs_are_scope_filtered() {
+        let reg = Registry::default();
+        let router = Arc::new(paging_router("hi".to_string()));
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("other".to_string());
+        let cached = vec![
+            json!({ "name": "s__big" }),
+            json!({ "name": "other__thing" }),
+            json!({ "name": "toolport_status" }),
+        ];
+        let args = json!({
+            "script": "return { \
+                servers: toolport.listServers().sort(), \
+                tools: toolport.listTools().sort(), \
+                hasS: typeof servers.s, \
+                hasOther: typeof servers.other \
+            };"
+        });
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &cached,
+            Some("scoped"),
+            Some(&allowed),
+            None,
+            &args,
+        );
+        assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
+        let v = &result["structuredContent"]["result"];
+        assert_eq!(v["servers"], json!(["other"]));
+        assert_eq!(v["tools"], json!(["other__thing"]));
+        assert_eq!(v["hasS"], json!("undefined"));
+        assert_eq!(v["hasOther"], json!("object"));
+    }
+
+    /// End-to-end: a typed stub routes through execute_call like toolport.call.
+    #[test]
+    fn run_script_servers_stub_aggregates_downstream() {
+        let reg = Registry::default();
+        let router = Arc::new(paging_router("hello".to_string()));
+        let cached = vec![json!({ "name": "s__big" })];
+        let args = json!({
+            "script": "var a = servers.s.big({}); return a.structuredContent.user.name;"
+        });
+        let result =
+            run_script_dispatch(&reg, Some(&router), &cached, None, None, None, &args);
+        assert_eq!(result["isError"].as_bool(), Some(false));
+        assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
+        assert_eq!(result["structuredContent"]["toolportScript"]["calls"], 1);
+        assert_eq!(result["structuredContent"]["result"], "Alice");
     }
 
     /// Safety: a destructive tool called INSIDE a script fails closed when per-call

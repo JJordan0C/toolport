@@ -16,6 +16,10 @@
 //! - `toolport.callAsync(name, args)` — returns a Promise; independent calls fan out with
 //!   bounded host-side parallelism (v2)
 //! - `toolport.callAll([{name, args}, ...])` — `Promise.all` sugar over `callAsync`
+//! - `servers.<server>.<tool>(args)` — typed stubs from the scoped catalog (sync); use
+//!   `.async(args)` for the Promise form. CamelCase aliases are added when they differ
+//!   from the sanitized tool segment (e.g. `create_refund` and `createRefund`).
+//! - `toolport.listTools()` / `toolport.listServers()` — catalog introspection
 //!
 //! Each binding routes through the caller-supplied closure (the same path as
 //! `toolport_call_tool`: per-client scope, human approval, result shaping), so a script
@@ -23,7 +27,7 @@
 //! deadline, max concurrent host calls, and boa's loop/recursion caps.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -199,16 +203,172 @@ globalThis.toolport = {
             return toolport.callAsync(name, args);
         }));
     },
+    listTools: function () { return []; },
+    listServers: function () { return []; },
 };
 "#;
 
+/// Build the `globalThis.servers` injection from exposed catalog tool names
+/// (`server__tool`). Safe to eval after [`PRELUDE`]: stubs call through `toolport.call` /
+/// `callAsync`, so gates stay intact. Empty catalog yields an empty `servers` object.
+///
+/// Property names use the sanitized tool segment; when a camelCase form differs and does
+/// not collide with another tool on the same server, both names are registered.
+pub fn build_servers_prelude(catalog: &[String]) -> String {
+    // server -> (tool_prop -> full exposed name), BTree for stable output in tests.
+    let mut by_server: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    for exposed in catalog {
+        let Some((server, tool)) = split_exposed_name(exposed) else {
+            continue;
+        };
+        if server.is_empty() || tool.is_empty() {
+            continue;
+        }
+        by_server
+            .entry(server.to_string())
+            .or_default()
+            .entry(tool.to_string())
+            .or_insert_with(|| exposed.clone());
+    }
+
+    let mut out = String::with_capacity(256 + catalog.len() * 80);
+    out.push_str("(function () {\n");
+    out.push_str("  var servers = Object.create(null);\n");
+    out.push_str("  function stub(fullName) {\n");
+    out.push_str("    var f = function (args) {\n");
+    out.push_str("      return toolport.call(fullName, args === undefined || args === null ? {} : args);\n");
+    out.push_str("    };\n");
+    out.push_str("    f.async = function (args) {\n");
+    out.push_str("      return toolport.callAsync(fullName, args === undefined || args === null ? {} : args);\n");
+    out.push_str("    };\n");
+    out.push_str("    f.toolName = fullName;\n");
+    out.push_str("    return f;\n");
+    out.push_str("  }\n");
+    out.push_str("  function ensure(server) {\n");
+    out.push_str("    if (!servers[server]) servers[server] = Object.create(null);\n");
+    out.push_str("    return servers[server];\n");
+    out.push_str("  }\n");
+
+    let mut all_tools: Vec<String> = Vec::new();
+    for (server, tools) in &by_server {
+        let server_lit = js_string_literal(server);
+        out.push_str("  {\n");
+        out.push_str("    var s = ensure(");
+        out.push_str(&server_lit);
+        out.push_str(");\n");
+
+        // Track props claimed on this server so camelCase aliases don't clobber peers.
+        let claimed: BTreeSet<&str> = tools.keys().map(String::as_str).collect();
+        for (tool, exposed) in tools {
+            let exposed_lit = js_string_literal(exposed);
+            let tool_lit = js_string_literal(tool);
+            out.push_str("    s[");
+            out.push_str(&tool_lit);
+            out.push_str("] = stub(");
+            out.push_str(&exposed_lit);
+            out.push_str(");\n");
+            all_tools.push(exposed.clone());
+
+            let camel = snake_to_camel(tool);
+            if camel != *tool && is_js_ident_start(&camel) && !claimed.contains(camel.as_str()) {
+                let camel_lit = js_string_literal(&camel);
+                out.push_str("    if (s[");
+                out.push_str(&camel_lit);
+                out.push_str("] === undefined) s[");
+                out.push_str(&camel_lit);
+                out.push_str("] = s[");
+                out.push_str(&tool_lit);
+                out.push_str("];\n");
+            }
+        }
+        out.push_str("  }\n");
+    }
+
+    out.push_str("  globalThis.servers = servers;\n");
+    out.push_str("  var __toolport_catalog = [");
+    for (i, name) in all_tools.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&js_string_literal(name));
+    }
+    out.push_str("];\n");
+    out.push_str("  toolport.listTools = function () { return __toolport_catalog.slice(); };\n");
+    out.push_str("  toolport.listServers = function () { return Object.keys(servers); };\n");
+    out.push_str("})();\n");
+    out
+}
+
+/// Split an exposed `server__tool` name on the first `__` (matches how the router
+/// allocates names). Returns `None` when the separator is missing.
+pub fn split_exposed_name(exposed: &str) -> Option<(&str, &str)> {
+    exposed.split_once("__")
+}
+
+/// True when `name` is a gateway meta-tool that should not appear on `servers.*`.
+pub fn is_code_mode_meta_tool(name: &str) -> bool {
+    name.starts_with("toolport_") || name.starts_with("help_")
+}
+
+fn js_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn snake_to_camel(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut up = false;
+    for c in s.chars() {
+        if c == '_' {
+            up = true;
+            continue;
+        }
+        if up {
+            for u in c.to_uppercase() {
+                out.push(u);
+            }
+            up = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn is_js_ident_start(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
 /// Run `script` with `data` available as a global `data` object, giving it `toolport.call`
-/// / `callAsync` / `callAll` bound to `call`. Returns one aggregated [`ScriptOutcome`];
-/// intermediate call results never surface to the model.
+/// / `callAsync` / `callAll` bound to `call`, plus `servers.*` stubs from `catalog`.
+/// Returns one aggregated [`ScriptOutcome`]; intermediate call results never surface to
+/// the model.
 ///
 /// Scripts are wrapped in an async IIFE so top-level `await` and returned Promises work.
 /// Independent `callAsync` work is flushed with up to [`Limits::max_parallel`] host calls
 /// in flight at once.
+///
+/// `catalog` is the list of exposed tool names (`server__tool`) the script may stub;
+/// pass the client-scoped cache (meta tools filtered). Empty is fine: string-form
+/// `toolport.call` still works.
 ///
 /// `call` must be `'static` (the gateway builds it from `Arc`-cloned handles). It is
 /// invoked once per host tool call; whatever it returns becomes that call's JS result.
@@ -217,6 +377,7 @@ pub fn run_script(
     data: Value,
     call: CallBinding,
     limits: Limits,
+    catalog: &[String],
 ) -> ScriptOutcome {
     let calls_made = Rc::new(Cell::new(0usize));
     let pending = Rc::new(RefCell::new(VecDeque::new()));
@@ -290,6 +451,12 @@ pub fn run_script(
     }
 
     if let Err(e) = context.eval(Source::from_bytes(PRELUDE)) {
+        return fail(calls_made.get(), e);
+    }
+
+    // Typed `servers.*` surface from the scoped catalog (after toolport bindings exist).
+    let servers_js = build_servers_prelude(catalog);
+    if let Err(e) = context.eval(Source::from_bytes(servers_js.as_bytes())) {
         return fail(calls_made.get(), e);
     }
 
@@ -520,10 +687,14 @@ mod tests {
         })
     }
 
+    fn run(script: &str, data: Value, call: CallBinding, limits: Limits) -> ScriptOutcome {
+        run_script(script, data, call, limits, &[])
+    }
+
     #[test]
     fn runs_a_plain_script_and_returns_its_value() {
         let call = Arc::new(|_: &str, _: Value| Value::Null);
-        let out = run_script("return 1 + 2;", json!({}), call, Limits::default());
+        let out = run("return 1 + 2;", json!({}), call, Limits::default());
         assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
         assert_eq!(out.value, json!(3));
         assert_eq!(out.calls, 0);
@@ -541,7 +712,7 @@ mod tests {
             }
             return out;
         "#;
-        let out = run_script(script, json!({ "ids": [10, 20, 30] }), call, Limits::default());
+        let out = run(script, json!({ "ids": [10, 20, 30] }), call, Limits::default());
         assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
         assert_eq!(out.value, json!([10, 20, 30]));
         assert_eq!(out.calls, 3);
@@ -558,7 +729,7 @@ mod tests {
             max_calls: 2,
             ..Limits::default()
         };
-        let out = run_script(
+        let out = run(
             "for (var i = 0; i < 10; i++) { toolport.call('t', {}); } return 'done';",
             json!({}),
             call,
@@ -577,7 +748,7 @@ mod tests {
             loop_iteration_limit: 1000,
             ..Limits::default()
         };
-        let out = run_script("while (true) {} return 1;", json!({}), call, limits);
+        let out = run("while (true) {} return 1;", json!({}), call, limits);
         assert_ne!(out.error, None, "an infinite loop must be stopped");
         assert_eq!(out.calls, 0);
     }
@@ -585,14 +756,14 @@ mod tests {
     #[test]
     fn a_thrown_error_is_reported_not_panicked() {
         let call = Arc::new(|_: &str, _: Value| Value::Null);
-        let out = run_script("throw new Error('boom');", json!({}), call, Limits::default());
+        let out = run("throw new Error('boom');", json!({}), call, Limits::default());
         assert!(out.error.unwrap().contains("boom"));
     }
 
     #[test]
     fn syntax_error_fails_closed() {
         let call = Arc::new(|_: &str, _: Value| Value::Null);
-        let out = run_script("this is not valid )(", json!({}), call, Limits::default());
+        let out = run("this is not valid )(", json!({}), call, Limits::default());
         assert_ne!(out.error, None);
         assert_eq!(out.calls, 0);
     }
@@ -605,7 +776,7 @@ mod tests {
             const a = await toolport.callAsync("lookup", { id: 7 });
             return a.args.id;
         "#;
-        let out = run_script(script, json!({}), call, Limits::default());
+        let out = run(script, json!({}), call, Limits::default());
         assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
         assert_eq!(out.value, json!(7));
         assert_eq!(out.calls, 1);
@@ -623,7 +794,7 @@ mod tests {
             ]);
             return results.map(function (r) { return r.echo + ":" + r.args.n; });
         "#;
-        let out = run_script(script, json!({}), call, Limits::default());
+        let out = run(script, json!({}), call, Limits::default());
         assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
         assert_eq!(out.value, json!(["a:1", "b:2", "c:3"]));
         assert_eq!(out.calls, 3);
@@ -646,7 +817,7 @@ mod tests {
             ]);
             return results.map(function (r) { return r.echo + r.args.i; }).join(",");
         "#;
-        let out = run_script(script, json!({}), call, Limits::default());
+        let out = run(script, json!({}), call, Limits::default());
         assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
         assert_eq!(out.value, json!("x1,y2"));
         assert_eq!(out.calls, 2);
@@ -659,7 +830,7 @@ mod tests {
             max_calls: 2,
             ..Limits::default()
         };
-        let out = run_script(
+        let out = run(
             r#"
                 await Promise.all([
                     toolport.callAsync("a", {}),
@@ -691,7 +862,7 @@ mod tests {
             ..Limits::default()
         };
         let started = Instant::now();
-        let out = run_script(
+        let out = run(
             r#"
                 return await Promise.all([
                     toolport.callAsync("a", {}),
@@ -739,7 +910,7 @@ mod tests {
             wall_clock: StdDuration::from_secs(10),
             ..Limits::default()
         };
-        let out = run_script(
+        let out = run(
             r#"
                 return await Promise.all([
                     toolport.callAsync("a", {}),
@@ -757,5 +928,133 @@ mod tests {
         let peak = *peak.lock().unwrap();
         assert!(peak <= 2, "peak concurrency {peak} exceeded max_parallel 2");
         assert!(peak >= 2, "expected to reach max_parallel, peak={peak}");
+    }
+
+    #[test]
+    fn servers_stub_calls_through_with_snake_and_camel() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let call = recording_call(log.clone());
+        let catalog = vec![
+            "stripe__create_refund".to_string(),
+            "github__create_pull_request".to_string(),
+        ];
+        let script = r#"
+            const a = servers.stripe.create_refund({ id: "ch_1" });
+            const b = servers.stripe.createRefund({ id: "ch_2" });
+            const c = servers.github.createPullRequest({ title: "t" });
+            return {
+                tools: toolport.listTools().sort(),
+                servers: toolport.listServers().sort(),
+                names: [a.echo, b.echo, c.echo],
+                ids: [a.args.id, b.args.id],
+                title: c.args.title,
+            };
+        "#;
+        let out = run_script(script, json!({}), call, Limits::default(), &catalog);
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(out.calls, 3);
+        assert_eq!(
+            out.value["names"],
+            json!([
+                "stripe__create_refund",
+                "stripe__create_refund",
+                "github__create_pull_request"
+            ])
+        );
+        assert_eq!(out.value["ids"], json!(["ch_1", "ch_2"]));
+        assert_eq!(out.value["title"], json!("t"));
+        assert_eq!(
+            out.value["tools"],
+            json!(["github__create_pull_request", "stripe__create_refund"])
+        );
+        assert_eq!(out.value["servers"], json!(["github", "stripe"]));
+        let log = log.lock().unwrap();
+        assert_eq!(log[0].0, "stripe__create_refund");
+        assert_eq!(log[2].0, "github__create_pull_request");
+    }
+
+    #[test]
+    fn servers_stub_async_fans_out() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let call = recording_call(log.clone());
+        let catalog = vec![
+            "stripe__create_refund".to_string(),
+            "resend__send_email".to_string(),
+        ];
+        let script = r#"
+            const results = await Promise.all([
+                servers.stripe.createRefund.async({ id: 1 }),
+                servers.resend.send_email.async({ to: "a@b.c" }),
+            ]);
+            return results.map(function (r) { return r.echo; }).sort();
+        "#;
+        let out = run_script(script, json!({}), call, Limits::default(), &catalog);
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(out.calls, 2);
+        assert_eq!(
+            out.value,
+            json!(["resend__send_email", "stripe__create_refund"])
+        );
+    }
+
+    #[test]
+    fn empty_catalog_still_exposes_empty_servers() {
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let out = run(
+            "return { tools: toolport.listTools(), servers: toolport.listServers(), has: typeof servers };",
+            json!({}),
+            call,
+            Limits::default(),
+        );
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(out.value["tools"], json!([]));
+        assert_eq!(out.value["servers"], json!([]));
+        assert_eq!(out.value["has"], json!("object"));
+    }
+
+    #[test]
+    fn js_string_literal_escapes_quotes_and_newlines() {
+        assert_eq!(js_string_literal("a'b\\c\nd"), "'a\\'b\\\\c\\nd'");
+    }
+
+    #[test]
+    fn snake_to_camel_basic() {
+        assert_eq!(snake_to_camel("create_refund"), "createRefund");
+        assert_eq!(snake_to_camel("alreadyCamel"), "alreadyCamel");
+        assert_eq!(snake_to_camel("a_b_c"), "aBC");
+    }
+
+    #[test]
+    fn split_exposed_name_uses_first_separator() {
+        assert_eq!(
+            split_exposed_name("stripe__create_refund"),
+            Some(("stripe", "create_refund"))
+        );
+        assert_eq!(
+            split_exposed_name("s__tool__extra"),
+            Some(("s", "tool__extra"))
+        );
+        assert_eq!(split_exposed_name("nosep"), None);
+    }
+
+    #[test]
+    fn camel_alias_does_not_clobber_sibling_tool() {
+        // If both create_refund and createRefund exist as distinct tools, keep both.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let call = recording_call(log.clone());
+        let catalog = vec![
+            "s__create_refund".to_string(),
+            "s__createRefund".to_string(),
+        ];
+        let script = r#"
+            return {
+                a: servers.s.create_refund({}).echo,
+                b: servers.s.createRefund({}).echo,
+            };
+        "#;
+        let out = run_script(script, json!({}), call, Limits::default(), &catalog);
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(out.value["a"], json!("s__create_refund"));
+        assert_eq!(out.value["b"], json!("s__createRefund"));
     }
 }
