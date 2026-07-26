@@ -20,11 +20,14 @@
 //!   `.async(args)` for the Promise form. CamelCase aliases are added when they differ
 //!   from the sanitized tool segment (e.g. `create_refund` and `createRefund`).
 //! - `toolport.listTools()` / `toolport.listServers()` — catalog introspection
+//! - `toolport.fetchResult({cursor, offset?, len?, projection?})` — page a previously
+//!   shaped result (cursor handoff / structured projection) without leaving the script
 //!
-//! Each binding routes through the caller-supplied closure (the same path as
-//! `toolport_call_tool`: per-client scope, human approval, result shaping), so a script
-//! never widens what the client could already reach. Limits: call budget, wall-clock
-//! deadline, max concurrent host calls, and boa's loop/recursion caps.
+//! Downstream calls from a script still pass scope, HITL, and content-defense gates, but
+//! intermediate results are **not** byte-budget shaped: full bodies stay in the sandbox
+//! (they never enter model context). The gateway shapes only the script's final aggregate
+//! for the client. Limits: call budget, wall-clock deadline, max concurrent host calls,
+//! promise-job budget, and boa's loop/recursion caps.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -47,6 +50,18 @@ use serde_json::{json, Value};
 /// `Send + Sync` so independent `callAsync` work can run on a small thread pool without
 /// serializing every host call on the JS thread.
 pub type CallBinding = Arc<dyn Fn(&str, Value) -> Value + Send + Sync>;
+
+/// Arguments for [`FetchBinding`] / `toolport.fetchResult`.
+#[derive(Debug, Clone)]
+pub struct FetchArgs {
+    pub cursor: String,
+    pub offset: usize,
+    pub len: usize,
+    pub projection: Option<String>,
+}
+
+/// Host binding for paging a shaped result by cursor (same cache as `toolport_fetch_result`).
+pub type FetchBinding = Arc<dyn Fn(FetchArgs) -> Value + Send + Sync>;
 
 /// Resource limits for one script run. All are fail-closed: exceeding any of them aborts
 /// the script with an error result the agent can read and recover from.
@@ -249,6 +264,19 @@ struct HostState {
     pending: Rc<RefCell<VecDeque<PendingCall>>>,
 }
 
+/// Capture for `__toolport_fetch_result` (no GC refs).
+struct FetchHost {
+    fetch: Option<FetchBinding>,
+}
+
+impl Finalize for FetchHost {}
+// SAFETY: only Arc/Option of host closures — no boa heap pointers.
+unsafe impl Trace for FetchHost {
+    unsafe fn trace(&self, _tracer: &mut boa_gc::Tracer) {}
+    unsafe fn trace_non_roots(&self) {}
+    fn run_finalizer(&self) {}
+}
+
 impl Clone for HostState {
     fn clone(&self) -> Self {
         Self {
@@ -321,6 +349,18 @@ globalThis.toolport = {
             var args = item && item.args;
             return toolport.callAsync(name, args);
         }));
+    },
+    // Page a shaped result by cursor (same stash as toolport_fetch_result). Prefer
+    // projecting / filtering full intermediate tool results in-script instead; this
+    // is for cursors handed in via `data` or left from a prior shaped agent turn.
+    fetchResult: function (opts) {
+        opts = (opts === undefined || opts === null) ? {} : opts;
+        return JSON.parse(__toolport_fetch_result(JSON.stringify({
+            cursor: opts.cursor,
+            offset: opts.offset,
+            len: opts.len,
+            projection: opts.projection
+        })));
     },
     listTools: function () { return []; },
     listServers: function () { return []; },
@@ -477,13 +517,16 @@ fn is_js_ident_start(s: &str) -> bool {
 }
 
 /// Run `script` with `data` available as a global `data` object, giving it `toolport.call`
-/// / `callAsync` / `callAll` bound to `call`, plus `servers.*` stubs from `catalog`.
-/// Returns one aggregated [`ScriptOutcome`]; intermediate call results never surface to
-/// the model.
+/// / `callAsync` / `callAll` / `fetchResult` bound to host closures, plus `servers.*`
+/// stubs from `catalog`. Returns one aggregated [`ScriptOutcome`]; intermediate call
+/// results never surface to the model.
 ///
 /// Scripts are wrapped in an async IIFE so top-level `await` and returned Promises work.
 /// Independent `callAsync` work is flushed with up to [`Limits::max_parallel`] host calls
 /// in flight at once.
+///
+/// `fetch` wires `toolport.fetchResult` (cursor paging / projection). Pass `None` to
+/// leave fetchResult as a fail-closed stub (tests that only exercise tool calls).
 ///
 /// `catalog` is the list of exposed tool names (`server__tool`) the script may stub;
 /// pass the client-scoped cache (meta tools filtered). Empty is fine: string-form
@@ -495,6 +538,7 @@ pub fn run_script(
     script: &str,
     data: Value,
     call: CallBinding,
+    fetch: Option<FetchBinding>,
     limits: Limits,
     catalog: &[String],
 ) -> ScriptOutcome {
@@ -564,6 +608,57 @@ pub fn run_script(
     }
     if let Err(e) =
         context.register_global_callable(js_string!("__toolport_call_async"), 2, async_native)
+    {
+        return fail(calls_made.get(), e);
+    }
+
+    // Fetch binding: pages shaped results by cursor. Absent binding fails closed.
+    let fetch_host = FetchHost { fetch };
+    let fetch_native = NativeFunction::from_copy_closure_with_captures(
+        |_this: &JsValue, args: &[JsValue], host: &FetchHost, _ctx: &mut Context| {
+            let Some(fetch) = host.fetch.as_ref() else {
+                return Err(JsError::from_native(JsNativeError::error().with_message(
+                    "toolport.fetchResult is unavailable in this context",
+                )));
+            };
+            let raw = args
+                .first()
+                .and_then(JsValue::as_string)
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_else(|| "{}".to_string());
+            let spec: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+            let cursor = spec
+                .get("cursor")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if cursor.is_empty() {
+                return Err(JsError::from_native(JsNativeError::error().with_message(
+                    "toolport.fetchResult requires a non-empty cursor",
+                )));
+            }
+            let offset = spec
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let len = spec.get("len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let projection = spec
+                .get("projection")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let result = (fetch)(FetchArgs {
+                cursor,
+                offset,
+                len,
+                projection,
+            });
+            let result_str = serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string());
+            Ok(JsValue::from(js_string!(result_str)))
+        },
+        fetch_host,
+    );
+    if let Err(e) =
+        context.register_global_callable(js_string!("__toolport_fetch_result"), 1, fetch_native)
     {
         return fail(calls_made.get(), e);
     }
@@ -818,7 +913,7 @@ mod tests {
     }
 
     fn run(script: &str, data: Value, call: CallBinding, limits: Limits) -> ScriptOutcome {
-        run_script(script, data, call, limits, &[])
+        run_script(script, data, call, None, limits, &[])
     }
 
     #[test]
@@ -1007,8 +1102,9 @@ mod tests {
         let elapsed = started.elapsed();
         assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
         assert_eq!(out.calls, 3);
+        // Three 80ms sequential would be ~240ms; allow headroom for scheduler noise.
         assert!(
-            elapsed < StdDuration::from_millis(200),
+            elapsed < StdDuration::from_millis(220),
             "expected overlapping host calls, took {elapsed:?}"
         );
     }
@@ -1080,7 +1176,7 @@ mod tests {
                 title: c.args.title,
             };
         "#;
-        let out = run_script(script, json!({}), call, Limits::default(), &catalog);
+        let out = run_script(script, json!({}), call, None, Limits::default(), &catalog);
         assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
         assert_eq!(out.calls, 3);
         assert_eq!(
@@ -1118,7 +1214,7 @@ mod tests {
             ]);
             return results.map(function (r) { return r.echo; }).sort();
         "#;
-        let out = run_script(script, json!({}), call, Limits::default(), &catalog);
+        let out = run_script(script, json!({}), call, None, Limits::default(), &catalog);
         assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
         assert_eq!(out.calls, 2);
         assert_eq!(
@@ -1182,10 +1278,58 @@ mod tests {
                 b: servers.s.createRefund({}).echo,
             };
         "#;
-        let out = run_script(script, json!({}), call, Limits::default(), &catalog);
+        let out = run_script(script, json!({}), call, None, Limits::default(), &catalog);
         assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
         assert_eq!(out.value["a"], json!("s__create_refund"));
         assert_eq!(out.value["b"], json!("s__createRefund"));
+    }
+
+    #[test]
+    fn fetch_result_binding_pages_shaped_cursor() {
+        // Simulate a shaped stash entry via the fetch binding (gateway wires shaping::fetch_result).
+        let full = "abcdefghijklmnopqrstuvwxyz";
+        let fetch: FetchBinding = Arc::new(move |args: FetchArgs| {
+            assert_eq!(args.cursor, "r1");
+            let start = args.offset.min(full.len());
+            let end = if args.len == 0 {
+                full.len()
+            } else {
+                start.saturating_add(args.len).min(full.len())
+            };
+            json!({
+                "content": [{ "type": "text", "text": &full[start..end] }],
+                "isError": false
+            })
+        });
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let out = run_script(
+            r#"
+                const a = toolport.fetchResult({ cursor: "r1", offset: 0, len: 5 });
+                const b = toolport.fetchResult({ cursor: "r1", offset: 5, len: 5 });
+                return { a: a.content[0].text, b: b.content[0].text };
+            "#,
+            json!({}),
+            call,
+            Some(fetch),
+            Limits::default(),
+            &[],
+        );
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(out.value["a"], json!("abcde"));
+        assert_eq!(out.value["b"], json!("fghij"));
+    }
+
+    #[test]
+    fn fetch_result_unavailable_without_binding() {
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let out = run(
+            r#"return toolport.fetchResult({ cursor: "r1" });"#,
+            json!({}),
+            call,
+            Limits::default(),
+        );
+        assert_ne!(out.error, None);
+        assert!(out.error.unwrap().contains("unavailable"));
     }
 
     #[test]

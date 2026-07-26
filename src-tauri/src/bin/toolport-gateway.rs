@@ -545,20 +545,18 @@ fn run_script_tool_def() -> Value {
         "description": "Run ONE JavaScript orchestration script server-side instead of making \
             many separate tool calls. Prefer the typed surface when you know the server: \
             `servers.stripe.create_refund({...})` (sync) or `servers.stripe.createRefund.async({...})` \
-            (Promise; fan out with Promise.all / await). CamelCase aliases are provided when they \
-            differ from the snake_case tool segment. Also: `toolport.call(name, args)`, \
-            `toolport.callAsync`, `toolport.callAll`, `toolport.listTools()`, `toolport.listServers()`. \
-            Loop, branch, and combine results, then `return` a single aggregated value - only the \
-            returned value comes back, so intermediate results never fill your context. Top-level \
-            await works. Each call still passes the same gates as toolport_call_tool (scope, human \
-            approval). Best when you already know the steps; use toolport_search_tools + \
-            toolport_call_tool while exploring.",
+            (Promise; fan out with Promise.all / await). Also: `toolport.call`, `callAsync`, \
+            `callAll`, `fetchResult({cursor, offset, projection})`, `listTools()`, `listServers()`. \
+            Intermediate tool results are full-sized inside the script (not context-budget shaped); \
+            only your returned aggregate is shaped for the model. Loop, branch, project, then \
+            `return` one value. Top-level await works. Gates match toolport_call_tool (scope, human \
+            approval). Best when you already know the steps; explore with toolport_search_tools first.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "script": {
                     "type": "string",
-                    "description": "JavaScript body. Prefer servers.<server>.<tool>(args) or toolport.call / callAsync / callAll; `return` the final value (top-level await ok). Global `data` is the optional payload below; toolport.listTools/listServers introspect the scoped catalog."
+                    "description": "JavaScript body. Prefer servers.<server>.<tool>(args) or toolport.call / callAsync / callAll / fetchResult; `return` the final value (top-level await ok). Intermediate results are full-sized in-script. Global `data` is the optional payload below."
                 },
                 "data": {
                     "type": "object",
@@ -2858,6 +2856,10 @@ fn execute_call(
     name: &str,
     arguments: Value,
     mut confirmed: bool,
+    // When false, content defense still runs but result-shaping is skipped. Code-mode
+    // intermediate calls pass full bodies into the sandbox (they never enter model
+    // context); only the script's final aggregate is shaped for the client.
+    shape: bool,
 ) -> Value {
     let mut call_profiler = RoutedCallProfiler::start(name);
     // Resolve the call's real (server, original tool) from the router's route map,
@@ -3106,7 +3108,7 @@ fn execute_call(
             } else {
                 recovery_hint(cached, srv)
             };
-            let out = defend_and_shape(reg, srv, tool, client, result, &trailer);
+            let out = defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
             if let Some(profiler) = &mut call_profiler {
                 profiler.mark_postprocess();
             }
@@ -3161,7 +3163,15 @@ fn execute_call(
                 "content": [{ "type": "text", "text": e }],
                 "isError": true,
             });
-            defend_and_shape(reg, srv, tool, client, result, &recovery_hint(cached, srv))
+            defend_and_shape(
+                reg,
+                srv,
+                tool,
+                client,
+                result,
+                &recovery_hint(cached, srv),
+                shape,
+            )
         }
     }
 }
@@ -3183,6 +3193,7 @@ fn defend_and_shape(
     client: Option<&str>,
     mut result: Value,
     trailer: &str,
+    shape: bool,
 ) -> Value {
     // Scan untrusted output for injection; label always, optionally fail closed.
     // Block mode alone must still run the scanner: an org forceBlockOnInjection (or a
@@ -3200,20 +3211,24 @@ fn defend_and_shape(
     }
     // Cap an oversized result, cache the full body, hand back a head + fetch cursor.
     // A per-server resultBudget overrides the global default (Some(0) = never shape).
-    let budget = reg
-        .result_budgets
-        .get(srv)
-        .map(|&b| b as usize)
-        .unwrap_or_else(|| {
-        let (budget, warning) = shaping::budget();
+    // Code-mode intermediate calls pass `shape = false`: full bodies stay in the
+    // sandbox; only the script's final aggregate is shaped for the model.
+    if shape {
+        let budget = reg
+            .result_budgets
+            .get(srv)
+            .map(|&b| b as usize)
+            .unwrap_or_else(|| {
+                let (budget, warning) = shaping::budget();
 
-        if let Some(msg) = warning {
-            eprintln!("{msg}");
-        }
+                if let Some(msg) = warning {
+                    eprintln!("{msg}");
+                }
 
-        budget
-    });
-    shaping::shape_result(&mut result, budget, client);
+                budget
+            });
+        shaping::shape_result(&mut result, budget, client);
+    }
     // Toolport-authored trailer, appended last so it survives both passes intact.
     let trailer = trailer.trim();
     if !trailer.is_empty() {
@@ -3302,6 +3317,8 @@ fn run_script_dispatch(
     let cancel_owned = cancel;
 
     // Arc + Send + Sync so independent callAsync work can run on a small host thread pool.
+    // shape=false: intermediate results stay full-sized in the sandbox (never enter model
+    // context). Content defense still runs. Final aggregate is shaped below.
     let call: codemode::CallBinding =
         Arc::new(move |name: &str, args: Value| {
             execute_call(
@@ -3315,14 +3332,33 @@ fn run_script_dispatch(
                 name,
                 args,
                 false,
+                false,
             )
         });
+
+    // Cursor handoff for any already-shaped result (prior turn, or external cursor in data).
+    let client_for_fetch = client.map(str::to_string);
+    let fetch: codemode::FetchBinding = Arc::new(move |args: codemode::FetchArgs| {
+        shaping::fetch_result(
+            &args.cursor,
+            args.offset,
+            args.len,
+            client_for_fetch.as_deref(),
+            args.projection.as_deref(),
+        )
+    });
 
     // Typed `servers.*` stubs from the client-scoped catalog (meta-tools excluded).
     let catalog = script_catalog_tools(cached, allowed);
 
-    let outcome =
-        codemode::run_script(&script, data, call, codemode::Limits::default(), &catalog);
+    let outcome = codemode::run_script(
+        &script,
+        data,
+        call,
+        Some(fetch),
+        codemode::Limits::default(),
+        &catalog,
+    );
 
     // Account the round-trips this one call replaced (calls - 1), composing with the
     // lazy-discovery savings in the same log + counter.
@@ -3348,10 +3384,10 @@ fn run_script_dispatch(
         }
     };
 
-    // Each toolport.call() result is shaped independently, but a script can aggregate
-    // many individually bounded results into one response that is far larger than the
-    // client transport can safely decode. Shape the final aggregate as one unit too.
-    // The full aggregate remains available through toolport_fetch_result's cursor.
+    // Intermediate calls were not shaped (full bodies stayed in the sandbox). The
+    // script's aggregate can still blow the transport/context budget, so shape only
+    // this final result; the full aggregate remains available via toolport_fetch_result
+    // (or toolport.fetchResult inside a later script).
     let (budget, warning) = shaping::budget();
     if let Some(msg) = warning {
         eprintln!("{msg}");
@@ -4005,6 +4041,7 @@ fn handle_request_with_cancel(
                     name.as_str(),
                     arguments,
                     confirmed,
+                    true,
                 ),
             ))
         }
@@ -8798,7 +8835,7 @@ mod tests {
             "content": [{ "type": "text", "text": payload }],
             "isError": true,
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("external data"), "error text must be labeled as data");
         assert!(text.contains("evil-server"), "wrapper names the originating server");
@@ -8809,7 +8846,7 @@ mod tests {
             "content": [{ "type": "text", "text": "e".repeat(200_000) }],
             "isError": true,
         });
-        let shaped = defend_and_shape(&reg, "srv", "srv__t", None, huge, "");
+        let shaped = defend_and_shape(&reg, "srv", "srv__t", None, huge, "", true);
         let shaped_text = shaped["content"][0]["text"].as_str().unwrap();
         assert!(
             shaped_text.len() < 200_000,
@@ -8820,7 +8857,7 @@ mod tests {
         // The Toolport-authored trailer is appended after the scan, as its own block,
         // so it is never wrapped as external data.
         let clean = json!({ "content": [{ "type": "text", "text": "not found" }], "isError": true });
-        let with_hint = defend_and_shape(&reg, "srv", "srv__t", None, clean, "Try list_things first.");
+        let with_hint = defend_and_shape(&reg, "srv", "srv__t", None, clean, "Try list_things first.", true);
         let blocks = with_hint["content"].as_array().unwrap();
         let trailer = blocks.last().unwrap()["text"].as_str().unwrap();
         assert_eq!(trailer, "Try list_things first.");
@@ -8837,7 +8874,7 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         assert_eq!(out["isError"], true, "blocked call must be isError");
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("blocked"), "security message");
@@ -8857,7 +8894,7 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         assert_ne!(
             out["content"][0]["text"].as_str().unwrap().starts_with("Toolport: blocked"),
             true,
@@ -8876,7 +8913,7 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         assert!(
             out["content"][0]["text"]
                 .as_str()
@@ -8897,7 +8934,7 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         assert_eq!(out["isError"], true);
         assert!(
             out["content"][0]["text"]
@@ -9219,13 +9256,13 @@ mod tests {
         assert_eq!(result["structuredContent"]["result"]["sum"], 60);
     }
 
-    /// A code-mode script can combine several individually shaped downstream results.
-    /// The final aggregate must itself stay within the gateway result budget, otherwise
-    /// large single-line JSON-RPC responses can break client transport decoders.
+    /// Intermediate tool results stay full-sized inside the script; only the final
+    /// aggregate is shaped for the model. Scripts can filter/project huge bodies in JS.
     #[test]
     fn run_script_shapes_oversized_final_aggregate() {
         let reg = Registry::default();
-        let router = Arc::new(paging_router("x".repeat(shaping::DEFAULT_BUDGET_BYTES * 2)));
+        let body = "x".repeat(shaping::DEFAULT_BUDGET_BYTES * 2);
+        let router = Arc::new(paging_router(body.clone()));
         let args = json!({
             "script": "return [ \
                 toolport.call('s__big', {}), \
@@ -9266,9 +9303,78 @@ mod tests {
             serde_json::from_str(fetched_text).expect("complete fetched aggregate");
         let calls = aggregate.as_array().expect("script returned an array");
         assert_eq!(calls.len(), 4);
-        assert!(calls.iter().all(|call| call["content"][0]["text"]
+        // Intermediates were NOT shaped: full bodies (or structured) available to the script.
+        assert!(calls.iter().all(|call| {
+            let text = call["content"][0]["text"].as_str().unwrap_or("");
+            !text.contains("Toolport shaped this result")
+                && (text.contains(&body) || call.get("structuredContent").is_some())
+        }));
+    }
+
+    /// Script sees the full oversized intermediate and can return a small projection.
+    #[test]
+    fn run_script_can_project_large_intermediate_without_cursor() {
+        let reg = Registry::default();
+        let big = "y".repeat(shaping::DEFAULT_BUDGET_BYTES * 2);
+        let router = Arc::new(paging_router(big.clone()));
+        let args = json!({
+            "script": "var r = toolport.call('s__big', {}); \
+                       var t = r.content[0].text; \
+                       return { len: t.length, head: t.slice(0, 8), shaped: t.indexOf('Toolport shaped') >= 0 };"
+        });
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args);
+        assert_eq!(result["isError"].as_bool(), Some(false));
+        let v = &result["structuredContent"]["result"];
+        assert_eq!(v["shaped"], false);
+        assert_eq!(v["len"], big.chars().count() as u64); // or as number
+        assert_eq!(v["head"], "yyyyyyyy");
+    }
+
+    /// toolport.fetchResult pages a shaped stash (same owner rules as toolport_fetch_result).
+    #[test]
+    fn run_script_fetch_result_reads_shaped_cursor() {
+        let reg = Registry::default();
+        let router = Arc::new(paging_router("z".to_string()));
+        // Seed the shaping cache as a prior shaped agent-facing result would.
+        // Body must dominate the envelope so shape_result actually caches (half-size rule).
+        let payload = format!("hello{}", "x".repeat(2000));
+        let mut seeded = json!({
+            "content": [{ "type": "text", "text": payload }],
+            "isError": false
+        });
+        assert!(
+            shaping::shape_result(&mut seeded, 512, Some("alice")),
+            "seed must shape so a cursor exists"
+        );
+        let seed_text = seeded["content"][0]["text"].as_str().unwrap();
+        let cursor = seed_text
+            .split("\"cursor\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("seed cursor");
+
+        let args = json!({
+            "script": format!(
+                "var page = toolport.fetchResult({{ cursor: '{cursor}', offset: 0, len: 5 }}); \
+                 return page.content[0].text;"
+            ),
+        });
+        // Client owner must match the stash owner.
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &[],
+            Some("alice"),
+            None,
+            None,
+            &args,
+        );
+        assert_eq!(result["isError"].as_bool(), Some(false));
+        let text = result["structuredContent"]["result"]
             .as_str()
-            .is_some_and(|body| body.contains("Toolport shaped this result"))));
+            .unwrap_or("");
+        // fetch_result returns the page plus a Toolport footer; head is the body slice.
+        assert!(text.starts_with("hello"), "got {text}");
     }
 
     /// The per-client scope guard applies to a call made INSIDE a script exactly as it does
