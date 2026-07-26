@@ -1106,6 +1106,28 @@ impl Router {
         })
     }
 
+    /// Subscribe to resource-updated notifications on the owning downstream
+    /// (concrete first-writer, then template expansion — same as
+    /// [`read_resource`]). SOU-394.
+    pub fn subscribe_resource(&self, uri: &str) -> Result<Value, String> {
+        let server_id = self
+            .resource_server(uri)
+            .ok_or_else(|| format!("no server owns resource '{uri}'"))?
+            .to_string();
+        let slot = self.slot_for(&server_id)?;
+        self.call_with_retry(&slot, |server| server.subscribe_resource(uri))
+    }
+
+    /// Unsubscribe from resource-updated notifications on the owning downstream.
+    pub fn unsubscribe_resource(&self, uri: &str) -> Result<Value, String> {
+        let server_id = self
+            .resource_server(uri)
+            .ok_or_else(|| format!("no server owns resource '{uri}'"))?
+            .to_string();
+        let slot = self.slot_for(&server_id)?;
+        self.call_with_retry(&slot, |server| server.unsubscribe_resource(uri))
+    }
+
     /// Get a prompt by its exposed name, forwarding the server's real name.
     /// `&self`: locks only the owning server (see `route_call`).
     pub fn get_prompt(&self, exposed_name: &str, arguments: Value) -> Result<Value, String> {
@@ -1311,6 +1333,10 @@ mod tests {
                 "resources/read" => {
                     let uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
                     Ok(json!({ "contents": [{ "uri": uri, "text": format!("{}-body", self.label) }] }))
+                }
+                "resources/subscribe" | "resources/unsubscribe" => {
+                    let uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+                    Ok(json!({ "uri": uri, "via": self.label }))
                 }
                 "prompts/list" => Ok(json!({
                     "prompts": [{ "name": "greet", "description": "greeting" }]
@@ -1908,6 +1934,11 @@ mod tests {
         );
         let result = router.read_resource("postgres://item/42").unwrap();
         assert_eq!(result["contents"][0]["text"], "postgres-body");
+        // Subscribe/unsubscribe use the same ownership path as read (SOU-394).
+        let sub = router.subscribe_resource("postgres://item/42").unwrap();
+        assert_eq!(sub["via"], "postgres");
+        let unsub = router.unsubscribe_resource("postgres://item/42").unwrap();
+        assert_eq!(unsub["via"], "postgres");
     }
 
     #[test]
@@ -1939,6 +1970,9 @@ mod tests {
                         Ok(json!({
                             "contents": [{ "uri": uri, "text": format!("{}-body", self.label) }]
                         }))
+                    }
+                    "resources/subscribe" | "resources/unsubscribe" => {
+                        Ok(json!({ "via": self.label }))
                     }
                     other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
                 }

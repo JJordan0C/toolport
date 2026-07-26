@@ -15,6 +15,11 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Called from a downstream stdout drain when an armed server emits
+/// `notifications/resources/updated` (SOU-394). The gateway fans the URI out to
+/// subscribed upstream clients only.
+pub type ResourceUpdatedSink = Arc<dyn Fn(String) + Send + Sync>;
+
 use serde_json::{json, Value};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -648,20 +653,47 @@ fn is_list_changed(line: &str) -> bool {
     list_changed_kind(line) == change::TOOLS
 }
 
+/// Extract the resource URI from a `notifications/resources/updated` line, or
+/// `None` when the line is not that notification. Distinct from list_changed
+/// (SOU-394): resource content changed, not the catalog membership.
+fn resource_updated_uri(line: &str) -> Option<String> {
+    // Cheap gate: skip JSON parse for ordinary request/response lines.
+    if !line.contains("resources/updated") {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("method").and_then(|m| m.as_str()) != Some("notifications/resources/updated") {
+        return None;
+    }
+    v.get("params")
+        .and_then(|p| p.get("uri"))
+        .and_then(|u| u.as_str())
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+}
+
 /// Forward one drained stdout line to the request loop, first flagging `dirty` if
-/// the server (once `armed`) announced a tool-list change. Returns false when the
-/// receiver is gone (transport closed) so the drain loop can stop.
+/// the server (once `armed`) announced a tool-list change, and invoking the
+/// resource-updated sink for `notifications/resources/updated` (SOU-394).
+/// Returns false when the receiver is gone (transport closed) so the drain loop
+/// can stop.
 fn forward_line(
     line: String,
     tx: &Sender<String>,
     dirty: &Option<Arc<AtomicU8>>,
     armed: &Arc<AtomicBool>,
+    resource_updated: &Option<ResourceUpdatedSink>,
 ) -> bool {
-    if let Some(flag) = dirty {
-        if armed.load(Ordering::SeqCst) {
+    if armed.load(Ordering::SeqCst) {
+        if let Some(flag) = dirty {
             let kind = list_changed_kind(&line);
             if kind != 0 {
                 flag.fetch_or(kind, Ordering::SeqCst);
+            }
+        }
+        if let Some(sink) = resource_updated {
+            if let Some(uri) = resource_updated_uri(&line) {
+                sink(uri);
             }
         }
     }
@@ -1424,7 +1456,7 @@ impl StdioTransport {
         env: &[(String, String)],
         cwd: Option<&str>,
     ) -> Result<Self, String> {
-        Self::spawn_inner(command, args, env, cwd, None)
+        Self::spawn_inner(command, args, env, cwd, None, None)
     }
 
     /// Like [`spawn`], but sets a [`change`] bit in `dirty` whenever the downstream
@@ -1432,14 +1464,19 @@ impl StdioTransport {
     /// (after `arm_tools_watch`). The gateway watches that flag and re-queries the
     /// affected list, so a server changing its own catalog mid-session reaches the
     /// client instead of being silently dropped.
+    ///
+    /// When `resource_updated` is set, armed `notifications/resources/updated`
+    /// lines invoke that sink with the resource URI (SOU-394) so the gateway can
+    /// fan out only to subscribed upstream clients.
     pub fn spawn_watched(
         command: &str,
         args: &[String],
         env: &[(String, String)],
         cwd: Option<&str>,
         dirty: Arc<AtomicU8>,
+        resource_updated: Option<ResourceUpdatedSink>,
     ) -> Result<Self, String> {
-        Self::spawn_inner(command, args, env, cwd, Some(dirty))
+        Self::spawn_inner(command, args, env, cwd, Some(dirty), resource_updated)
     }
 
     fn spawn_inner(
@@ -1448,6 +1485,7 @@ impl StdioTransport {
         env: &[(String, String)],
         cwd: Option<&str>,
         dirty: Option<Arc<AtomicU8>>,
+        resource_updated: Option<ResourceUpdatedSink>,
     ) -> Result<Self, String> {
         // Split a command that packed its args into the `command` string, so a
         // mis-shaped config spawns correctly instead of erroring cryptically.
@@ -1539,7 +1577,7 @@ impl StdioTransport {
                             );
                             break;
                         }
-                        if !forward_line(line, &tx, &dirty, &drain_armed) {
+                        if !forward_line(line, &tx, &dirty, &drain_armed, &resource_updated) {
                             break;
                         }
                     }
@@ -2457,6 +2495,20 @@ impl DownstreamServer {
     ) -> Result<Value, TransportError> {
         self.transport
             .request_with_cancel("resources/read", json!({ "uri": uri }), cancel)
+    }
+
+    /// Subscribe to `notifications/resources/updated` for one resource URI on
+    /// this downstream (SOU-394). The gateway only calls this when at least one
+    /// upstream client is subscribed to the same URI.
+    pub fn subscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
+        self.transport
+            .request("resources/subscribe", json!({ "uri": uri }))
+    }
+
+    /// Drop a previously established downstream resource subscription.
+    pub fn unsubscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
+        self.transport
+            .request("resources/unsubscribe", json!({ "uri": uri }))
     }
 
     /// Get one prompt by its (original, downstream) name.
@@ -3817,23 +3869,24 @@ mod tests {
         let dirty = Some(Arc::new(AtomicU8::new(0)));
         let armed = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
+        let no_sink = None;
 
         // Unarmed (still in the handshake window): the line is forwarded but the
         // change is not acted on.
-        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed));
+        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink));
         assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), 0);
         assert_eq!(rx.recv().unwrap(), notif);
 
         // Armed: the same notification now sets the TOOLS bit.
         armed.store(true, Ordering::SeqCst);
-        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed));
+        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink));
         assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), change::TOOLS);
         assert_eq!(rx.recv().unwrap(), notif);
 
         // A resources/list_changed sets the RESOURCES bit alongside it (OR, not
         // overwrite), so distinct changes between watcher ticks aren't lost.
         let res_notif = r#"{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}"#;
-        assert!(forward_line(res_notif.to_string(), &tx, &dirty, &armed));
+        assert!(forward_line(res_notif.to_string(), &tx, &dirty, &armed, &no_sink));
         assert_eq!(
             dirty.as_ref().unwrap().load(Ordering::SeqCst),
             change::TOOLS | change::RESOURCES
@@ -3843,13 +3896,64 @@ mod tests {
         // An ordinary line is always forwarded and never flags a change.
         let resp = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
         let dirty2 = Some(Arc::new(AtomicU8::new(0)));
-        assert!(forward_line(resp.to_string(), &tx, &dirty2, &armed));
+        assert!(forward_line(resp.to_string(), &tx, &dirty2, &armed, &no_sink));
         assert_eq!(dirty2.as_ref().unwrap().load(Ordering::SeqCst), 0);
         assert_eq!(rx.recv().unwrap(), resp);
 
         // A closed receiver makes forward_line report "stop".
         drop(rx);
-        assert!(!forward_line(notif.to_string(), &tx, &dirty, &armed));
+        assert!(!forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink));
+    }
+
+    #[test]
+    fn resource_updated_uri_parses_only_updated_notifications() {
+        use super::resource_updated_uri;
+        assert_eq!(
+            resource_updated_uri(
+                r#"{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file://a"}}"#
+            )
+            .as_deref(),
+            Some("file://a")
+        );
+        // list_changed must not be treated as an updated notification.
+        assert_eq!(
+            resource_updated_uri(
+                r#"{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}"#
+            ),
+            None
+        );
+        assert_eq!(resource_updated_uri(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#), None);
+        assert_eq!(resource_updated_uri("not json"), None);
+    }
+
+    #[test]
+    fn forward_line_invokes_resource_updated_sink_when_armed() {
+        use super::{forward_line, ResourceUpdatedSink};
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sink: ResourceUpdatedSink = Arc::new(move |uri| {
+            sink_seen.lock().unwrap().push(uri);
+        });
+        let dirty = Some(Arc::new(AtomicU8::new(0)));
+        let armed = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sink_opt = Some(sink);
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"fixture://r"}}"#;
+
+        // Unarmed: no sink call.
+        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &sink_opt));
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(rx.recv().unwrap(), line);
+
+        // Armed: sink receives the URI; dirty bits stay clear (not a list change).
+        armed.store(true, Ordering::SeqCst);
+        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &sink_opt));
+        assert_eq!(seen.lock().unwrap().as_slice(), &["fixture://r".to_string()]);
+        assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), 0);
+        assert_eq!(rx.recv().unwrap(), line);
     }
 
     #[test]

@@ -81,6 +81,18 @@ MCP defines no separate templates list-change notification. Incomplete
 downstream pagination keeps the previous complete snapshot (covered in Rust
 unit tests and documented here).
 
+### Resource subscriptions (SOU-394)
+
+Toolport always advertises `resources.subscribe` and proxies
+`resources/subscribe` / `resources/unsubscribe` through the same first-writer
+ownership path as `resources/read` (concrete URI, then template expansion),
+with the same HTTP scope rules. Downstream subscribe is reference-counted per
+URI; `notifications/resources/updated` is forwarded only to subscribed
+upstream clients (stdio + HTTP SSE), and is kept distinct from
+`resources/list_changed`. Unknown or out-of-scope URIs fail closed. The fixture
+exposes `emit_resource_updated` so the harness can trigger a real downstream
+update after subscribe.
+
 ```bash
 npm run build:gateway
 npm run bench:mcp-native

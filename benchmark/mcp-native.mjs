@@ -37,6 +37,8 @@ class McpProcess {
     this.stderr = "";
     this.pending = new Map();
     this.nextId = 0;
+    this.notifications = [];
+    this.notificationWaiters = [];
     this.proc = spawn(command, args, {
       ...options,
       stdio: ["pipe", "pipe", "pipe"],
@@ -51,6 +53,23 @@ class McpProcess {
       try {
         message = JSON.parse(line);
       } catch {
+        return;
+      }
+      // Server→client notifications (no id): collect for waitForNotification.
+      if (message.id === undefined || message.id === null) {
+        if (typeof message.method === "string") {
+          this.notifications.push(message);
+          const still = [];
+          for (const waiter of this.notificationWaiters) {
+            if (waiter.method && message.method !== waiter.method) {
+              still.push(waiter);
+              continue;
+            }
+            clearTimeout(waiter.timer);
+            waiter.resolve(message);
+          }
+          this.notificationWaiters = still;
+        }
         return;
       }
       const pending = this.pending.get(message.id);
@@ -87,12 +106,38 @@ class McpProcess {
     this.proc.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
   }
 
+  /** Wait for a server notification (optionally filtered by method). */
+  waitForNotification(method, timeoutMs = 10_000) {
+    const existing = this.notifications.find((n) => !method || n.method === method);
+    if (existing) {
+      this.notifications = this.notifications.filter((n) => n !== existing);
+      return Promise.resolve(existing);
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.notificationWaiters = this.notificationWaiters.filter((w) => w !== waiter);
+        reject(
+          new Error(
+            `waitForNotification(${method ?? "*"}) timed out\n${this.stderr.trim()}`,
+          ),
+        );
+      }, timeoutMs);
+      const waiter = { method, resolve, reject, timer };
+      this.notificationWaiters.push(waiter);
+    });
+  }
+
   rejectAll(error) {
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(error);
     }
     this.pending.clear();
+    for (const waiter of this.notificationWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    this.notificationWaiters = [];
   }
 
   stop() {
@@ -109,6 +154,19 @@ function definitions(kind, count) {
   return Array.from({ length: count }, (_, index) => {
     const suffix = String(index).padStart(2, "0");
     if (kind === "tools") {
+      // First tool doubles as the SOU-394 control plane for emitting
+      // notifications/resources/updated after a successful subscribe.
+      if (index === 0) {
+        return {
+          name: "emit_resource_updated",
+          description: "Emit resources/updated for a subscribed URI",
+          inputSchema: {
+            type: "object",
+            properties: { uri: { type: "string" } },
+            required: ["uri"],
+          },
+        };
+      }
       return {
         name: `tool_${suffix}`,
         description: `Fixture tool ${suffix}`,
@@ -322,6 +380,7 @@ async function main() {
 
       checks.advertisesNativeCapabilities =
         initialized.capabilities?.resources?.listChanged === true &&
+        initialized.capabilities?.resources?.subscribe === true &&
         initialized.capabilities?.prompts?.listChanged === true &&
         initialized.capabilities?.completions !== undefined;
       checks.allToolsDiscovered = tools.length === count;
@@ -349,6 +408,64 @@ async function main() {
         resourcesResult.nextCursor === undefined &&
         templatesResult.nextCursor === undefined &&
         promptsResult.nextCursor === undefined;
+
+      // --- Resource subscriptions + resources/updated fanout (SOU-394) ---
+      const subUri = lastResource;
+      assertNoRpcError(
+        await client.call("resources/subscribe", { uri: subUri }),
+        "resources/subscribe",
+      );
+      // Unknown URI fails closed (no owner).
+      const unknownSub = await client.call("resources/subscribe", {
+        uri: "fixture://does-not-exist",
+      });
+      checks.subscribeUnknownUriFailsClosed = Boolean(unknownSub.error);
+
+      // Trigger a downstream resources/updated via the fixture control tool.
+      // Drain any list_changed noise from ready so we wait for the real update.
+      client.notifications = client.notifications.filter(
+        (n) => n.method !== "notifications/tools/list_changed",
+      );
+      const waitUpdated = client.waitForNotification(
+        "notifications/resources/updated",
+        15_000,
+      );
+      assertNoRpcError(
+        await client.call("tools/call", {
+          name: "fixture__emit_resource_updated",
+          arguments: { uri: subUri },
+        }),
+        "tools/call emit_resource_updated",
+      );
+      const updated = await waitUpdated;
+      checks.resourceUpdatedForwardedToSubscriber = updated?.params?.uri === subUri;
+
+      assertNoRpcError(
+        await client.call("resources/unsubscribe", { uri: subUri }),
+        "resources/unsubscribe",
+      );
+      // After unsubscribe, a second emit should not reach this client.
+      // Fixture refuses emit when not subscribed (tool-level isError; gateway
+      // surfaces that as a successful JSON-RPC with isError:true).
+      const afterUnsub = await client.call("tools/call", {
+        name: "fixture__emit_resource_updated",
+        arguments: { uri: subUri },
+      });
+      checks.unsubscribeStopsDownstreamEmit =
+        afterUnsub.result?.isError === true ||
+        String(afterUnsub.result?.content?.[0]?.text ?? "").includes("not subscribed");
+
+      // Expanded template URI can be subscribed via template ownership.
+      const templateUri = expandedLater;
+      assertNoRpcError(
+        await client.call("resources/subscribe", { uri: templateUri }),
+        "resources/subscribe template expansion",
+      );
+      assertNoRpcError(
+        await client.call("resources/unsubscribe", { uri: templateUri }),
+        "resources/unsubscribe template expansion",
+      );
+      checks.subscribeTemplateExpandedUri = true;
     });
 
     // --- Cross-server template/URI collisions: first writer wins ---
@@ -490,7 +607,9 @@ async function main() {
     if (jsonOutput) {
       console.log(JSON.stringify(report, null, 2));
     } else {
-      console.log("# Toolport native MCP pagination + templates + completions");
+      console.log(
+        "# Toolport native MCP pagination + templates + completions + subscriptions",
+      );
       console.log("");
       console.log(
         `Fixture: ${count} tools/resources/templates/prompts; 2 items per downstream page.`,

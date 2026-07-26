@@ -44,6 +44,8 @@ const pageCounters = {
   resourceTemplates: 0,
   prompts: 0,
 };
+/** URIs this fixture session has accepted via resources/subscribe (SOU-394). */
+const resourceSubscriptions = new Set();
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 
 function write(message) {
@@ -173,7 +175,7 @@ rl.on("line", (line) => {
         capabilities: {
           tools: {},
           ...(resources.length > 0 || resourceTemplates.length > 0
-            ? { resources: {} }
+            ? { resources: { subscribe: true } }
             : {}),
           ...(prompts.length > 0 ? { prompts: {} } : {}),
           ...(prompts.length > 0 || resourceTemplates.length > 0
@@ -206,6 +208,29 @@ rl.on("line", (line) => {
       const name = request.params?.name;
       if (!byName.has(name)) {
         error(request.id, -32602, `unknown fixture tool: ${name}`);
+        break;
+      }
+      // Control plane for SOU-394: emit resources/updated for a subscribed URI
+      // so the gateway fanout path can be exercised end-to-end.
+      if (name === "emit_resource_updated") {
+        const uri = request.params?.arguments?.uri;
+        if (typeof uri !== "string" || !uri) {
+          error(request.id, -32602, "emit_resource_updated requires arguments.uri");
+          break;
+        }
+        if (!resourceSubscriptions.has(uri)) {
+          error(request.id, -32602, `emit_resource_updated: uri not subscribed: ${uri}`);
+          break;
+        }
+        write({
+          jsonrpc: "2.0",
+          method: "notifications/resources/updated",
+          params: { uri },
+        });
+        result(request.id, {
+          content: [{ type: "text", text: JSON.stringify({ ok: true, uri }) }],
+          isError: false,
+        });
         break;
       }
       result(request.id, {
@@ -291,6 +316,35 @@ rl.on("line", (line) => {
           },
         ],
       });
+      break;
+    }
+    case "resources/subscribe": {
+      const uri = request.params?.uri;
+      if (!uri || typeof uri !== "string") {
+        error(request.id, -32602, "resources/subscribe requires params.uri");
+        break;
+      }
+      let known = resourcesByUri.has(uri);
+      if (!known) {
+        known = resourceTemplates.some((t) => templateMatches(uri, t.uriTemplate));
+      }
+      if (!known) {
+        error(request.id, -32602, `unknown fixture resource: ${uri}`);
+        break;
+      }
+      resourceSubscriptions.add(uri);
+      result(request.id, {});
+      break;
+    }
+    case "resources/unsubscribe": {
+      const uri = request.params?.uri;
+      if (!uri || typeof uri !== "string") {
+        error(request.id, -32602, "resources/unsubscribe requires params.uri");
+        break;
+      }
+      resourceSubscriptions.delete(uri);
+      // Idempotent success even when the URI was not subscribed.
+      result(request.id, {});
       break;
     }
     case "prompts/list": {
