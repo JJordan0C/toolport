@@ -627,12 +627,16 @@ pub fn run_script(
     };
     let fetch_native = NativeFunction::from_copy_closure_with_captures(
         |_this: &JsValue, args: &[JsValue], host: &FetchHost, _ctx: &mut Context| {
-            reserve_budget(host.calls_made.get(), host.max_calls, host.deadline)?;
+            // Availability first: an exhausted budget must not mask the real reason
+            // a script cannot page results here.
             let Some(fetch) = host.fetch.as_ref() else {
                 return Err(JsError::from_native(JsNativeError::error().with_message(
                     "toolport.fetchResult is unavailable in this context",
                 )));
             };
+            // Budget/deadline next, still before argument parsing, so a script that
+            // loops on invalid specs cannot spin past its wall clock unchecked.
+            reserve_budget(host.calls_made.get(), host.max_calls, host.deadline)?;
             let raw = args
                 .first()
                 .and_then(JsValue::as_string)

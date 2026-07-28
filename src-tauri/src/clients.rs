@@ -2416,7 +2416,52 @@ fn backup_file(client_id: &str, path: &Path) -> Result<Option<PathBuf>, String> 
         .unwrap_or("config");
     let dest = dir.join(format!("{}-{}", epoch_millis(), name));
     std::fs::copy(path, &dest).map_err(|e| e.to_string())?;
+    prune_backups(&dir, name);
     Ok(Some(dest))
+}
+
+/// How many backup generations to keep per client config file. Matches the
+/// registry's `BACKUP_GENERATIONS` so both stores bound recovery depth the same way.
+const CONFIG_BACKUP_GENERATIONS: usize = 5;
+
+/// Drop all but the newest [`CONFIG_BACKUP_GENERATIONS`] backups of one config file
+/// (SOU-433).
+///
+/// These copies are not inert: a Shared HTTP client's config carries a live
+/// `Authorization: Bearer <token>`, and since #503 that bearer is the one the client
+/// actually sends. Repoint runs on every launch, so an unpruned directory accumulated
+/// working credentials indefinitely, and `revoke_client_http_token` (which exists
+/// precisely so "a leftover backup" cannot keep authenticating) only covers Disconnect.
+/// Bounding the count bounds how long a rotated-away token survives on disk.
+///
+/// Best-effort: a failure here must never fail the write the backup was protecting.
+/// Names are `<millis>-<file name>`; the timestamp is fixed-width for any realistic
+/// epoch, so lexical order is age order.
+fn prune_backups(dir: &Path, name: &str) {
+    let suffix = format!("-{name}");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut mine: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|f| f.to_str())
+                .and_then(|f| f.strip_suffix(&suffix))
+                // Timestamp prefix only, so backups of `config.yaml` never prune
+                // backups of some other `<x>-config.yaml` in the same directory.
+                .is_some_and(|stamp| !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect();
+    if mine.len() <= CONFIG_BACKUP_GENERATIONS {
+        return;
+    }
+    mine.sort();
+    let excess = mine.len() - CONFIG_BACKUP_GENERATIONS;
+    for stale in mine.into_iter().take(excess) {
+        let _ = std::fs::remove_file(stale);
+    }
 }
 
 fn entry_to_json(entry: &ServerEntry) -> serde_json::Value {
@@ -4136,6 +4181,52 @@ mod tests {
 
     fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("conduit-w-{}-{}.cfg", std::process::id(), label))
+    }
+
+    /// SOU-433: config backups carry a live Shared HTTP bearer, so the directory
+    /// must not grow forever. Prune keeps the newest generations of the file it was
+    /// called for, and never touches a differently-named config's backups.
+    #[test]
+    fn prune_backups_bounds_generations_per_config_file() {
+        let dir = std::env::temp_dir().join(format!("toolport-bk-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 8 generations of config.yaml, oldest first by timestamp prefix.
+        for stamp in 1000000000001u64..=1000000000008 {
+            std::fs::write(dir.join(format!("{stamp}-config.yaml")), "Authorization: Bearer x")
+                .unwrap();
+        }
+        // A different config whose name ENDS with the same suffix, plus unrelated files.
+        std::fs::write(dir.join("1000000000001-other-config.yaml"), "x").unwrap();
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+
+        prune_backups(&dir, "config.yaml");
+
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "1000000000001-other-config.yaml".to_string(),
+                "1000000000004-config.yaml".to_string(),
+                "1000000000005-config.yaml".to_string(),
+                "1000000000006-config.yaml".to_string(),
+                "1000000000007-config.yaml".to_string(),
+                "1000000000008-config.yaml".to_string(),
+                "notes.txt".to_string(),
+            ],
+            "keep the newest {CONFIG_BACKUP_GENERATIONS}, drop older, touch nothing else"
+        );
+
+        // Idempotent once at the cap.
+        prune_backups(&dir, "config.yaml");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 7);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

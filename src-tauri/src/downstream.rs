@@ -42,7 +42,14 @@ const STDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// still fails immediately because its stdout closing ends the wait. Batch
 /// connects run one thread per server, so several cold launchers install in
 /// parallel and a batch waits out this budget at most once, not per server.
-const LAUNCHER_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+const LAUNCHER_CONNECT_TIMEOUT: Duration = LEADER_OPEN_BUDGET;
+
+/// The longest a single legitimate downstream open can take: the launcher budget
+/// above, which is the slowest path (it exceeds the ~110s of three
+/// [`STDIO_READ_TIMEOUT`] attempts plus backoff). Exported so anything that waits on
+/// another caller's open - `OPEN_GATE_WAIT` in the gateway - derives its deadline from
+/// this instead of hardcoding a number the two can drift apart on (SOU-434).
+pub const LEADER_OPEN_BUDGET: Duration = Duration::from_secs(120);
 /// Keep at most this many bytes of a child's stderr tail for error reporting.
 const STDERR_TAIL_CAP: usize = 4096;
 

@@ -66,12 +66,19 @@ const MAX_RESOURCE_SUBS_PER_SESSION: usize = 256;
 /// Process-wide cap on concurrent resource subscriptions (SOU-394).
 const MAX_RESOURCE_SUBS_TOTAL: usize = 4096;
 
+/// Margin on top of the leader's open budget, so a waiter is not told the subscribe
+/// timed out while the leader is still succeeding.
+const OPEN_GATE_MARGIN: Duration = Duration::from_secs(30);
+
 /// How long a waiter blocks for the leader's downstream subscribe before failing
-/// closed (WS1-4). Must outlast a legitimate leader open: upstream RPC retries
-/// can run ~110s (three 30s attempts + backoff), and launcher-backed servers
-/// use the 120s interactive budget. 150s leaves a small margin so waiters are
-/// not told the subscribe timed out while the leader is still succeeding.
-const OPEN_GATE_WAIT: Duration = Duration::from_secs(150);
+/// closed (WS1-4). Derived from [`downstream::LEADER_OPEN_BUDGET`] rather than
+/// hardcoded, so raising the launcher budget can never silently make waiters give
+/// up before the leader they are waiting on (SOU-434).
+///
+/// Note this is longer than any client request timeout, so a waiter can outlive the
+/// caller that queued it; bounding parked waiters is the remaining half of SOU-434.
+const OPEN_GATE_WAIT: Duration =
+    Duration::from_secs(downstream::LEADER_OPEN_BUDGET.as_secs() + OPEN_GATE_MARGIN.as_secs());
 
 /// Coordinates concurrent first-subscriber races for one URI.
 struct OpenGate {
@@ -768,6 +775,39 @@ static CODE_MODE: AtomicBool = AtomicBool::new(false);
 /// the process flag stuck true (WS2-6).
 #[cfg(test)]
 static CODE_MODE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Holds [`CODE_MODE_TEST_LOCK`] and restores the flag's prior value on drop.
+///
+/// Restoring with a plain call after the assertions is not enough: a failing
+/// assertion unwinds past it and leaks the flag into every later test, and since
+/// every lock site recovers from poisoning with `PoisonError::into_inner`, those
+/// tests then run against state the failure left behind. One real failure would
+/// cascade into unrelated ones.
+#[cfg(test)]
+struct CodeModeGuard {
+    prev: bool,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl CodeModeGuard {
+    fn acquire() -> Self {
+        let lock = CODE_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self {
+            prev: CODE_MODE.load(Ordering::Relaxed),
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CodeModeGuard {
+    fn drop(&mut self) {
+        set_code_mode_flag(self.prev);
+    }
+}
 
 fn set_code_mode_flag(enabled: bool) {
     CODE_MODE.store(enabled, Ordering::Relaxed);
@@ -10060,10 +10100,7 @@ mod tests {
     fn run_script_is_refused_when_code_mode_disabled() {
         // WS2-6: drive the live atomic. Serialize so parallel tests cannot leave
         // CODE_MODE stuck true (and so tools/list counts stay stable).
-        let _guard = CODE_MODE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = CODE_MODE.load(Ordering::Relaxed);
+        let _guard = CodeModeGuard::acquire();
         set_code_mode_flag(false);
         let mut reg = Registry::default();
         reg.code_mode = false;
@@ -10087,7 +10124,6 @@ mod tests {
             None,
         )
         .unwrap();
-        set_code_mode_flag(prev);
         assert_eq!(resp["result"]["isError"].as_bool(), Some(true));
         assert!(resp["result"]["content"][0]["text"]
             .as_str()
@@ -10100,10 +10136,7 @@ mod tests {
     /// always passes `router_arc: None`, so it cannot assert a successful run.
     #[test]
     fn run_script_respects_live_code_mode_flag() {
-        let _guard = CODE_MODE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = CODE_MODE.load(Ordering::Relaxed);
+        let _guard = CodeModeGuard::acquire();
         let reg = Registry::default();
         let router = Arc::new(routed_router("s", "tool"));
         let search_index = CatalogSearchIndex::build(&[]);
@@ -10156,7 +10189,6 @@ mod tests {
             None,
         )
         .unwrap();
-        set_code_mode_flag(prev);
 
         assert_eq!(
             allowed["result"]["isError"].as_bool(),
@@ -10188,10 +10220,7 @@ mod tests {
     /// the fallback [`Registry::default`] has `code_mode: true`.
     #[test]
     fn code_mode_flag_fails_closed_when_registry_load_fails() {
-        let _guard = CODE_MODE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = CODE_MODE.load(Ordering::Relaxed);
+        let _guard = CodeModeGuard::acquire();
         set_code_mode_flag(true);
 
         // Same helper the boot path uses on Err(load_resolved).
@@ -10246,7 +10275,6 @@ mod tests {
             None,
         )
         .unwrap();
-        set_code_mode_flag(prev);
         assert_eq!(call["result"]["isError"].as_bool(), Some(true));
         assert!(call["result"]["content"][0]["text"]
             .as_str()
@@ -12655,10 +12683,7 @@ mod tests {
     fn lazy_tools_list_returns_only_meta_tools() {
         // Hold CODE_MODE_TEST_LOCK: other tests flip the global atomic, and an
         // exact tool count of 4 assumes run_script is not advertised.
-        let _guard = CODE_MODE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = CODE_MODE.load(Ordering::Relaxed);
+        let _guard = CodeModeGuard::acquire();
         set_code_mode_flag(false);
 
         let reg = Registry::default();
@@ -12677,7 +12702,6 @@ mod tests {
             None,
         )
         .unwrap();
-        set_code_mode_flag(prev);
         let names: Vec<&str> = resp["result"]["tools"]
             .as_array()
             .unwrap()

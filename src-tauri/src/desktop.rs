@@ -726,7 +726,7 @@ fn install_gateway(
     {
         // Ensure the supervised bridge is up, mint/reuse a per-client bearer, write
         // native remote or mcp-remote into the client config (SOU-407).
-        let status = start_http_bridge(bridge, None)?;
+        let status = start_http_bridge_at(bridge.inner(), None)?;
         let port = status.port.unwrap_or(8765);
         let url = format!("http://127.0.0.1:{port}/mcp");
         let token = ensure_client_http_token(state.inner(), &client_id, profile.as_deref())?;
@@ -976,7 +976,7 @@ async fn migrate_client(
     let migrate_write = if transport.eq_ignore_ascii_case("sharedHttp")
         || transport.eq_ignore_ascii_case("shared_http")
     {
-        let status = start_http_bridge(bridge, None)?;
+        let status = start_http_bridge_at(bridge.inner(), None)?;
         let port = status.port.unwrap_or(8765);
         let url = format!("http://127.0.0.1:{port}/mcp");
         let token = ensure_client_http_token(state.inner(), &client_id, profile.as_deref())?;
@@ -2770,12 +2770,68 @@ fn stop_spawned_gateways() -> u32 {
 /// current resolved binary. Safe to run any time; used from Settings and launch.
 /// Returns labels of processes that were stopped.
 #[tauri::command]
-fn stop_stale_gateways() -> Vec<String> {
+fn stop_stale_gateways(bridge: State<HttpBridgeState>) -> Vec<String> {
+    reap_stale_and_restore_bridge(bridge.inner())
+}
+
+/// Run the stale reaper, then bring the supervised HTTP bridge back if the reaper
+/// stopped it (SOU-418 / SOU-432).
+///
+/// The reaper is *supposed* to kill a bridge running a replaced binary - that is the
+/// whole point of SOU-414, and on Linux `2ba9f95` guarantees it, because an exe ending
+/// in ` (deleted)` deliberately misses keep-paths after an in-place upgrade. But nothing
+/// respawns it: `http_bridge_alive` only clears the tracking state, so HTTP/OpenAPI
+/// clients would stay dark until someone re-opened Settings. Restarting on the same port
+/// keeps SOU-414's guarantee (the old image dies) without stranding the transport.
+///
+/// Connected clients are unaffected by the new process: they authenticate with the
+/// per-client bearers in `http_clients`, not the bridge's own env token.
+fn reap_stale_and_restore_bridge(bridge: &HttpBridgeState) -> Vec<String> {
     let mut extra_keep = Vec::new();
     if let Some(p) = clients::resolve_gateway_path() {
         extra_keep.push(p);
     }
-    crate::gateway_publish::stop_stale_gateways_with_keep(&extra_keep)
+    // Port of a bridge that is alive *before* the reap; None means there is nothing
+    // to restore and the reaper's outcome is final.
+    let was_serving = {
+        let mut b = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        http_bridge_alive(&mut b).then(|| b.port).flatten()
+    };
+    let killed = crate::gateway_publish::stop_stale_gateways_with_keep(&extra_keep);
+    if let Some(port) = was_serving {
+        let still_serving = {
+            let mut b = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            http_bridge_alive(&mut b)
+        };
+        if !still_serving {
+            // The just-killed child may not have released the port yet, and
+            // `start_http_bridge_at` deliberately fails fast on a taken port (a
+            // user-initiated start must not report success against someone else's
+            // listener). Retry briefly so a teardown race does not turn into a
+            // spurious "could not be restarted".
+            let mut last = String::new();
+            for attempt in 0..5 {
+                match start_http_bridge_at(bridge, Some(port)) {
+                    Ok(_) => {
+                        eprintln!(
+                            "toolport: restarted the HTTP endpoint on port {port} after the stale \
+                             reaper stopped its previous (replaced) binary"
+                        );
+                        return killed;
+                    }
+                    Err(e) => last = e,
+                }
+                if attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+            eprintln!(
+                "toolport: the stale reaper stopped the HTTP endpoint on port {port} and it could \
+                 not be restarted: {last}. Start it again from Settings."
+            );
+        }
+    }
+    killed
 }
 
 /// Start `toolport-gateway --http <port>` as a supervised child so HTTP/OpenAPI
@@ -2784,6 +2840,15 @@ fn stop_stale_gateways() -> Vec<String> {
 #[tauri::command]
 fn start_http_bridge(
     state: State<HttpBridgeState>,
+    port: Option<u16>,
+) -> Result<HttpBridgeStatus, String> {
+    start_http_bridge_at(state.inner(), port)
+}
+
+/// Body of [`start_http_bridge`], taking the state directly so non-command callers
+/// (the reaper's bridge restore) can reach it without a `State` wrapper.
+fn start_http_bridge_at(
+    state: &HttpBridgeState,
     port: Option<u16>,
 ) -> Result<HttpBridgeStatus, String> {
     let port = port.unwrap_or(8765);
@@ -3237,7 +3302,10 @@ pub fn run() {
             //   3. Re-point client configs that still use the conduit entry name,
             //      CONDUIT_* env keys, conduit-gateway binary, or the old data-dir
             //      path. Surgical + backed up; a no-op once every client is current.
-            std::thread::spawn(|| {
+            // Handle for the migration thread: the reaper at the end of it needs
+            // HttpBridgeState so a stopped bridge can be brought back (SOU-418).
+            let migrate_handle = app.handle().clone();
+            std::thread::spawn(move || {
                 // Prefer a quiet data-dir rename before publishing/repointing so the
                 // new bin path is under Toolport and client configs get that path.
                 // Gateways holding files open may block the rename; we then keep the
@@ -3294,11 +3362,11 @@ pub fn run() {
                 // Run once immediately, then again after a short delay so a client that
                 // race-respawns an old path between repoint and the first kill is cleaned up
                 // without another full app restart.
-                let mut extra_keep = Vec::new();
-                if let Some(p) = clients::resolve_gateway_path() {
-                    extra_keep.push(p);
-                }
-                let stale = crate::gateway_publish::stop_stale_gateways_with_keep(&extra_keep);
+                //
+                // Both passes go through `reap_stale_and_restore_bridge` so a supervised
+                // HTTP bridge the reaper stops (correctly, when its binary was replaced)
+                // comes back instead of leaving HTTP/OpenAPI clients dark (SOU-418).
+                let stale = reap_stale_and_restore_bridge(migrate_handle.state::<HttpBridgeState>().inner());
                 if !stale.is_empty() {
                     eprintln!(
                         "toolport: stopped {} stale gateway process(es): {}",
@@ -3306,11 +3374,11 @@ pub fn run() {
                         stale.join("; ")
                     );
                 }
-                let keep_for_retry = extra_keep.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(3));
-                    let again =
-                        crate::gateway_publish::stop_stale_gateways_with_keep(&keep_for_retry);
+                    let again = reap_stale_and_restore_bridge(
+                        migrate_handle.state::<HttpBridgeState>().inner(),
+                    );
                     if !again.is_empty() {
                         eprintln!(
                             "toolport: delayed reaper stopped {} more stale gateway process(es): {}",

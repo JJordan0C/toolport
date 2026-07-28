@@ -188,6 +188,13 @@ pub struct ReapContext {
     /// nested macOS helper, AppImage stable copy, etc.). Compared case-insensitively
     /// with normalized separators.
     pub keep_paths: Vec<PathBuf>,
+    /// PIDs that are never killed, checked before every other rule including
+    /// `kill_all` (SOU-432). Always carries the calling process: a reaper must not
+    /// kill the process it is running in. `2ba9f95` made that reachable rather than
+    /// theoretical by design - a Linux exe ending in ` (deleted)` deliberately
+    /// misses keep-paths, so an in-place binary swap turns "our own image" into a
+    /// Kill verdict for any caller whose basename looks like a gateway.
+    pub keep_pids: Vec<u32>,
     /// When true (updater), every gateway process is killed, including current.
     pub kill_all: bool,
 }
@@ -377,6 +384,11 @@ fn path_looks_like_our_install(path: &Path) -> bool {
 /// Pure keep/kill decision. Getting this wrong is expensive both ways: too eager
 /// kills the bridge we just started; too shy leaves users on old gateway code.
 pub fn decide_reap(proc: &GatewayProcess, ctx: &ReapContext) -> ReapDecision {
+    // Before anything else, including kill_all: never kill a protected pid
+    // (the calling process itself) (SOU-432).
+    if ctx.keep_pids.contains(&proc.pid) {
+        return ReapDecision::Keep;
+    }
     if !is_gateway_basename(&proc.basename) {
         return ReapDecision::Keep;
     }
@@ -497,6 +509,8 @@ pub fn stop_spawned_gateways() -> u32 {
     let ctx = ReapContext {
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         keep_paths: Vec::new(),
+        // Even the updater's kill-all must not kill the process running it.
+        keep_pids: vec![std::process::id()],
         kill_all: true,
     };
     let report = reap_with_context(&ctx);
@@ -523,6 +537,7 @@ pub fn stop_stale_gateways_with_keep(extra_keep: &[PathBuf]) -> Vec<String> {
     let ctx = ReapContext {
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         keep_paths: keep,
+        keep_pids: vec![std::process::id()],
         kill_all: false,
     };
     let report = reap_with_context(&ctx);
@@ -851,6 +866,7 @@ mod tests {
         ReapContext {
             current_version: version.into(),
             keep_paths: keep.iter().map(PathBuf::from).collect(),
+            keep_pids: Vec::new(),
             kill_all,
         }
     }
@@ -1043,6 +1059,63 @@ mod tests {
         );
     }
 
+    /// SOU-432: a protected pid outranks every other rule, including `kill_all`
+    /// and the Linux ` (deleted)` policy that deliberately misses keep-paths.
+    #[test]
+    fn keep_pids_outrank_every_kill_rule() {
+        let deleted = PathBuf::from("/home/u/.local/share/toolport/toolport-gateway (deleted)");
+        let mut stale = ctx("1.9.6", &["/home/u/.local/share/toolport/toolport-gateway"], false);
+        let me = proc(4242, "toolport-gateway", deleted.to_str());
+        // Control: unprotected, this is exactly the WS4-3 Kill case.
+        assert_eq!(decide_reap(&me, &stale), ReapDecision::Kill);
+        stale.keep_pids = vec![4242];
+        assert_eq!(
+            decide_reap(&me, &stale),
+            ReapDecision::Keep,
+            "a reaper must never kill the process it runs in"
+        );
+        // A different pid at the same path is still reaped.
+        assert_eq!(
+            decide_reap(&proc(99, "toolport-gateway", deleted.to_str()), &stale),
+            ReapDecision::Kill
+        );
+        // kill_all does not override the guard either.
+        let mut all = ctx("1.9.6", &[], true);
+        all.keep_pids = vec![4242];
+        assert_eq!(decide_reap(&me, &all), ReapDecision::Keep);
+        assert_eq!(
+            decide_reap(&proc(99, "toolport-gateway", deleted.to_str()), &all),
+            ReapDecision::Kill
+        );
+    }
+
+    /// The shipped call sites must actually seed the guard, not just support it.
+    #[test]
+    fn production_reap_contexts_protect_the_current_process() {
+        for ctx in [
+            ReapContext {
+                current_version: "1.9.6".into(),
+                keep_paths: Vec::new(),
+                keep_pids: vec![std::process::id()],
+                kill_all: true,
+            },
+            ReapContext {
+                current_version: "1.9.6".into(),
+                keep_paths: default_keep_paths(),
+                keep_pids: vec![std::process::id()],
+                kill_all: false,
+            },
+        ] {
+            assert_eq!(
+                decide_reap(
+                    &proc(std::process::id(), "toolport-gateway", Some("/opt/toolport/toolport-gateway")),
+                    &ctx
+                ),
+                ReapDecision::Keep
+            );
+        }
+    }
+
     #[test]
     fn is_gateway_basename_accepts_versioned_and_plain() {
         assert!(is_gateway_basename("toolport-gateway.exe"));
@@ -1079,6 +1152,7 @@ mod tests {
         let c = ReapContext {
             current_version: "1.9.6".into(),
             keep_paths: vec![keep.clone()],
+            keep_pids: Vec::new(),
             kill_all: false,
         };
         // Fresh process at the keep path survives.
