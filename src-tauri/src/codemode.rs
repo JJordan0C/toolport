@@ -1354,6 +1354,56 @@ mod tests {
         assert!(out.error.unwrap().contains("unavailable"));
     }
 
+    /// An exhausted budget must not mask the real reason a script cannot page
+    /// results: with no binding AND no budget left, the error still says
+    /// "unavailable", not "budget exceeded".
+    #[test]
+    fn fetch_result_unavailable_wins_over_an_exhausted_budget() {
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let out = run(
+            r#"return toolport.fetchResult({ cursor: "r1" });"#,
+            json!({}),
+            call,
+            Limits {
+                max_calls: 0,
+                ..Limits::default()
+            },
+        );
+        let err = out.error.expect("no binding must still be an error");
+        assert!(
+            err.contains("unavailable"),
+            "availability must be reported ahead of the budget: {err}"
+        );
+        assert!(!err.contains("budget"), "misleading budget error: {err}");
+    }
+
+    /// The deadline check still runs before argument parsing, so a script looping on
+    /// invalid specs against a live binding cannot spin past its wall clock.
+    #[test]
+    fn fetch_result_charges_the_budget_before_validating_the_spec() {
+        let fetch: FetchBinding = Arc::new(|_: FetchArgs| {
+            json!({ "content": [{ "type": "text", "text": "x" }], "isError": false })
+        });
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let out = run_script(
+            // Empty cursor is invalid; the budget must be refused first.
+            r#"return toolport.fetchResult({ cursor: "" });"#,
+            json!({}),
+            call,
+            Some(fetch),
+            Limits {
+                max_calls: 0,
+                ..Limits::default()
+            },
+            &[],
+        );
+        let err = out.error.expect("exhausted budget must be an error");
+        assert!(
+            err.contains("budget"),
+            "budget must be checked before spec validation: {err}"
+        );
+    }
+
     /// WS2-2: fetchResult must share the call budget with toolport.call.
     #[test]
     fn fetch_result_counts_against_call_budget() {

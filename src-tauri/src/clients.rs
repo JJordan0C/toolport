@@ -2435,31 +2435,39 @@ const CONFIG_BACKUP_GENERATIONS: usize = 5;
 /// Bounding the count bounds how long a rotated-away token survives on disk.
 ///
 /// Best-effort: a failure here must never fail the write the backup was protecting.
-/// Names are `<millis>-<file name>`; the timestamp is fixed-width for any realistic
-/// epoch, so lexical order is age order.
+/// Names are `<millis>-<file name>`. Age order comes from parsing that prefix as a
+/// number, not from sorting the names: lexical order only equals age order while every
+/// stamp is the same width, so a short prefix (a clock that read near the epoch, or any
+/// future change to the stamp format) would sort as "oldest" and get deleted first
+/// regardless of when it was written.
 fn prune_backups(dir: &Path, name: &str) {
     let suffix = format!("-{name}");
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut mine: Vec<PathBuf> = entries
+    let mut mine: Vec<(u128, PathBuf)> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
+        .filter_map(|p| {
+            let stamp = p
+                .file_name()
                 .and_then(|f| f.to_str())
                 .and_then(|f| f.strip_suffix(&suffix))
                 // Timestamp prefix only, so backups of `config.yaml` never prune
                 // backups of some other `<x>-config.yaml` in the same directory.
-                .is_some_and(|stamp| !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()))
+                .filter(|stamp| !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()))
+                // An unparseable stamp means a name we do not own the format of; skip
+                // it rather than guess its age.
+                .and_then(|stamp| stamp.parse::<u128>().ok())?;
+            Some((stamp, p))
         })
         .collect();
     if mine.len() <= CONFIG_BACKUP_GENERATIONS {
         return;
     }
-    mine.sort();
+    mine.sort_by_key(|(stamp, _)| *stamp);
     let excess = mine.len() - CONFIG_BACKUP_GENERATIONS;
-    for stale in mine.into_iter().take(excess) {
+    for (_, stale) in mine.into_iter().take(excess) {
         let _ = std::fs::remove_file(stale);
     }
 }
@@ -4226,6 +4234,48 @@ mod tests {
         // Idempotent once at the cap.
         prune_backups(&dir, "config.yaml");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 7);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Age order must come from the parsed stamp, not the name. When the millisecond
+    /// count gains a digit, lexical order inverts and a plain sort would delete one of
+    /// the NEWEST backups while keeping older ones.
+    #[test]
+    fn prune_backups_orders_by_parsed_timestamp_not_lexically() {
+        let dir = std::env::temp_dir().join(format!("toolport-bk-width-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Straddle a digit-width boundary: 13-digit stamps are numerically OLDER than
+        // the 14-digit ones, but sort AFTER them as strings.
+        let oldest = "9999999999997";
+        for stamp in [
+            oldest,
+            "9999999999998",
+            "9999999999999",
+            "10000000000000",
+            "10000000000001",
+            "10000000000002",
+        ] {
+            std::fs::write(dir.join(format!("{stamp}-config.yaml")), "x").unwrap();
+        }
+
+        prune_backups(&dir, "config.yaml");
+
+        let left: std::collections::BTreeSet<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .collect();
+        assert_eq!(left.len(), CONFIG_BACKUP_GENERATIONS);
+        assert!(
+            !left.contains(&format!("{oldest}-config.yaml")),
+            "the numerically oldest backup must be the one dropped: {left:?}"
+        );
+        assert!(
+            left.contains("10000000000000-config.yaml"),
+            "a lexical sort would have deleted this newer backup instead: {left:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

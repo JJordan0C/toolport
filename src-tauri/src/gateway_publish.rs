@@ -195,7 +195,9 @@ pub struct ReapContext {
     /// misses keep-paths, so an in-place binary swap turns "our own image" into a
     /// Kill verdict for any caller whose basename looks like a gateway.
     pub keep_pids: Vec<u32>,
-    /// When true (updater), every gateway process is killed, including current.
+    /// When true (updater), every gateway process is killed regardless of path or
+    /// version, so locked binaries can be replaced. Still subject to `keep_pids`:
+    /// unlocking the binaries is pointless if the process doing it kills itself.
     pub kill_all: bool,
 }
 
