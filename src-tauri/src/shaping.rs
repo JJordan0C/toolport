@@ -244,7 +244,21 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
         cursor,
         head_chars
     );
-    *result = text_result(format!("{head}{marker}"), is_error);
+    // Shaping deliberately rewrites `content` and stashes `structuredContent` in
+    // the cache (both retrievable via the cursor). Every other top-level field
+    // belongs to the downstream server, not to us: `_meta`, and whatever a future
+    // revision or extension adds. Carry them across so shaping stays a truncation
+    // of the body rather than a rewrite of the envelope (SOU-444).
+    let mut shaped = text_result(format!("{head}{marker}"), is_error);
+    if let (Some(src), Some(dst)) = (result.as_object(), shaped.as_object_mut()) {
+        for (key, value) in src {
+            if matches!(key.as_str(), "content" | "structuredContent" | "isError") {
+                continue;
+            }
+            dst.insert(key.clone(), value.clone());
+        }
+    }
+    *result = shaped;
     true
 }
 
@@ -491,6 +505,71 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("end of result"));
+    }
+
+    #[test]
+    fn relayable_meta_keeps_unknown_and_drops_per_hop() {
+        use crate::downstream::{relayable_meta, sanitize_forwarded_meta};
+
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": { "name": "x" },
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "progressToken": "p-1",
+            "traceparent": "00-abc-def-01",
+            "com.example/unknown": { "a": 1 }
+        });
+        let kept = relayable_meta(Some(&meta)).expect("some keys survive");
+        assert_eq!(kept["traceparent"], "00-abc-def-01");
+        assert_eq!(kept["com.example/unknown"]["a"], 1);
+        assert!(kept.get("io.modelcontextprotocol/protocolVersion").is_none());
+        assert!(kept.get("io.modelcontextprotocol/clientInfo").is_none());
+        assert!(kept.get("io.modelcontextprotocol/clientCapabilities").is_none());
+        assert!(kept.get("progressToken").is_none(), "withheld until SOU-444 part 2");
+
+        // Nothing relayable means no `_meta` at all, not an empty object, so the
+        // request stays byte-identical to what Toolport sent before SOU-444.
+        assert!(relayable_meta(Some(&json!({ "progressToken": "p" }))).is_none());
+        assert!(relayable_meta(None).is_none());
+
+        // The wholesale-forward path (completion/complete) strips the same keys.
+        let mut params = json!({
+            "ref": { "type": "ref/prompt", "name": "p" },
+            "_meta": { "io.modelcontextprotocol/clientInfo": { "name": "x" }, "keep": 1 }
+        });
+        sanitize_forwarded_meta(&mut params);
+        assert_eq!(params["_meta"]["keep"], 1);
+        assert!(params["_meta"].get("io.modelcontextprotocol/clientInfo").is_none());
+
+        // ...and removes `_meta` entirely when nothing survives.
+        let mut params = json!({
+            "ref": {}, "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" }
+        });
+        sanitize_forwarded_meta(&mut params);
+        assert!(params.get("_meta").is_none());
+    }
+
+    #[test]
+    fn shaping_preserves_meta_and_unknown_envelope_fields() {
+        // Shaping truncates the BODY. Everything else in the envelope belongs to
+        // the downstream server: `_meta`, and whatever a future revision or
+        // extension adds. Dropping it would make Toolport a lossy proxy in the
+        // result direction, the mirror of the request-side gap (SOU-444).
+        let mut r = json!({
+            "content": [{ "type": "text", "text": "x".repeat(5_000) }],
+            "isError": false,
+            "_meta": { "io.modelcontextprotocol/serverInfo": { "name": "srv", "version": "1" } },
+            "somethingAFutureSpecAdded": { "keep": true }
+        });
+        assert!(shape_result(&mut r, 1024, None));
+
+        assert_eq!(r["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "srv");
+        assert_eq!(r["somethingAFutureSpecAdded"]["keep"], true);
+        // ...while the body really was shaped.
+        assert!(r["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Toolport shaped this result"));
     }
 
     #[test]

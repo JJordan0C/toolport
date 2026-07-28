@@ -288,12 +288,10 @@ fn downstream_transcript_pins_current_wire_format() {
         assert!(methods.iter().any(|m| m == expected), "missing {expected} in {methods:?}");
     }
 
-    // The `tools/call` envelope as it exists today. Params are RECONSTRUCTED by
-    // `downstream.rs:2498` as exactly `{name, arguments}`, which is why
-    // `params._meta` has never survived a hop through Toolport.
-    //
-    // SOU-444 changes this. When it lands, `_meta` becomes an expected key here
-    // and this assertion must be updated deliberately.
+    // The `tools/call` envelope for a call carrying no client metadata. Since
+    // SOU-444 the gateway attaches `_meta` only when there is something relayable
+    // to attach, so this shape is byte-identical to what Toolport sent before
+    // that work: an unchanged request for every server that never sees `_meta`.
     let call = transcript
         .iter()
         .find(|r| r["method"] == "tools/call")
@@ -323,30 +321,95 @@ fn downstream_transcript_pins_current_wire_format() {
 // 3. Known gaps, encoded as acceptance criteria
 // ---------------------------------------------------------------------------
 
-/// SOU-444. `_meta` sent by an upstream client must reach the downstream server.
-/// Today the gateway reconstructs `params` from `{name, arguments}` and drops
-/// everything else, so this fails.
-///
-/// Remove the `#[ignore]` when envelope-transparent proxying lands.
-#[test]
-#[ignore = "SOU-444: params are reconstructed, so _meta never reaches downstream"]
-fn client_meta_reaches_downstream_server() {
+/// Ask the fixture to reflect back whatever `_meta` reached it.
+fn relayed_meta(client_meta: &Value) -> Value {
     let dirty = Arc::new(AtomicU8::new(0));
     let transport = StdioTransport::spawn_watched(mock_bin(), &[], &[], None, dirty, None)
         .expect("spawn fixture");
     let mut server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
-
-    // `echo_meta` reflects whatever `params._meta` it received.
     let result = server
-        .call("echo_meta", json!({}))
+        .call_with_cancel("echo_meta", json!({}), None, Some(client_meta))
         .expect("echo_meta call");
+    result["structuredContent"]["receivedMeta"].clone()
+}
 
-    let received = &result["structuredContent"]["receivedMeta"];
-    assert!(
-        received.get("progressToken").is_some(),
-        "a progressToken supplied by the client must reach the server, got {received}"
+/// SOU-444. `_meta` an upstream client sends must reach the downstream server,
+/// including keys this build has never heard of. That "forward unknown by
+/// default" property is what stops Toolport silently breaking future extensions
+/// such as MCP Apps and Tasks.
+#[test]
+fn client_meta_reaches_downstream_server() {
+    let received = relayed_meta(&json!({
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "com.example/somethingWeHaveNeverSeen": { "nested": [1, 2, 3] },
+        "io.modelcontextprotocol/tasks": { "taskId": "t-1" }
+    }));
+
+    assert_eq!(
+        received["traceparent"],
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "OTel trace context is explicitly meant to propagate across hops"
     );
+    assert_eq!(
+        received["com.example/somethingWeHaveNeverSeen"]["nested"][2], 3,
+        "an unknown extension namespace must survive verbatim, got {received}"
+    );
+    assert_eq!(received["io.modelcontextprotocol/tasks"]["taskId"], "t-1");
+}
+
+/// The other half of relaying: keys that describe one hop must NOT be forwarded.
+/// Toolport is the client on the downstream hop, so relaying the upstream
+/// client's identity or capabilities would assert claims the gateway cannot
+/// honour. SOU-445/SOU-446 replace these with Toolport's own values.
+#[test]
+fn per_hop_meta_keys_are_not_relayed() {
+    let received = relayed_meta(&json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": { "name": "SomeOtherClient", "version": "9.9.9" },
+        "io.modelcontextprotocol/clientCapabilities": { "sampling": {} },
+        "keepMe": true
+    }));
+
+    for key in [
+        "io.modelcontextprotocol/protocolVersion",
+        "io.modelcontextprotocol/clientInfo",
+        "io.modelcontextprotocol/clientCapabilities",
+    ] {
+        assert!(
+            received.get(key).is_none(),
+            "{key} is per-hop and must not be relayed, got {received}"
+        );
+    }
+    assert_eq!(received["keepMe"], true, "non-per-hop keys still travel");
+}
+
+/// A request whose `_meta` is entirely per-hop must not gain an empty `_meta`
+/// object. Downstream servers that never see client metadata keep receiving
+/// byte-identical requests.
+#[test]
+fn fully_stripped_meta_leaves_no_empty_object() {
+    let received = relayed_meta(&json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+    }));
+    assert!(
+        received.is_null(),
+        "no relayable keys should mean no _meta at all, got {received}"
+    );
+}
+
+/// SOU-444, part two. `progressToken` is deliberately withheld until the gateway
+/// can route `notifications/progress` back to the originating request: the stdio
+/// read loop drops every notification it does not recognise, so relaying the
+/// token today would invite progress traffic into a black hole.
+///
+/// Remove the `#[ignore]` (and `WITHHELD_META_KEYS` in `downstream.rs`) when
+/// progress routing lands.
+#[test]
+#[ignore = "SOU-444 part 2: progressToken withheld until notifications/progress can be routed back"]
+fn progress_token_reaches_downstream_server() {
+    let received = relayed_meta(&json!({ "progressToken": "p-1" }));
+    assert_eq!(received["progressToken"], "p-1");
 }
 
 /// SOU-445. A dual-era gateway must connect to a modern, stateless server by

@@ -3044,6 +3044,10 @@ fn execute_call(
     confirm: Option<&ConfirmGuard>,
     name: &str,
     arguments: Value,
+    // The upstream client's `params._meta`, relayed to the downstream server
+    // minus per-hop keys (SOU-444). `None` for calls Toolport originates
+    // itself: a code-mode script step has no client request behind it.
+    client_meta: Option<&Value>,
     opts: CallOpts,
     // Live swappable router slot (SOU-321). After HITL approval we re-clone this so
     // quarantine applied via `Arc::make_mut` during the hold is visible before execute.
@@ -3302,7 +3306,7 @@ fn execute_call(
     }
 
     let started = Instant::now();
-    match exec_router.route_call_with_cancel(name, arguments, cancel.clone()) {
+    match exec_router.route_call_with_cancel(name, arguments, cancel.clone(), client_meta) {
         Ok(result) => {
             if let Some(profiler) = &mut call_profiler {
                 profiler.mark_downstream();
@@ -3573,6 +3577,9 @@ fn run_script_dispatch(
                     None,
                     name,
                     args,
+                    // A script step is Toolport's own call, not a relay of a client
+                    // request, so there is no client `_meta` to carry.
+                    None,
                     CallOpts {
                         confirmed: false,
                         shape: false,
@@ -4307,6 +4314,8 @@ fn handle_request_with_cancel(
                     Some(confirm),
                     name.as_str(),
                     arguments,
+                    // Relay the client's request metadata downstream (SOU-444).
+                    req.get("params").and_then(|p| p.get("_meta")),
                     CallOpts {
                         confirmed,
                         shape: true,
@@ -4371,7 +4380,8 @@ fn handle_request_with_cancel(
                     return Some(error(id, -32602, &format!("Toolport: no server owns resource '{uri}'")));
                 }
             }
-            match router.read_resource_with_cancel(uri, cancel.clone()) {
+            let client_meta = req.get("params").and_then(|p| p.get("_meta")).cloned();
+            match router.read_resource_with_cancel(uri, cancel.clone(), client_meta.as_ref()) {
                 Ok(mut result) => {
                     // Content defense: a resource is as attacker-controllable as a tool
                     // result, so scan it for injection and label any flagged text as data.
@@ -4435,7 +4445,9 @@ fn handle_request_with_cancel(
                     return Some(error(id, -32602, &format!("Toolport: no route for prompt '{name}'")));
                 }
             }
-            match router.get_prompt_with_cancel(name, arguments, cancel.clone()) {
+            let client_meta = params.and_then(|p| p.get("_meta")).cloned();
+            match router.get_prompt_with_cancel(name, arguments, cancel.clone(), client_meta.as_ref())
+            {
                 Ok(mut result) => {
                     // Content defense: a prompt's messages are attacker-controllable too;
                     // scan for injection and label any flagged text as data.

@@ -24,6 +24,83 @@ use serde_json::{json, Value};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// `_meta` keys that describe a single client-to-server hop and therefore must
+/// NOT be relayed onward (SOU-444).
+///
+/// Toolport is the *client* on the downstream hop, so it speaks for itself
+/// there: the version it negotiated with that particular server, its own
+/// identity, and the capabilities it can actually service. Relaying the upstream
+/// client's values would assert claims Toolport cannot honour - advertising a
+/// sampling capability, say, that the gateway would then have to service on the
+/// client's behalf. SOU-445/SOU-446 replace these with Toolport's own per-
+/// connection values rather than simply omitting them.
+pub const PER_HOP_META_KEYS: [&str; 3] = [
+    "io.modelcontextprotocol/protocolVersion",
+    "io.modelcontextprotocol/clientInfo",
+    "io.modelcontextprotocol/clientCapabilities",
+];
+
+/// `progressToken` is deliberately withheld for now. The stdio read loop drops
+/// every notification it does not recognise, so `notifications/progress` from a
+/// downstream server currently goes nowhere. Relaying the token would invite
+/// that traffic into a black hole and could push a server into a streaming mode
+/// for a client that will never see the updates. Released in the second half of
+/// SOU-444, once progress notifications can be routed back to the originating
+/// request.
+const WITHHELD_META_KEYS: [&str; 1] = ["progressToken"];
+
+/// The part of an upstream client's `_meta` that may travel downstream.
+///
+/// MCP's `_meta` is an open map: OpenTelemetry trace context, extension
+/// namespaces, and (from 2026-07-28) protocol version, client identity, and
+/// capabilities all ride here. Everything that is not per-hop or explicitly
+/// withheld is relayed untouched, including keys this build has never heard of -
+/// that is what keeps Toolport from silently breaking future extensions.
+///
+/// Returns `None` when nothing survives, so the outgoing params keep their
+/// historical shape byte-for-byte.
+pub fn relayable_meta(meta: Option<&Value>) -> Option<Value> {
+    let obj = meta?.as_object()?;
+    let kept: serde_json::Map<String, Value> = obj
+        .iter()
+        .filter(|(k, _)| {
+            !PER_HOP_META_KEYS.contains(&k.as_str()) && !WITHHELD_META_KEYS.contains(&k.as_str())
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    (!kept.is_empty()).then(|| Value::Object(kept))
+}
+
+/// Apply the same per-hop discipline to a params object that is forwarded
+/// wholesale rather than rebuilt.
+///
+/// `completion/complete` is the one request Toolport already relayed verbatim
+/// (`Router::resolve_completion` clones the client's params and rewrites only
+/// `ref`), so without this it would leak per-hop keys the rebuilt paths strip.
+pub fn sanitize_forwarded_meta(params: &mut Value) {
+    let Some(obj) = params.as_object_mut() else {
+        return;
+    };
+    if !obj.contains_key("_meta") {
+        return;
+    }
+    match relayable_meta(obj.get("_meta")) {
+        Some(kept) => obj.insert("_meta".to_string(), kept),
+        None => obj.remove("_meta"),
+    };
+}
+
+/// Attach relayed `_meta` to an outgoing params object.
+///
+/// A request carrying no relayable metadata is left exactly as Toolport built it
+/// before SOU-444, so existing downstream servers see no change whatsoever.
+fn with_meta(mut params: Value, meta: Option<&Value>) -> Value {
+    if let Some(relayed) = relayable_meta(meta) {
+        params["_meta"] = relayed;
+    }
+    params
+}
+
 /// Max time to wait for a single stdio response before giving up. Without this a
 /// server that never replies would block its thread (and the batch health probe)
 /// forever.
@@ -2492,34 +2569,42 @@ impl DownstreamServer {
     }
 
     pub fn call(&mut self, tool: &str, arguments: Value) -> Result<Value, TransportError> {
-        self.call_with_cancel(tool, arguments, None)
+        self.call_with_cancel(tool, arguments, None, None)
     }
 
+    /// `meta` is the upstream client's `params._meta`, relayed downstream minus
+    /// the per-hop keys (SOU-444). `None` for calls Toolport originates itself,
+    /// such as a code-mode script step, which have no client request behind them.
     pub fn call_with_cancel(
         &mut self,
         tool: &str,
         arguments: Value,
         cancel: Option<CancelContext>,
+        meta: Option<&Value>,
     ) -> Result<Value, TransportError> {
         self.transport.request_with_cancel(
             "tools/call",
-            json!({ "name": tool, "arguments": arguments }),
+            with_meta(json!({ "name": tool, "arguments": arguments }), meta),
             cancel,
         )
     }
 
     /// Read one resource by its (original, downstream) uri.
     pub fn read_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
-        self.read_resource_with_cancel(uri, None)
+        self.read_resource_with_cancel(uri, None, None)
     }
 
     pub fn read_resource_with_cancel(
         &mut self,
         uri: &str,
         cancel: Option<CancelContext>,
+        meta: Option<&Value>,
     ) -> Result<Value, TransportError> {
-        self.transport
-            .request_with_cancel("resources/read", json!({ "uri": uri }), cancel)
+        self.transport.request_with_cancel(
+            "resources/read",
+            with_meta(json!({ "uri": uri }), meta),
+            cancel,
+        )
     }
 
     /// Subscribe to `notifications/resources/updated` for one resource URI on
@@ -2538,7 +2623,7 @@ impl DownstreamServer {
 
     /// Get one prompt by its (original, downstream) name.
     pub fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Value, TransportError> {
-        self.get_prompt_with_cancel(name, arguments, None)
+        self.get_prompt_with_cancel(name, arguments, None, None)
     }
 
     pub fn get_prompt_with_cancel(
@@ -2546,10 +2631,11 @@ impl DownstreamServer {
         name: &str,
         arguments: Value,
         cancel: Option<CancelContext>,
+        meta: Option<&Value>,
     ) -> Result<Value, TransportError> {
         self.transport.request_with_cancel(
             "prompts/get",
-            json!({ "name": name, "arguments": arguments }),
+            with_meta(json!({ "name": name, "arguments": arguments }), meta),
             cancel,
         )
     }
