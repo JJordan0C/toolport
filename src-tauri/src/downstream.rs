@@ -30,6 +30,63 @@ use serde_json::{json, Value};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Which protocol era a downstream connection settled on (SOU-445).
+///
+/// Replaces the single global [`PROTOCOL_VERSION`] for anything that needs to
+/// know how to talk to a *particular* server: Toolport can hold connections in
+/// both eras at once, and must translate between them when the upstream client's
+/// era differs from a downstream server's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Era {
+    /// Opened with an `initialize` handshake; the version was negotiated once for
+    /// the whole connection (2025-11-25 and earlier).
+    Legacy { version: String },
+    /// No handshake: version, identity, and capabilities ride on every request's
+    /// `_meta` (2026-07-28 and later).
+    Modern { version: String },
+}
+
+impl Era {
+    pub fn version(&self) -> &str {
+        match self {
+            Era::Legacy { version } | Era::Modern { version } => version,
+        }
+    }
+
+    pub fn is_modern(&self) -> bool {
+        matches!(self, Era::Modern { .. })
+    }
+}
+
+/// Pick a protocol version from a `DiscoverResult`, preferring the newest
+/// revision Toolport implements.
+fn choose_protocol_version(discovered: &Value) -> Option<String> {
+    let supported: Vec<&str> = discovered
+        .get("supportedVersions")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    supported
+        .iter()
+        .find(|v| **v == MODERN_PROTOCOL_VERSION)
+        .map(|v| (*v).to_string())
+}
+
+/// Every MCP revision Toolport can speak to a downstream server, newest first.
+///
+/// `2026-07-28` and later are "modern": no handshake, with version, identity and
+/// capabilities carried as per-request `_meta`. Everything earlier is "legacy"
+/// and opens with `initialize`. Toolport is dual-era, so it must drive both.
+pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// Error codes the 2026-07-28 allocation policy reserves for the specification
+/// (`-32020`..`-32099`). Their presence in a response is what identifies a modern
+/// server during the backward-compatibility probe.
+pub const HEADER_MISMATCH: i64 = -32020;
+pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i64 = -32021;
+pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
 /// `_meta` keys that describe a single client-to-server hop and therefore must
 /// NOT be relayed onward (SOU-444).
 ///
@@ -107,6 +164,43 @@ fn with_meta(mut params: Value, meta: Option<&Value>) -> Value {
     params
 }
 
+/// Merge the connection's standard protocol `_meta` into an outgoing request.
+///
+/// Applied by the transport, so every request gets it regardless of which call
+/// site built the params. Protocol keys win over anything already present:
+/// they describe *this* hop, and Toolport owns them (SOU-445).
+fn merge_protocol_meta(params: &mut Value, protocol: &Value) {
+    let (Some(obj), Some(protocol)) = (params.as_object_mut(), protocol.as_object()) else {
+        return;
+    };
+    let slot = obj
+        .entry("_meta")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !slot.is_object() {
+        *slot = Value::Object(serde_json::Map::new());
+    }
+    if let Some(meta) = slot.as_object_mut() {
+        for (key, value) in protocol {
+            meta.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// The standard `_meta` a modern (2026-07-28+) connection puts on every request.
+fn protocol_meta_for(version: &str) -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": version,
+        "io.modelcontextprotocol/clientInfo": {
+            "name": "toolport-gateway",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        // Toolport speaks for itself on this hop. It advertises no client
+        // capabilities of its own yet; SOU-449 fills these in once MRTR lets the
+        // gateway service sampling/elicitation on a client's behalf.
+        "io.modelcontextprotocol/clientCapabilities": {}
+    })
+}
+
 /// Max time to wait for a single stdio response before giving up. Without this a
 /// server that never replies would block its thread (and the batch health probe)
 /// forever.
@@ -166,6 +260,13 @@ pub enum TransportError {
     /// responded with an error (or the response was structurally invalid). Does NOT
     /// count against server health - a bad tool call is not a dead server.
     Fatal(String),
+    /// The server returned a JSON-RPC *error object*, preserved structurally.
+    ///
+    /// Previously these were flattened with `Fatal(err.to_string())`, which threw
+    /// away the `code`. The 2026-07-28 era probe branches on exactly that code, so
+    /// it has to survive (SOU-445). Treated like `Fatal` everywhere else: an error
+    /// response is not a health failure.
+    Rpc(Value),
     /// The server is unreachable or unresponsive (a read timed out, or the connection
     /// died). Distinct from `Fatal` so the circuit breaker can trip on a genuinely
     /// dead/hung server without counting ordinary error responses against it.
@@ -376,8 +477,59 @@ impl TransportError {
     /// True if this reflects the server being unreachable/unhealthy (timeout, dead
     /// connection, or exhausted connection/rate-limit retries) rather than a normal
     /// protocol or application error. Only these trip the per-server circuit breaker.
+    ///
+    /// [`TransportError::Rpc`] is deliberately excluded, same as [`TransportError::Fatal`]:
+    /// a server that answers with an error response is alive and well-behaved.
     pub fn is_health_failure(&self) -> bool {
         matches!(self, TransportError::Unavailable(_) | TransportError::Retry { .. })
+    }
+
+    /// The JSON-RPC `code`, when the failure was an error *response* from the
+    /// server rather than a transport problem.
+    ///
+    /// The 2026-07-28 compatibility ladder is defined entirely in terms of this
+    /// code, which is why the error object is preserved structurally instead of
+    /// being flattened into a message string (SOU-445).
+    pub fn rpc_code(&self) -> Option<i64> {
+        match self {
+            TransportError::Rpc(err) => err.get("code").and_then(Value::as_i64),
+            _ => None,
+        }
+    }
+
+    /// True when the server answered with an error only a *modern* (2026-07-28 or
+    /// later) implementation produces.
+    ///
+    /// This is the pivot of the backward-compatibility probe: a recognized modern
+    /// error means the server IS modern and the client must correct the request
+    /// (usually by retrying with a mutually supported version) rather than
+    /// falling back to the legacy `initialize` handshake. Anything else - an
+    /// unrecognized error, or no response at all - identifies a legacy server.
+    pub fn is_modern_protocol_error(&self) -> bool {
+        matches!(
+            self.rpc_code(),
+            Some(HEADER_MISMATCH)
+                | Some(MISSING_REQUIRED_CLIENT_CAPABILITY)
+                | Some(UNSUPPORTED_PROTOCOL_VERSION)
+        )
+    }
+
+    /// Protocol versions a server advertised in an `UnsupportedProtocolVersionError`.
+    pub fn supported_versions(&self) -> Vec<String> {
+        let TransportError::Rpc(err) = self else {
+            return Vec::new();
+        };
+        err.get("data")
+            .and_then(|d| d.get("supported"))
+            .and_then(Value::as_array)
+            .map(|versions| {
+                versions
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -385,6 +537,9 @@ impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TransportError::Fatal(msg) => write!(f, "{msg}"),
+            // Rendered exactly as the flattened form was, so nothing user-facing
+            // changes now that the error is carried structurally.
+            TransportError::Rpc(err) => write!(f, "{err}"),
             TransportError::Unavailable(msg) => write!(f, "{msg}"),
             TransportError::Retry { message, .. } => write!(f, "{message}"),
         }
@@ -651,6 +806,15 @@ pub fn is_server_initiated_request(v: &Value) -> bool {
 /// A bidirectional JSON-RPC channel to one downstream server.
 pub trait Transport: Send {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError>;
+    /// Standard per-request `_meta` to merge into every outgoing request.
+    ///
+    /// From 2026-07-28 there is no handshake: each request carries its own
+    /// protocol version, client identity, and client capabilities. Setting it
+    /// once here means every call site - `fetch_paginated_list`, `tools/call`,
+    /// `resources/read`, and anything added later - gets it without repeating
+    /// the merge. Default no-op, so legacy connections send exactly what they
+    /// always did (SOU-445).
+    fn set_protocol_meta(&mut self, _meta: Option<Value>) {}
     fn request_with_cancel(
         &mut self,
         method: &str,
@@ -1310,6 +1474,9 @@ pub struct StdioTransport {
     /// (SOU-444). Shared with the stdout drain thread so the gateway can bind it
     /// after the transport is spawned, keeping `spawn_watched`'s signature stable.
     progress: Arc<Mutex<Option<ProgressSink>>>,
+    /// Standard per-request `_meta` for a modern (2026-07-28+) connection, merged
+    /// into every outgoing request. `None` on legacy connections (SOU-445).
+    protocol_meta: Option<Value>,
 }
 
 /// Owns a Windows Job Object configured to terminate every assigned process
@@ -1757,6 +1924,7 @@ impl StdioTransport {
             launcher: is_download_launcher(command, args),
             server_handler: None,
             progress,
+            protocol_meta: None,
         })
     }
 
@@ -1810,6 +1978,10 @@ impl Transport for StdioTransport {
         let id = self.next_id;
         self.next_id += 1;
         let downstream_id = json!(id);
+        let mut params = params;
+        if let Some(protocol) = &self.protocol_meta {
+            merge_protocol_meta(&mut params, protocol);
+        }
         let msg = json!({ "jsonrpc": "2.0", "id": downstream_id.clone(), "method": method, "params": params });
 
         // A broken stdin pipe means the child is gone: a health failure, not a protocol error.
@@ -1901,7 +2073,7 @@ impl Transport for StdioTransport {
             }
             if ids_match(value.get("id"), Some(&json!(id))) {
                 if let Some(err) = value.get("error") {
-                    return Err(TransportError::Fatal(err.to_string()));
+                    return Err(TransportError::Rpc(err.clone()));
                 }
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
@@ -1936,6 +2108,10 @@ impl Transport for StdioTransport {
 
     fn set_server_request_handler(&mut self, handler: ServerRequestHandler) {
         self.server_handler = Some(handler);
+    }
+
+    fn set_protocol_meta(&mut self, meta: Option<Value>) {
+        self.protocol_meta = meta;
     }
 }
 
@@ -2105,6 +2281,9 @@ pub struct HttpTransport {
     /// Route `notifications/progress` seen mid-SSE back to the client that minted
     /// the token (SOU-444).
     progress: Option<ProgressSink>,
+    /// Standard per-request `_meta` for a modern (2026-07-28+) connection, merged
+    /// into every outgoing request. `None` on legacy connections (SOU-445).
+    protocol_meta: Option<Value>,
 }
 
 impl HttpTransport {
@@ -2150,6 +2329,7 @@ impl HttpTransport {
             server_handler: None,
             resource_updated: None,
             progress: None,
+            protocol_meta: None,
         }
     }
 
@@ -2415,10 +2595,14 @@ impl Transport for HttpTransport {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
         let id = self.next_id;
         self.next_id += 1;
+        let mut params = params;
+        if let Some(protocol) = &self.protocol_meta {
+            merge_protocol_meta(&mut params, protocol);
+        }
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         let resp = self.post(&body, true)?.ok_or_else(|| TransportError::Fatal("empty response".to_string()))?;
         if let Some(err) = resp.get("error") {
-            return Err(TransportError::Fatal(err.to_string()));
+            return Err(TransportError::Rpc(err.clone()));
         }
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -2431,6 +2615,10 @@ impl Transport for HttpTransport {
 
     fn set_server_request_handler(&mut self, handler: ServerRequestHandler) {
         self.server_handler = Some(handler);
+    }
+
+    fn set_protocol_meta(&mut self, meta: Option<Value>) {
+        self.protocol_meta = meta;
     }
 }
 
@@ -2452,6 +2640,8 @@ pub struct DownstreamServer {
     caps_prompts: bool,
     /// Whether the server's `initialize` advertised the completions utility.
     caps_completions: bool,
+    /// The protocol era this connection settled on at handshake (SOU-445).
+    era: Era,
 }
 
 impl DownstreamServer {
@@ -2468,19 +2658,69 @@ impl DownstreamServer {
         // before the server can answer at all.
         let handshake_timeout = transport.connect_timeout();
         transport.set_read_timeout(handshake_timeout);
-        let init = transport.request(
+
+        // Era detection (SOU-445). Toolport is dual-era: it must drive both
+        // `initialize`-era servers and modern stateless ones.
+        //
+        // We try `initialize` FIRST and fall forward, rather than probing with
+        // `server/discover` first as the spec suggests. The spec's ordering is a
+        // SHOULD, and for Toolport it is the wrong trade today: essentially every
+        // installed server is legacy, and a legacy stdio server typically answers
+        // an unknown method with silence rather than an error - so a discover-first
+        // probe would charge every existing user a read-timeout on every connect.
+        // Going legacy-first costs the existing install base exactly nothing and
+        // costs a modern server one cheap rejected request. Worth revisiting once
+        // modern servers are common.
+        let (era, caps) = match transport.request(
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") }
             }),
-        ).map_err(|e| e.to_string())?;
-        let caps = init.get("capabilities");
+        ) {
+            Ok(init) => {
+                let version = init
+                    .get("protocolVersion")
+                    .and_then(Value::as_str)
+                    .unwrap_or(PROTOCOL_VERSION)
+                    .to_string();
+                let caps = init.get("capabilities").cloned();
+                transport
+                    .notify("notifications/initialized", json!({}))
+                    .map_err(|e| e.to_string())?;
+                (Era::Legacy { version }, caps)
+            }
+            // A dead or unresponsive server is not a modern server. Probing it
+            // again would just double the wait before reporting the same failure.
+            Err(err) if err.is_health_failure() => return Err(err.to_string()),
+            Err(init_err) => {
+                // The server answered, but refused `initialize`. A modern server
+                // has no such method. Confirm with `server/discover`, which every
+                // modern server MUST implement, rather than guessing from an
+                // error code the spec leaves implementation-defined.
+                let discovered = transport
+                    .request(
+                        "server/discover",
+                        json!({ "_meta": protocol_meta_for(MODERN_PROTOCOL_VERSION) }),
+                    )
+                    .map_err(|_| init_err.to_string())?;
+                let version = choose_protocol_version(&discovered).ok_or_else(|| {
+                    format!(
+                        "server supports no protocol version Toolport speaks (offered {:?})",
+                        discovered.get("supportedVersions")
+                    )
+                })?;
+                // From here every request carries its own protocol metadata;
+                // there is no handshake and no `notifications/initialized`.
+                transport.set_protocol_meta(Some(protocol_meta_for(&version)));
+                (Era::Modern { version }, discovered.get("capabilities").cloned())
+            }
+        };
+        let caps = caps.as_ref();
         let caps_resources = caps.and_then(|c| c.get("resources")).is_some();
         let caps_prompts = caps.and_then(|c| c.get("prompts")).is_some();
         let caps_completions = caps.and_then(|c| c.get("completions")).is_some();
-        transport.notify("notifications/initialized", json!({})).map_err(|e| e.to_string())?;
 
         // `initialize` answered, so any launcher download is done: the rest of the
         // handshake goes back to the tight budget - a server that comes up but then
@@ -2509,6 +2749,7 @@ impl DownstreamServer {
             caps_resources,
             caps_prompts,
             caps_completions,
+            era,
         })
     }
 
@@ -2724,6 +2965,11 @@ impl DownstreamServer {
     /// Whether this server advertised the completions utility at initialize.
     pub fn supports_completions(&self) -> bool {
         self.caps_completions
+    }
+
+    /// The protocol era and version this connection negotiated (SOU-445).
+    pub fn era(&self) -> &Era {
+        &self.era
     }
 
     /// Forward a `completion/complete` request. `params` must already use the
@@ -2960,6 +3206,7 @@ mod tests {
             caps_resources: false,
             caps_prompts: false,
             caps_completions: false,
+            era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
         };
         server.refresh_tools();
         assert_eq!(server.tools, vec![json!({"name":"stable"})]);
@@ -2984,6 +3231,7 @@ mod tests {
             caps_resources: true,
             caps_prompts: false,
             caps_completions: false,
+            era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
         };
         server.refresh_resources();
         assert_eq!(server.resources, vec![json!({"uri":"r:"})]);

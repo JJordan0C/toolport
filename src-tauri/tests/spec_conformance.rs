@@ -68,20 +68,15 @@ fn raw_transport(env: &[(String, String)]) -> StdioTransport {
     StdioTransport::spawn_watched(mock_bin(), &[], env, None, dirty, None).expect("spawn fixture")
 }
 
-/// The gateway flattens JSON-RPC error objects into `TransportError::Fatal(String)`
-/// (`downstream.rs:1765`), so the structured `code` is only recoverable by
-/// re-parsing. Re-parsing here keeps these tests honest about what the wire
-/// actually carried.
-///
-/// This lossiness is itself a gap: the 2026-07-28 backward-compatibility ladder
-/// requires a client to branch on whether a `400` body is a *recognized modern
-/// error* (`-32022`/`-32021`/`-32020`) before falling back to `initialize`.
-/// Preserving the structured error is tracked as part of SOU-445.
+/// JSON-RPC error objects are carried structurally by `TransportError::Rpc`
+/// since SOU-445, so a test can read the `code` directly. This used to re-parse
+/// a flattened string, which is exactly the lossiness that made the
+/// backward-compatibility ladder unimplementable.
 fn error_json(err: &TransportError) -> Value {
-    let TransportError::Fatal(msg) = err else {
-        panic!("expected a Fatal protocol error, got {err:?}");
+    let TransportError::Rpc(obj) = err else {
+        panic!("expected a JSON-RPC error response, got {err:?}");
     };
-    serde_json::from_str(msg).unwrap_or_else(|_| json!({ "message": msg }))
+    obj.clone()
 }
 
 fn read_transcript(path: &std::path::Path) -> Vec<Value> {
@@ -452,13 +447,10 @@ fn downstream_progress_notification_reaches_the_bound_sink() {
     assert_eq!(got[0]["params"]["total"], 2);
 }
 
-/// SOU-445. A dual-era gateway must connect to a modern, stateless server by
-/// probing `server/discover` and never sending `initialize`.
-///
-/// Today `DownstreamServer::connect` opens with `initialize` unconditionally, so
-/// a strict 2026-07-28 server refuses the handshake and the connection fails.
+/// SOU-445. A dual-era gateway must connect to a modern, stateless server: fall
+/// forward from the rejected `initialize` to `server/discover`, then carry the
+/// protocol `_meta` on every subsequent request.
 #[test]
-#[ignore = "SOU-445: connect() always sends initialize, so modern servers are unreachable"]
 fn gateway_connects_to_a_modern_server() {
     let path = scratch_path("modern");
     let _ = std::fs::remove_file(&path);
@@ -467,20 +459,83 @@ fn gateway_connects_to_a_modern_server() {
     let dirty = Arc::new(AtomicU8::new(0));
     let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
         .expect("spawn fixture");
-    let server = DownstreamServer::connect("mock".to_string(), Box::new(transport))
+    let mut server = DownstreamServer::connect("mock".to_string(), Box::new(transport))
         .expect("a dual-era gateway must connect to a modern server");
+
+    assert!(server.era().is_modern(), "era should be detected as modern");
+    assert_eq!(server.era().version(), MODERN);
+
+    // The connection is not merely established: it is usable. The strict fixture
+    // rejects any request lacking the protocol `_meta`, so a successful call
+    // proves the transport is stamping every request, not just the handshake.
+    let result = server.call("echo", json!({ "text": "hi" })).expect("call a modern server");
+    assert_eq!(result["content"][0]["text"], "hi");
+    assert_eq!(result["resultType"], "complete");
     drop(server);
 
-    let methods = methods_of(&read_transcript(&path));
-    assert_eq!(
-        methods.first().map(String::as_str),
-        Some("server/discover"),
-        "a dual-era client probes with server/discover first, got {methods:?}"
+    let transcript = read_transcript(&path);
+    let methods = methods_of(&transcript);
+
+    // `initialize` is attempted once and rejected; the fall-forward is what makes
+    // the connection work. No `notifications/initialized` is ever sent.
+    assert_eq!(methods.first().map(String::as_str), Some("initialize"));
+    assert!(
+        methods.iter().any(|m| m == "server/discover"),
+        "must fall forward to server/discover, got {methods:?}"
     );
     assert!(
-        !methods.iter().any(|m| m == "initialize"),
-        "a modern server must never be sent initialize, got {methods:?}"
+        !methods.iter().any(|m| m == "notifications/initialized"),
+        "a modern server has no handshake to complete, got {methods:?}"
     );
+
+    // Every post-handshake request carries its own protocol version and identity.
+    for record in transcript.iter().filter(|r| r["method"] == "tools/list" || r["method"] == "tools/call")
+    {
+        let meta = &record["params"]["_meta"];
+        assert_eq!(
+            meta["io.modelcontextprotocol/protocolVersion"], MODERN,
+            "every modern request declares its version, got {record}"
+        );
+        assert_eq!(
+            meta["io.modelcontextprotocol/clientInfo"]["name"], "toolport-gateway",
+            "Toolport identifies itself on the downstream hop, not the upstream client"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The legacy path must be untouched by era detection: no extra probe, no
+/// `server/discover`, and no protocol `_meta` on the wire. This is the
+/// no-regression guarantee for the entire existing install base.
+#[test]
+fn legacy_servers_see_no_era_detection_traffic() {
+    let path = scratch_path("legacy-era");
+    let _ = std::fs::remove_file(&path);
+    let env = env_for(Some("2025-06-18"), true, Some(&path.to_string_lossy()));
+
+    let dirty = Arc::new(AtomicU8::new(0));
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+        .expect("spawn fixture");
+    let mut server =
+        DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
+    assert!(!server.era().is_modern());
+    assert_eq!(server.era().version(), "2025-06-18");
+    server.call("echo", json!({ "text": "hi" })).expect("call");
+    drop(server);
+
+    let transcript = read_transcript(&path);
+    let methods = methods_of(&transcript);
+    assert!(
+        !methods.iter().any(|m| m == "server/discover"),
+        "a legacy server must never be probed, got {methods:?}"
+    );
+    for record in &transcript {
+        assert!(
+            record["params"].get("_meta").is_none(),
+            "legacy requests carry no protocol _meta, got {record}"
+        );
+    }
 
     let _ = std::fs::remove_file(&path);
 }
