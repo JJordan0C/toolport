@@ -6,8 +6,6 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
-## [1.9.7] - 2026-07-28
-
 Stale gateways actually stop after an upgrade, approvals stay bound to what you
 approved, and a batch of transport and code-mode hardening.
 
