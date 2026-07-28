@@ -6,6 +6,57 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.9.7] - 2026-07-28
+
+Stale gateways actually stop after an upgrade, approvals stay bound to what you
+approved, and a batch of transport and code-mode hardening.
+
+### Security
+
+**An approved tool call is re-checked against the live gateway before it runs.** A
+human approval was validated against a snapshot taken before the hold, so a tool that
+was quarantined, released, or had its definition changed during the approval window
+still executed against the pre-hold view. Approvals now rebind to the live router and
+fail closed if the definition fingerprint moved or the tool is blocked, with a clearer
+"this approval is stale" message. (SOU-321, SOU-322)
+
+**Vendor auth hints require an exact domain match.** Lookalike apex domains
+(`clerkauth.com`, `evilgithub.com`) could inherit a real vendor's auth hints and token
+URL through prefix/suffix matching on the second-level label. Matching is now exact,
+`api.githubcopilot.com` gets its own entry, and a trailing-dot FQDN still resolves.
+
+### Fixed
+
+**Old gateway processes are stopped after an upgrade, on every OS.** Upgrading left
+older versioned gateways (`toolport-gateway-1.9.4.exe` and friends) running, so
+security and policy fixes in the new binary never took effect for clients still talking
+to them. Identity is now path-based across Windows, macOS, and Linux. On macOS the
+process listing used an argv that Apple's `ps` rejects, so it saw zero gateways; on
+Linux a binary replaced in place is now correctly treated as obsolete rather than
+protected. Settings gains a **Stop old gateways** action. (SOU-414)
+
+**The Shared HTTP bridge comes back after the reaper stops it.** Reaping a bridge whose
+binary was replaced left HTTP and OpenAPI clients with nothing listening until someone
+reopened Settings.
+
+**A Continue Shared HTTP bearer now reaches the wire.** The token was written under
+`env`, which Continue does not forward for remote servers, leaving a plaintext bearer
+on disk that never authenticated. It now goes under `requestOptions.headers`, matching
+Continue's contract. Ownership re-detection reads both.
+
+**Client config backups no longer accumulate live bearer tokens.** Every config write
+copied the previous file and nothing ever pruned them, so a Shared HTTP client's
+backups piled up carrying working credentials. Capped at five generations per file,
+matching the registry.
+
+**Resource subscriptions clean up when a session is replaced**, and a subscriber
+waiting on another client's open no longer gives up while that open is still
+succeeding.
+
+**Code mode budget and isolation.** `fetchResult` shares the call and wall-clock budget
+rather than paging without limit, async workers reinstall the active session for host
+calls, and a corrupt registry no longer boots with code mode enabled.
+
 ## [1.9.6] - 2026-07-27
 
 Client config ownership, Shared HTTP connect, code mode v2 (parallel + typed stubs),
