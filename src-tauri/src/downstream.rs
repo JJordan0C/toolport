@@ -2704,7 +2704,14 @@ impl DownstreamServer {
                         "server/discover",
                         json!({ "_meta": protocol_meta_for(MODERN_PROTOCOL_VERSION) }),
                     )
-                    .map_err(|_| init_err.to_string())?;
+                    // The era conclusion is "legacy server that rejected our
+                    // handshake", so the initialize error is the actionable one.
+                    // Carry the probe's failure too: if discover timed out rather
+                    // than being refused, reporting only the initialize error
+                    // hides that the connect also paid a full read timeout.
+                    .map_err(|probe_err| {
+                        format!("{init_err} (server/discover probe also failed: {probe_err})")
+                    })?;
                 let version = choose_protocol_version(&discovered).ok_or_else(|| {
                     format!(
                         "server supports no protocol version Toolport speaks (offered {:?})",

@@ -97,6 +97,12 @@ fn decorate_for_upstream(mut result: Value) -> Value {
     // is never overwritten.
     obj.entry("resultType").or_insert_with(|| json!("complete"));
     let meta = obj.entry("_meta").or_insert_with(|| json!({}));
+    // A downstream server that returned a non-object `_meta` is malformed, but
+    // that must not make OUR envelope invalid by silently skipping the required
+    // serverInfo. There are no keys to preserve in a non-object, so replace it.
+    if !meta.is_object() {
+        *meta = json!({});
+    }
     if let Some(meta) = meta.as_object_mut() {
         // Toolport IS the server on this hop, so it identifies itself here,
         // overwriting any downstream server's value. Symmetric with
@@ -3483,18 +3489,7 @@ fn execute_call(
     // against the raw server id, matching what the per-server sink binds, so the
     // spoof check compares like with like. Held in a named binding so the RAII
     // guard lives across the call rather than dropping immediately.
-    let progress_to = progress_target();
-    let _progress_route = progress_to
-        .as_deref()
-        .and_then(|session| register_progress(progress_routes(), client_meta, server_id, session));
-    // With nowhere to deliver progress, do not ask the server to produce it
-    // (SOU-447). Only allocates when the client actually requested progress.
-    let relay_owned = match (progress_to.is_none(), client_meta) {
-        (true, Some(meta)) if meta.get("progressToken").is_some() => {
-            Some(without_progress_token(meta))
-        }
-        _ => None,
-    };
+    let (_progress_route, relay_owned) = prepare_progress(client_meta, server_id);
     let client_meta = relay_owned.as_ref().or(client_meta);
 
     let started = Instant::now();
@@ -4603,12 +4598,11 @@ fn handle_request_with_cancel(
                 }
             }
             let client_meta = req.get("params").and_then(|p| p.get("_meta")).cloned();
-            let progress_to = progress_target();
-            let _progress_route = progress_to.as_deref().zip(router.resource_server(uri)).and_then(
-                |(session, owner)| {
-                    register_progress(progress_routes(), client_meta.as_ref(), owner, session)
-                },
-            );
+            let (_progress_route, relay_owned) = match router.resource_server(uri) {
+                Some(owner) => prepare_progress(client_meta.as_ref(), owner),
+                None => (None, None),
+            };
+            let client_meta = relay_owned.or(client_meta);
             match router.read_resource_with_cancel(uri, cancel.clone(), client_meta.as_ref()) {
                 Ok(mut result) => {
                     // Content defense: a resource is as attacker-controllable as a tool
@@ -4674,13 +4668,11 @@ fn handle_request_with_cancel(
                 }
             }
             let client_meta = params.and_then(|p| p.get("_meta")).cloned();
-            let progress_to = progress_target();
-            let _progress_route = progress_to
-                .as_deref()
-                .zip(router.prompt_server(name))
-                .and_then(|(session, owner)| {
-                    register_progress(progress_routes(), client_meta.as_ref(), owner, session)
-                });
+            let (_progress_route, relay_owned) = match router.prompt_server(name) {
+                Some(owner) => prepare_progress(client_meta.as_ref(), owner),
+                None => (None, None),
+            };
+            let client_meta = relay_owned.or(client_meta);
             match router.get_prompt_with_cancel(name, arguments, cancel.clone(), client_meta.as_ref())
             {
                 Ok(mut result) => {
@@ -5180,7 +5172,20 @@ struct ProgressRoute {
     /// The downstream server the token was relayed to. Recorded so a different
     /// server cannot emit progress for it.
     producer: String,
+    /// The token the CLIENT chose, restored on the way back out.
+    ///
+    /// `progressToken` is client-chosen and small integers are common, so two
+    /// clients can easily pick the same one. Keying the table on it directly let
+    /// a second registration clobber the first, and against the same server that
+    /// delivered one client's progress to another. Toolport therefore mints its
+    /// own unique token downstream and translates back here, the same way it
+    /// namespaces tool names.
+    client_token: Value,
 }
+
+/// Source of gateway-minted progress tokens. Process-wide and monotonic, so a
+/// token is never reused while an earlier call is still in flight.
+static PROGRESS_TOKEN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Live `progressToken` -> originating client map (SOU-444).
 ///
@@ -5215,15 +5220,21 @@ impl Drop for ProgressRegistration {
 /// Register the `progressToken` in `client_meta` (if any) for the duration of one
 /// downstream call. Returns `None` when the client asked for no progress, which
 /// is the common case.
+/// Returns the registration guard and the gateway-minted token to send
+/// downstream in place of the client's.
 fn register_progress(
     table: &Arc<Mutex<ProgressRoutes>>,
     client_meta: Option<&Value>,
     producer: &str,
     session: &str,
-) -> Option<ProgressRegistration> {
-    let token = client_meta?.get("progressToken")?;
-    let key = rpc_id_key(token)?;
-    let session = session.to_string();
+) -> Option<(ProgressRegistration, String)> {
+    let client_token = client_meta?.get("progressToken")?.clone();
+    // Mint our own token rather than reusing the client's. Two clients picking
+    // the same value (integers are common) would otherwise share a table entry.
+    let key = format!(
+        "tp-{}",
+        PROGRESS_TOKEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     table
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5231,14 +5242,52 @@ fn register_progress(
         .insert(
             key.clone(),
             ProgressRoute {
-                session,
+                session: session.to_string(),
                 producer: producer.to_string(),
+                client_token,
             },
         );
-    Some(ProgressRegistration {
-        table: Arc::clone(table),
+    Some((
+        ProgressRegistration {
+            table: Arc::clone(table),
+            key: key.clone(),
+        },
         key,
-    })
+    ))
+}
+
+/// Register progress routing for one downstream call and produce the `_meta` to
+/// relay in place of the client's.
+///
+/// Three call sites need this (`tools/call`, `resources/read`, `prompts/get`),
+/// so the token substitution and the "no channel, do not ask" rule live here
+/// rather than being repeated.
+fn prepare_progress(
+    client_meta: Option<&Value>,
+    producer: &str,
+) -> (Option<ProgressRegistration>, Option<Value>) {
+    let Some(meta) = client_meta else {
+        return (None, None);
+    };
+    if meta.get("progressToken").is_none() {
+        return (None, None);
+    }
+    match progress_target() {
+        Some(session) => {
+            match register_progress(progress_routes(), client_meta, producer, &session) {
+                Some((registration, token)) => {
+                    let mut relayed = meta.clone();
+                    if let Some(obj) = relayed.as_object_mut() {
+                        obj.insert("progressToken".to_string(), json!(token));
+                    }
+                    (Some(registration), Some(relayed))
+                }
+                None => (None, None),
+            }
+        }
+        // Nowhere to deliver it, so do not ask the server to produce it.
+        None => (None, Some(without_progress_token(meta))),
+    }
 }
 
 /// Deliver one `notifications/progress` to the client that minted its token,
@@ -5253,15 +5302,18 @@ fn deliver_progress(
     let Some(token) = note.get("params").and_then(|p| p.get("progressToken")) else {
         return;
     };
-    let Some(key) = rpc_id_key(token) else {
+    // The token on the wire is the one Toolport minted, not the client's.
+    let Some(key) = token.as_str().map(str::to_string) else {
         return;
     };
-    let session = {
+    let (session, client_token) = {
         let table = routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match table.active.get(&key) {
-            Some(route) if route.producer == producer => route.session.clone(),
+            Some(route) if route.producer == producer => {
+                (route.session.clone(), route.client_token.clone())
+            }
             Some(route) => {
                 eprintln!(
                     "toolport: progress for token from '{producer}' dropped \
@@ -5275,6 +5327,12 @@ fn deliver_progress(
             None => return,
         }
     };
+    // Hand the client back ITS token; ours is an internal correlator.
+    let mut note = note.clone();
+    if let Some(params) = note.get_mut("params").and_then(Value::as_object_mut) {
+        params.insert("progressToken".to_string(), client_token);
+    }
+    let note = &note;
     if session == RESOURCE_SUB_STDIO {
         let mut out = stdout
             .lock()
@@ -13159,18 +13217,6 @@ mod tests {
         assert!(chunk2.is_none(), "unsubscribed session must not receive update");
     }
 
-    /// Set the active MCP session for the duration of `f`, restoring it after, so
-    /// one test cannot leak a session id into the next.
-    fn with_active_session<T>(sid: &str, f: impl FnOnce() -> T) -> T {
-        ACTIVE_MCP_SESSION.with(|cell| {
-            let previous = cell.borrow().clone();
-            *cell.borrow_mut() = Some(sid.to_string());
-            let out = f();
-            *cell.borrow_mut() = previous;
-            out
-        })
-    }
-
     fn progress_note(token: &str) -> Value {
         json!({
             "jsonrpc": "2.0",
@@ -13341,25 +13387,70 @@ mod tests {
         let s2 = mint_mcp_session(&state, None).ok().expect("mint s2");
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
 
-        let registration = with_active_session(&s1, || {
+        let (_registration, wire_token) =
             register_progress(&routes, Some(&json!({ "progressToken": "tok-1" })), "alpha", &s1)
-        });
-        assert!(registration.is_some(), "a token should register a route");
+                .expect("a token should register a route");
+        assert_ne!(
+            wire_token, "tok-1",
+            "the downstream token must be Toolport's, not the client's"
+        );
 
         deliver_progress(
             &state.stdout,
             &state.mcp_sessions,
             &routes,
             "alpha",
-            &progress_note("tok-1"),
+            &progress_note(&wire_token),
         );
 
         let got = drain_session(&state, &s1);
         assert_eq!(got.len(), 1, "the minting client gets the progress");
-        assert!(got[0].contains("tok-1"));
+        // The client is handed back ITS token; ours is an internal correlator.
+        assert!(got[0].contains("tok-1"), "got {}", got[0]);
+        assert!(
+            !got[0].contains(&wire_token),
+            "the gateway's internal token must not leak to the client, got {}",
+            got[0]
+        );
         assert!(
             drain_session(&state, &s2).is_empty(),
             "another client must never see it"
+        );
+    }
+
+    #[test]
+    fn identical_client_tokens_from_two_clients_do_not_collide() {
+        // `progressToken` is client-chosen and small integers are common, so two
+        // clients picking the same value is likely. Keying the route table on it
+        // directly meant the second registration clobbered the first, and against
+        // the same server that delivered one client's progress to the other.
+        // Toolport mints its own token per call, so the two stay separate.
+        let state = http_state(false);
+        let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
+        let s2 = mint_mcp_session(&state, None).ok().expect("mint s2");
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+
+        // Same client token, same downstream server, two different clients.
+        let (_r1, wire1) =
+            register_progress(&routes, Some(&json!({ "progressToken": 1 })), "alpha", &s1).unwrap();
+        let (_r2, wire2) =
+            register_progress(&routes, Some(&json!({ "progressToken": 1 })), "alpha", &s2).unwrap();
+        assert_ne!(wire1, wire2, "each call gets its own downstream token");
+        assert_eq!(
+            routes.lock().unwrap().active.len(),
+            2,
+            "the second registration must not clobber the first"
+        );
+
+        let note = progress_note(&wire1);
+        deliver_progress(&state.stdout, &state.mcp_sessions, &routes, "alpha", &note);
+
+        let first = drain_session(&state, &s1);
+        assert_eq!(first.len(), 1, "progress goes to the client that asked");
+        assert!(first[0].contains("\"progressToken\":1"), "got {}", first[0]);
+        assert!(
+            drain_session(&state, &s2).is_empty(),
+            "the other client shares a token value but must see nothing"
         );
     }
 
@@ -13372,9 +13463,9 @@ mod tests {
         let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
 
-        let registration = with_active_session(&s1, || {
+        let (registration, wire_token) =
             register_progress(&routes, Some(&json!({ "progressToken": "tok-1" })), "alpha", &s1)
-        });
+                .expect("registers");
 
         // beta was never given this token.
         deliver_progress(
@@ -13382,7 +13473,7 @@ mod tests {
             &state.mcp_sessions,
             &routes,
             "beta",
-            &progress_note("tok-1"),
+            &progress_note(&wire_token),
         );
         assert!(
             drain_session(&state, &s1).is_empty(),
@@ -13405,7 +13496,7 @@ mod tests {
             &state.mcp_sessions,
             &routes,
             "alpha",
-            &progress_note("tok-1"),
+            &progress_note(&wire_token),
         );
         assert_eq!(drain_session(&state, &s1).len(), 1);
 
@@ -13421,7 +13512,7 @@ mod tests {
             &state.mcp_sessions,
             &routes,
             "alpha",
-            &progress_note("tok-1"),
+            &progress_note(&wire_token),
         );
         assert!(
             drain_session(&state, &s1).is_empty(),
