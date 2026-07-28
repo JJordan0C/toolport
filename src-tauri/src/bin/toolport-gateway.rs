@@ -553,6 +553,52 @@ static PROGRESS_DISPATCH: std::sync::OnceLock<ProgressDispatch> = std::sync::Onc
 static PROGRESS_ROUTES: std::sync::OnceLock<Arc<Mutex<ProgressRoutes>>> =
     std::sync::OnceLock::new();
 
+/// Whether this process serves a stdio MCP client, i.e. whether writing a
+/// server-to-client message to stdout reaches anybody.
+///
+/// False in HTTP bridge mode. Defaults to true when unset so direct unit-test
+/// callers keep the stdio behaviour they were written against.
+static HAS_STDIO_CLIENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Where progress for the request being served should be delivered, or `None`
+/// when there is no channel to deliver it on.
+///
+/// A legacy HTTP client has a session with an outbound queue. The stdio client
+/// is reached on stdout. A *modern* HTTP client has neither: 2026-07-28 removed
+/// protocol-level sessions, and its replacement channel (`subscriptions/listen`,
+/// SOU-448) does not exist yet. Falling back to stdout there would emit protocol
+/// traffic nobody is reading, so it returns `None` and the caller declines to ask
+/// the server for progress at all (SOU-447).
+fn progress_target() -> Option<String> {
+    progress_target_for(
+        ACTIVE_MCP_SESSION.with(|cell| cell.borrow().clone()),
+        HAS_STDIO_CLIENT.get().copied().unwrap_or(true),
+    )
+}
+
+/// The decision behind [`progress_target`], separated from the globals it reads
+/// so every combination is directly testable.
+fn progress_target_for(session: Option<String>, has_stdio_client: bool) -> Option<String> {
+    match session {
+        // A legacy HTTP session: deliver on its outbound queue.
+        Some(session) => Some(session),
+        // No session. In stdio mode that is the single stdio client; in HTTP mode
+        // it is a modern client, which has no server-to-client channel yet.
+        None => has_stdio_client.then(|| RESOURCE_SUB_STDIO.to_string()),
+    }
+}
+
+/// A copy of `meta` without `progressToken`, for when there is nowhere to deliver
+/// progress. Same principle as `WITHHELD_META_KEYS`: never ask a server for
+/// traffic that would land in a black hole.
+fn without_progress_token(meta: &Value) -> Value {
+    let mut out = meta.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.remove("progressToken");
+    }
+    out
+}
+
 /// The live token table, created on first use so tests can exercise routing
 /// without standing up a full gateway.
 fn progress_routes() -> &'static Arc<Mutex<ProgressRoutes>> {
@@ -3437,7 +3483,19 @@ fn execute_call(
     // against the raw server id, matching what the per-server sink binds, so the
     // spoof check compares like with like. Held in a named binding so the RAII
     // guard lives across the call rather than dropping immediately.
-    let _progress_route = register_progress(progress_routes(), client_meta, server_id);
+    let progress_to = progress_target();
+    let _progress_route = progress_to
+        .as_deref()
+        .and_then(|session| register_progress(progress_routes(), client_meta, server_id, session));
+    // With nowhere to deliver progress, do not ask the server to produce it
+    // (SOU-447). Only allocates when the client actually requested progress.
+    let relay_owned = match (progress_to.is_none(), client_meta) {
+        (true, Some(meta)) if meta.get("progressToken").is_some() => {
+            Some(without_progress_token(meta))
+        }
+        _ => None,
+    };
+    let client_meta = relay_owned.as_ref().or(client_meta);
 
     let started = Instant::now();
     match exec_router.route_call_with_cancel(name, arguments, cancel.clone(), client_meta) {
@@ -4545,9 +4603,12 @@ fn handle_request_with_cancel(
                 }
             }
             let client_meta = req.get("params").and_then(|p| p.get("_meta")).cloned();
-            let _progress_route = router.resource_server(uri).and_then(|owner| {
-                register_progress(progress_routes(), client_meta.as_ref(), owner)
-            });
+            let progress_to = progress_target();
+            let _progress_route = progress_to.as_deref().zip(router.resource_server(uri)).and_then(
+                |(session, owner)| {
+                    register_progress(progress_routes(), client_meta.as_ref(), owner, session)
+                },
+            );
             match router.read_resource_with_cancel(uri, cancel.clone(), client_meta.as_ref()) {
                 Ok(mut result) => {
                     // Content defense: a resource is as attacker-controllable as a tool
@@ -4613,9 +4674,13 @@ fn handle_request_with_cancel(
                 }
             }
             let client_meta = params.and_then(|p| p.get("_meta")).cloned();
-            let _progress_route = router.prompt_server(name).and_then(|owner| {
-                register_progress(progress_routes(), client_meta.as_ref(), owner)
-            });
+            let progress_to = progress_target();
+            let _progress_route = progress_to
+                .as_deref()
+                .zip(router.prompt_server(name))
+                .and_then(|(session, owner)| {
+                    register_progress(progress_routes(), client_meta.as_ref(), owner, session)
+                });
             match router.get_prompt_with_cancel(name, arguments, cancel.clone(), client_meta.as_ref())
             {
                 Ok(mut result) => {
@@ -5154,14 +5219,11 @@ fn register_progress(
     table: &Arc<Mutex<ProgressRoutes>>,
     client_meta: Option<&Value>,
     producer: &str,
+    session: &str,
 ) -> Option<ProgressRegistration> {
     let token = client_meta?.get("progressToken")?;
     let key = rpc_id_key(token)?;
-    let session = ACTIVE_MCP_SESSION.with(|cell| {
-        cell.borrow()
-            .clone()
-            .unwrap_or_else(|| RESOURCE_SUB_STDIO.to_string())
-    });
+    let session = session.to_string();
     table
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -7760,13 +7822,24 @@ fn mcp_sse_body(json: &str) -> String {
     format!("event: message\ndata: {json}\n\n")
 }
 
-fn mcp_rpc_response(status: u16, json_body: String, session_id: &str, prefer_sse: bool) -> HttpOut {
-    if prefer_sse {
+/// `session_id` is `None` for a modern (2026-07-28) client: the response must
+/// then carry no `Mcp-Session-Id`, since the header no longer exists and echoing
+/// one would invite the client to start replaying it (SOU-447).
+fn mcp_rpc_response(
+    status: u16,
+    json_body: String,
+    session_id: Option<&str>,
+    prefer_sse: bool,
+) -> HttpOut {
+    let out = if prefer_sse {
         HttpOut::new(status, "text/event-stream", mcp_sse_body(&json_body))
-            .with_header("Mcp-Session-Id", session_id)
             .with_header("Cache-Control", "no-cache")
     } else {
-        HttpOut::new(status, "application/json", json_body).with_header("Mcp-Session-Id", session_id)
+        HttpOut::new(status, "application/json", json_body)
+    };
+    match session_id {
+        Some(sid) => out.with_header("Mcp-Session-Id", sid),
+        None => out,
     }
 }
 
@@ -7786,6 +7859,13 @@ fn handle_mcp_http(
 ) -> HttpOut {
     let prefer_sse = mcp_prefers_sse(accept);
     match method {
+        // GET (listen stream) and DELETE (session teardown) are legacy-only: both
+        // were removed in 2026-07-28. A modern-ONLY server answers 405, but
+        // Toolport is dual-era, and neither verb carries a body, so there is no
+        // `_meta` to tell the eras apart. They stay available and keep requiring a
+        // live session, which is exactly the gate that turns a modern client's
+        // request away. They become 405 when legacy support is eventually dropped
+        // (SOU-447).
         "GET" => {
             if !mcp_prefers_sse(accept) {
                 return HttpOut::json_err(406, "Accept must include text/event-stream");
@@ -7839,65 +7919,96 @@ fn handle_mcp_http(
                 .unwrap_or("");
             let has_id = req_obj.contains_key("id");
             let is_initialize = method_name == "initialize";
+            // 2026-07-28 removed protocol-level sessions (SOU-447). A modern
+            // request declares its own version, so it is served statelessly.
+            let is_modern = upstream_declared_version(&req).is_some();
 
-            // Session rules: initialize may omit (and gets a new id); everything
-            // else that carries a method must present a live session id.
-            let session_id = if is_initialize {
+            // Session rules. Modern requests have none; legacy `initialize` may
+            // omit a session id (and gets a new one), and every other legacy
+            // request must present a live one.
+            //
+            // Removing the session for modern clients does NOT weaken the
+            // authorization boundary. `resolve_http_caller` already resolves the
+            // bearer token to an identity and an effective server scope on EVERY
+            // request, and that is what `allowed` / `client` are built from here.
+            // The session only ever *bound* a minted id to that same identity so a
+            // stolen id could not be replayed by another caller. With no id to
+            // steal, there is nothing to bind, and re-resolving scope per request
+            // is strictly tighter than a session that caches it (a live re-scope
+            // takes effect immediately instead of on session expiry).
+            let session_id: Option<String> = if is_modern {
+                // Per spec, an inbound Mcp-Session-Id on a modern request is
+                // ignored rather than honoured or echoed.
+                None
+            } else if is_initialize {
                 if let Some(existing) = session_hdr.map(str::trim).filter(|s| !s.is_empty()) {
                     // Client re-sent a session on initialize: accept if still live,
                     // otherwise mint a fresh one (spec: start over without the old id).
                     match mcp_require_session(state, Some(existing), session_owner) {
-                        Ok((sid, _)) => sid,
+                        Ok((sid, _)) => Some(sid),
                         Err(_) => match mint_mcp_session(state, session_owner) {
-                            Ok(sid) => sid,
+                            Ok(sid) => Some(sid),
                             Err(e) => return e,
                         },
                     }
                 } else {
                     match mint_mcp_session(state, session_owner) {
-                        Ok(sid) => sid,
+                        Ok(sid) => Some(sid),
                         Err(e) => return e,
                     }
                 }
             } else {
                 match mcp_require_session(state, session_hdr, session_owner) {
-                    Ok((sid, _)) => sid,
+                    Ok((sid, _)) => Some(sid),
                     Err(e) => return e,
                 }
             };
 
-            if is_initialize {
-                if let Ok(sessions) = state.mcp_sessions.lock() {
-                    if let Some(sess) = sessions.get(&session_id) {
-                        if let Ok(mut caps) = sess.client_upstream.lock() {
-                            capture_client_upstream_from_init(&mut caps, req.get("params"));
+            if let Some(session_id) = session_id.as_deref() {
+                if is_initialize {
+                    if let Ok(sessions) = state.mcp_sessions.lock() {
+                        if let Some(sess) = sessions.get(session_id) {
+                            if let Ok(mut caps) = sess.client_upstream.lock() {
+                                capture_client_upstream_from_init(&mut caps, req.get("params"));
+                            }
                         }
                     }
                 }
-            }
 
-            if is_jsonrpc_response(&req) {
-                if let Ok(sessions) = state.mcp_sessions.lock() {
-                    if let Some(sess) = sessions.get(&session_id) {
-                        if sess.try_deliver_upstream(&req) {
-                            return HttpOut::new(202, "text/plain", String::new())
-                                .with_header("Mcp-Session-Id", &session_id);
+                if is_jsonrpc_response(&req) {
+                    if let Ok(sessions) = state.mcp_sessions.lock() {
+                        if let Some(sess) = sessions.get(session_id) {
+                            if sess.try_deliver_upstream(&req) {
+                                return HttpOut::new(202, "text/plain", String::new())
+                                    .with_header("Mcp-Session-Id", session_id);
+                            }
                         }
                     }
                 }
+            } else if is_jsonrpc_response(&req) {
+                // Modern clients never answer server-initiated requests: MRTR
+                // replaced them, and the transport forbids a client sending a
+                // JSON-RPC response at all.
+                return HttpOut::json_err(
+                    400,
+                    "JSON-RPC responses are not accepted from a 2026-07-28 client",
+                );
             }
 
             // Notifications / JSON-RPC responses: 202 with empty body.
             if !has_id {
-                ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = Some(session_id.clone()));
+                ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = session_id.clone());
                 let _ = process_request(state, &req, guard, confirm, allowed, None, client);
                 ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = None);
-                return HttpOut::new(202, "text/plain", String::new())
-                    .with_header("Mcp-Session-Id", &session_id);
+                let out = HttpOut::new(202, "text/plain", String::new());
+                return match session_id.as_deref() {
+                    Some(sid) => out.with_header("Mcp-Session-Id", sid),
+                    None => out,
+                };
             }
 
             let resp = ACTIVE_MCP_SESSION.with(|cell| {
-                *cell.borrow_mut() = Some(session_id.clone());
+                *cell.borrow_mut() = session_id.clone();
                 let out = process_request(state, &req, guard, confirm, allowed, None, client);
                 *cell.borrow_mut() = None;
                 out
@@ -7912,7 +8023,7 @@ fn handle_mcp_http(
                         })
                         .to_string()
                     });
-                    mcp_rpc_response(200, body, &session_id, prefer_sse)
+                    mcp_rpc_response(200, body, session_id.as_deref(), prefer_sse)
                 }
                 None => {
                     let body = json!({
@@ -7921,7 +8032,7 @@ fn handle_mcp_http(
                         "error": { "code": -32603, "message": "no response" }
                     })
                     .to_string();
-                    mcp_rpc_response(500, body, &session_id, prefer_sse)
+                    mcp_rpc_response(500, body, session_id.as_deref(), prefer_sse)
                 }
             }
         }
@@ -9250,6 +9361,9 @@ fn main() {
         Arc::clone(&mcp_sessions),
         Arc::clone(progress_routes()),
     ));
+    // In HTTP bridge mode nothing reads this process's stdout, so it is not a
+    // delivery channel for server-to-client messages (SOU-447).
+    let _ = HAS_STDIO_CLIENT.set(!http_mode);
     // Single-flight for every router build/swap (startup, watcher self-heal, and
     // ${ROOT} rebuilds). Created up front so the startup build can share it.
     let rebuild_lock = Arc::new(Mutex::new(()));
@@ -11983,18 +12097,227 @@ mod tests {
         assert_eq!(after.status, 404);
     }
 
+    /// A modern (2026-07-28) JSON-RPC body: version in `_meta`, no handshake.
+    fn modern_http_body(id: i64, method: &str, params: Value) -> String {
+        let mut p = json!({
+            "_meta": { "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION }
+        });
+        if let (Some(dst), Some(src)) = (p.as_object_mut(), params.as_object()) {
+            for (k, v) in src {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": p }).to_string()
+    }
+
+    fn test_caller(identity: &str, scope: Option<&[&str]>) -> HttpCaller {
+        HttpCaller {
+            audit_label: Some(identity.to_string()),
+            session_owner: McpSessionOwner {
+                identity: identity.to_string(),
+                scope: scope.map(|s| s.iter().map(|v| v.to_string()).collect()),
+            },
+        }
+    }
+
+    #[test]
+    fn modern_http_client_needs_no_session() {
+        // The stateless revision's whole point over HTTP: no initialize, no
+        // Mcp-Session-Id, just an authenticated request (SOU-447).
+        let state = http_state(true);
+        let caller = test_caller("client:cursor", None);
+        let out = handle_http(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &modern_http_body(1, "tools/list", json!({})),
+            None,
+            None,
+            None,
+            Some(&caller),
+        );
+        assert_eq!(out.status, 200, "body={}", out.body);
+
+        // No session was minted, and none is echoed: the header does not exist in
+        // 2026-07-28, and echoing one would invite the client to replay it.
+        assert!(
+            !out.extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("Mcp-Session-Id")),
+            "modern response must carry no Mcp-Session-Id, got {:?}",
+            out.extra
+        );
+        assert!(
+            state.mcp_sessions.lock().unwrap().is_empty(),
+            "no session should have been created"
+        );
+
+        let body: Value = serde_json::from_str(&out.body).unwrap();
+        assert_eq!(body["result"]["resultType"], "complete");
+    }
+
+    #[test]
+    fn modern_http_request_still_enforces_client_scope() {
+        // THE security test for SOU-447. Sessions used to bind a minted id to an
+        // identity; removing them must not weaken what a scoped client can reach.
+        // Scope comes from resolve_http_caller on every request, so it still
+        // applies with no session in play.
+        let state = http_state(false);
+        // A real route, so the test discriminates: an in-scope call must SUCCEED
+        // while an out-of-scope one is refused. Without the positive case, a
+        // gateway that refused everything would also pass.
+        *state.router.lock().unwrap() = Arc::new(routed_router("github", "list_repos"));
+        let caller = test_caller("client:scoped", Some(&["github"]));
+        let allowed: std::collections::HashSet<String> =
+            ["github".to_string()].into_iter().collect();
+
+        let call = |name: &str| {
+            handle_http(
+                &state,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                "POST",
+                "/mcp",
+                &modern_http_body(1, "tools/call", json!({ "name": name, "arguments": {} })),
+                None,
+                None,
+                Some(&allowed),
+                Some(&caller),
+            )
+        };
+
+        // In scope: the call gets PAST the scope guard and is routed downstream.
+        // The mock route does not implement tools/call, so what comes back is its
+        // own error rather than a refusal. The distinguishing property is which
+        // error it is, not whether one occurred.
+        let in_scope = call("github__list_repos");
+        assert_eq!(in_scope.status, 200, "body={}", in_scope.body);
+        let body: Value = serde_json::from_str(&in_scope.body).unwrap();
+        let text = body["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            !text.contains("not available to this client"),
+            "an in-scope call must not be refused by the scope guard, got {body}"
+        );
+        assert!(
+            text.contains("unexpected tools/call"),
+            "expected the call to reach the downstream route, got {body}"
+        );
+
+        let out_of_scope = call("stripe__refund");
+        assert_eq!(out_of_scope.status, 200, "body={}", out_of_scope.body);
+        let body: Value = serde_json::from_str(&out_of_scope.body).unwrap();
+        assert!(
+            body["result"]["isError"].as_bool().unwrap_or(false),
+            "an out-of-scope server must be refused, got {body}"
+        );
+        assert!(
+            body["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not available to this client"),
+            "expected the scope guard to be what refused it, got {body}"
+        );
+    }
+
+    #[test]
+    fn modern_http_request_ignores_an_inbound_session_id() {
+        // Spec: a modern request's Mcp-Session-Id is ignored, not honoured and not
+        // echoed. Honouring it would let a stale legacy id influence a stateless
+        // request; echoing it would resurrect the header.
+        let state = http_state(true);
+        let caller = test_caller("client:cursor", None);
+        let out = handle_http(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &modern_http_body(1, "tools/list", json!({})),
+            // A session id that was never minted: a legacy request would 404 here.
+            Some("00000000000000000000000000000000"),
+            None,
+            None,
+            Some(&caller),
+        );
+        assert_eq!(out.status, 200, "an unknown session id must be ignored, body={}", out.body);
+        assert!(!out.extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("Mcp-Session-Id")));
+    }
+
+    #[test]
+    fn legacy_http_client_still_requires_a_session() {
+        // The other half of dual-era: nothing about the legacy path changed.
+        let state = http_state(true);
+        let caller = test_caller("client:cursor", None);
+        let no_session = handle_http(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }).to_string(),
+            None,
+            None,
+            None,
+            Some(&caller),
+        );
+        assert_eq!(
+            no_session.status, 400,
+            "a legacy request without a session is still rejected, body={}",
+            no_session.body
+        );
+
+        // ...and initialize still mints one.
+        let init = handle_http(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": "2025-06-18", "capabilities": {} }
+            })
+            .to_string(),
+            None,
+            None,
+            None,
+            Some(&caller),
+        );
+        assert_eq!(init.status, 200);
+        assert!(!mcp_session_of(&init).is_empty(), "legacy initialize still mints a session");
+    }
+
+    #[test]
+    fn modern_http_client_may_not_send_a_jsonrpc_response() {
+        // MRTR replaced server-initiated requests, and the transport forbids a
+        // client sending a JSON-RPC response at all.
+        let state = http_state(true);
+        let caller = test_caller("client:cursor", None);
+        let out = handle_http(
+            &state,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            "POST",
+            "/mcp",
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "result": {},
+                "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION } }
+            })
+            .to_string(),
+            None,
+            None,
+            None,
+            Some(&caller),
+        );
+        assert_eq!(out.status, 400, "body={}", out.body);
+    }
+
     #[test]
     fn mcp_http_session_is_bound_to_client_identity_and_scope() {
         let state = http_state(true);
         let search = SearchGuard::default();
         let confirm = ConfirmGuard::new();
-        let caller = |identity: &str, scope: &[&str]| HttpCaller {
-            audit_label: Some(identity.to_string()),
-            session_owner: McpSessionOwner {
-                identity: identity.to_string(),
-                scope: Some(scope.iter().map(|value| value.to_string()).collect()),
-            },
-        };
+        let caller = |identity: &str, scope: &[&str]| test_caller(identity, Some(scope));
         let owner = caller("client:cursor", &["github"]);
         let intruder = caller("client:webui", &["github"]);
         let rescoped_owner = caller("client:cursor", &["github", "stripe"]);
@@ -13019,7 +13342,7 @@ mod tests {
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
 
         let registration = with_active_session(&s1, || {
-            register_progress(&routes, Some(&json!({ "progressToken": "tok-1" })), "alpha")
+            register_progress(&routes, Some(&json!({ "progressToken": "tok-1" })), "alpha", &s1)
         });
         assert!(registration.is_some(), "a token should register a route");
 
@@ -13050,7 +13373,7 @@ mod tests {
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
 
         let registration = with_active_session(&s1, || {
-            register_progress(&routes, Some(&json!({ "progressToken": "tok-1" })), "alpha")
+            register_progress(&routes, Some(&json!({ "progressToken": "tok-1" })), "alpha", &s1)
         });
 
         // beta was never given this token.
@@ -13107,12 +13430,55 @@ mod tests {
     }
 
     #[test]
+    fn progress_has_no_target_for_a_modern_http_client() {
+        // A legacy HTTP session delivers on its outbound queue; stdio delivers on
+        // stdout. A modern HTTP client has neither until subscriptions/listen
+        // lands (SOU-448), so progress must resolve to no target rather than
+        // falling back to a stdout nobody in HTTP mode is reading.
+        assert_eq!(
+            progress_target_for(Some("sess-1".to_string()), false),
+            Some("sess-1".to_string()),
+            "legacy HTTP session"
+        );
+        assert_eq!(
+            progress_target_for(Some("sess-1".to_string()), true),
+            Some("sess-1".to_string()),
+            "session wins even in stdio mode"
+        );
+        assert_eq!(
+            progress_target_for(None, true),
+            Some(RESOURCE_SUB_STDIO.to_string()),
+            "stdio client"
+        );
+        assert_eq!(
+            progress_target_for(None, false),
+            None,
+            "modern HTTP client has no channel, so progress must not be requested"
+        );
+    }
+
+    #[test]
+    fn without_progress_token_keeps_everything_else() {
+        // Used when there is nowhere to deliver progress: drop only the token, so
+        // trace context and extension namespaces still reach the server.
+        let meta = json!({
+            "progressToken": "p-1",
+            "traceparent": "00-abc-def-01",
+            "com.example/keep": { "a": 1 }
+        });
+        let stripped = without_progress_token(&meta);
+        assert!(stripped.get("progressToken").is_none());
+        assert_eq!(stripped["traceparent"], "00-abc-def-01");
+        assert_eq!(stripped["com.example/keep"]["a"], 1);
+    }
+
+    #[test]
     fn no_progress_token_registers_no_route() {
         // The common case: clients that never ask for progress cost nothing and
         // leave no state behind.
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
-        assert!(register_progress(&routes, None, "alpha").is_none());
-        assert!(register_progress(&routes, Some(&json!({ "traceparent": "x" })), "alpha").is_none());
+        assert!(register_progress(&routes, None, "alpha", "stdio").is_none());
+        assert!(register_progress(&routes, Some(&json!({ "traceparent": "x" })), "alpha", "stdio").is_none());
         assert!(routes.lock().unwrap().active.is_empty());
     }
 
