@@ -33,7 +33,7 @@ use conduit_lib::clients;
 use conduit_lib::codemode;
 use conduit_lib::downstream::{
     self, DownstreamServer, ResourceUpdatedSink, ServerRequestHandler, StdioTransport, Transport,
-    PROTOCOL_VERSION,
+    MODERN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use conduit_lib::inspect;
 use conduit_lib::integrity;
@@ -47,12 +47,115 @@ use conduit_lib::secrets;
 use conduit_lib::semantic;
 use conduit_lib::shaping;
 
+thread_local! {
+    /// Protocol version of the request currently being served, when the client is
+    /// modern (2026-07-28+). `None` means a legacy client.
+    ///
+    /// Request-scoped rather than connection-scoped on purpose: a modern client
+    /// declares its version on every request, so there is no connection-level
+    /// negotiation to cache. Mirrors `ACTIVE_MCP_SESSION` so [`success`] can
+    /// decorate every result without threading the era through each of the two
+    /// dozen dispatch arms - including the ones that return early (SOU-446).
+    static ACTIVE_UPSTREAM_VERSION: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Sets the serving era for one request and restores the previous value on drop,
+/// so a nested dispatch (code mode re-entering `execute_call`) cannot leak it.
+struct UpstreamEraGuard(Option<String>);
+
+impl UpstreamEraGuard {
+    fn enter(version: Option<String>) -> Self {
+        UpstreamEraGuard(ACTIVE_UPSTREAM_VERSION.with(|cell| cell.replace(version)))
+    }
+}
+
+impl Drop for UpstreamEraGuard {
+    fn drop(&mut self) {
+        ACTIVE_UPSTREAM_VERSION.with(|cell| *cell.borrow_mut() = self.0.take());
+    }
+}
+
+/// True when the request being served came from a modern client.
+fn serving_modern_client() -> bool {
+    ACTIVE_UPSTREAM_VERSION.with(|cell| cell.borrow().is_some())
+}
+
+/// Add the fields a modern client requires to a result.
+///
+/// No-op for legacy clients, so their responses stay byte-identical to what
+/// Toolport sent before 2026-07-28 support existed (SOU-446).
+fn decorate_for_upstream(mut result: Value) -> Value {
+    if !serving_modern_client() {
+        return result;
+    }
+    let Some(obj) = result.as_object_mut() else {
+        return result;
+    };
+    // Every result carries `resultType`. Ordinary results are "complete";
+    // MRTR sets "input_required" on its own path (SOU-449), so an existing value
+    // is never overwritten.
+    obj.entry("resultType").or_insert_with(|| json!("complete"));
+    let meta = obj.entry("_meta").or_insert_with(|| json!({}));
+    if let Some(meta) = meta.as_object_mut() {
+        // Toolport IS the server on this hop, so it identifies itself here,
+        // overwriting any downstream server's value. Symmetric with
+        // PER_HOP_META_KEYS on the request side: per-hop keys belong to the hop.
+        meta.insert(
+            "io.modelcontextprotocol/serverInfo".to_string(),
+            json!({ "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") }),
+        );
+    }
+    result
+}
+
 fn success(id: Value, result: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+    json!({ "jsonrpc": "2.0", "id": id, "result": decorate_for_upstream(result) })
 }
 
 fn error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+/// Protocol versions Toolport serves to upstream clients, newest first.
+const SUPPORTED_UPSTREAM_VERSIONS: [&str; 2] = [MODERN_PROTOCOL_VERSION, PROTOCOL_VERSION];
+
+/// The protocol version a modern client declared on this request.
+///
+/// Presence of this key is what distinguishes a modern request from a legacy
+/// one: legacy clients negotiate once via `initialize` and never repeat it.
+fn upstream_declared_version(req: &Value) -> Option<&str> {
+    req.get("params")?
+        .get("_meta")?
+        .get("io.modelcontextprotocol/protocolVersion")?
+        .as_str()
+}
+
+/// `UnsupportedProtocolVersionError`, listing what Toolport does serve so the
+/// client can retry with a mutually supported version.
+fn unsupported_version_error(id: Value, requested: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": downstream::UNSUPPORTED_PROTOCOL_VERSION,
+            "message": "Unsupported protocol version",
+            "data": { "supported": SUPPORTED_UPSTREAM_VERSIONS, "requested": requested }
+        }
+    })
+}
+
+/// What Toolport advertises to upstream clients, shared by `initialize` (legacy)
+/// and `server/discover` (modern) so the two can never drift.
+fn gateway_capabilities() -> Value {
+    json!({
+        "tools": { "listChanged": true },
+        // Always-on proxy for resource subscriptions (SOU-394): advertise
+        // subscribe, fail closed when no owner can.
+        "resources": { "listChanged": true, "subscribe": true },
+        "prompts": { "listChanged": true },
+        "completions": {}
+    })
 }
 
 const MAX_SEARCH_QUERY_CHARS: usize = 512;
@@ -3750,7 +3853,44 @@ fn handle_request_with_cancel(
         _ => return None,
     };
 
+    // Determine the client's era for this request before dispatching (SOU-446).
+    // A modern client declares its version in `_meta` on every request and never
+    // sends `initialize`; a legacy client does the opposite. Toolport serves both
+    // concurrently on the same endpoint.
+    let declared = upstream_declared_version(req).map(str::to_string);
+    if let Some(version) = declared.as_deref() {
+        if !SUPPORTED_UPSTREAM_VERSIONS.contains(&version) {
+            return Some(unsupported_version_error(id, version));
+        }
+    }
+    // Only 2026-07-28+ gets modern result decoration. A client that names an
+    // older version in `_meta` is still served, just in its own era's shape.
+    let _era = UpstreamEraGuard::enter(
+        declared.filter(|v| v.as_str() == MODERN_PROTOCOL_VERSION),
+    );
+
     match method {
+        // Modern clients open here instead of handshaking. Servers MUST implement
+        // it, and it is also the stdio backward-compatibility probe a dual-era
+        // client uses to decide which era Toolport speaks.
+        "server/discover" => Some(success(
+            id,
+            json!({
+                "supportedVersions": SUPPORTED_UPSTREAM_VERSIONS,
+                "capabilities": gateway_capabilities(),
+                "instructions": "Toolport aggregates every configured MCP server behind one \
+                                 endpoint. In lazy discovery mode the catalog is reached through \
+                                 the toolport_search_tools / toolport_call_tool meta-tools rather \
+                                 than a full tools/list.",
+                // server/discover is a cacheable operation. The list results grow
+                // these fields in SOU-454.
+                "ttlMs": 300_000,
+                // Toolport's advertised capabilities depend on the requesting
+                // client's scope and profile, so a shared intermediary must not
+                // reuse one client's answer for another.
+                "cacheScope": "private"
+            }),
+        )),
         "initialize" => {
             let proto = req
                 .get("params")
@@ -3761,14 +3901,7 @@ fn handle_request_with_cancel(
                 id,
                 json!({
                     "protocolVersion": proto,
-                    "capabilities": {
-                        "tools": { "listChanged": true },
-                        // Always-on proxy for resource subscriptions (SOU-394):
-                        // advertise subscribe, fail closed when no owner can.
-                        "resources": { "listChanged": true, "subscribe": true },
-                        "prompts": { "listChanged": true },
-                        "completions": {}
-                    },
+                    "capabilities": gateway_capabilities(),
                     "serverInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") }
                 }),
             ))
@@ -4547,6 +4680,13 @@ fn handle_request_with_cancel(
                 )),
             }
         }
+        // `ping` was removed in 2026-07-28, so a modern client gets method-not-found
+        // rather than a misleading success. Legacy clients keep it (SOU-446).
+        "ping" if serving_modern_client() => Some(error(
+            id,
+            -32601,
+            "ping is not part of 2026-07-28",
+        )),
         "ping" => Some(success(id, json!({}))),
         other => Some(error(id, -32601, &format!("Method not found: {other}"))),
     }
@@ -12721,6 +12861,152 @@ mod tests {
         let sess = sessions.get(sid).unwrap();
         let mut out = sess.outbound.lock().unwrap();
         out.drain(..).map(|m| m.json).collect()
+    }
+
+    /// Dispatch one request with the default test rig.
+    fn dispatch(req: &Value) -> Value {
+        let reg = Registry::default();
+        let router = routed_router("s", "tool");
+        handle_request(
+            req,
+            &reg,
+            &router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .expect("a request with an id gets a response")
+    }
+
+    /// Build a modern (2026-07-28) request: version declared in `_meta`, no
+    /// handshake anywhere.
+    fn modern_req(id: i64, method: &str, extra: Value) -> Value {
+        let mut params = json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientInfo": { "name": "TestClient", "version": "1.0" },
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        });
+        if let (Some(p), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra {
+                p.insert(k.clone(), v.clone());
+            }
+        }
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+    }
+
+    #[test]
+    fn server_discover_answers_modern_clients() {
+        // Servers MUST implement server/discover. It is also the stdio probe a
+        // dual-era client uses to decide which era Toolport speaks (SOU-446).
+        let resp = dispatch(&modern_req(1, "server/discover", json!({})));
+        let result = &resp["result"];
+
+        assert_eq!(result["supportedVersions"][0], MODERN_PROTOCOL_VERSION);
+        assert!(result["capabilities"]["tools"].is_object());
+        assert_eq!(result["capabilities"]["resources"]["subscribe"], true);
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "toolport-gateway"
+        );
+        // Scope- and profile-dependent, so a shared intermediary must not reuse
+        // one client's answer for another.
+        assert_eq!(result["cacheScope"], "private");
+    }
+
+    #[test]
+    fn modern_client_is_served_without_any_handshake() {
+        // The whole point of the stateless revision: no initialize, no session,
+        // just a request that declares its own version.
+        let resp = dispatch(&modern_req(2, "tools/list", json!({})));
+        assert!(resp["result"]["tools"].is_array());
+        assert_eq!(resp["result"]["resultType"], "complete");
+        assert_eq!(
+            resp["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "toolport-gateway"
+        );
+    }
+
+    #[test]
+    fn legacy_clients_see_no_modern_fields() {
+        // The no-regression guarantee for every client in the wild today: a
+        // request without `_meta` gets a byte-identical response to before.
+        let req = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {} });
+        let resp = dispatch(&req);
+        assert!(resp["result"]["tools"].is_array());
+        assert!(
+            resp["result"].get("resultType").is_none(),
+            "legacy results carry no resultType, got {}",
+            resp["result"]
+        );
+        assert!(
+            resp["result"].get("_meta").is_none(),
+            "legacy results carry no _meta, got {}",
+            resp["result"]
+        );
+
+        // ...and initialize still works, unchanged.
+        let init = dispatch(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "initialize",
+            "params": { "protocolVersion": PROTOCOL_VERSION, "capabilities": {} }
+        }));
+        assert_eq!(init["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(init["result"]["serverInfo"]["name"], "toolport-gateway");
+        assert!(init["result"].get("resultType").is_none());
+    }
+
+    #[test]
+    fn unknown_protocol_version_is_rejected_with_what_we_support() {
+        // The client needs the `supported` list to pick a mutually supported
+        // version and retry, so an opaque failure would be a dead end.
+        let req = json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/list",
+            "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": "1900-01-01" } }
+        });
+        let resp = dispatch(&req);
+        assert_eq!(resp["error"]["code"], downstream::UNSUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(resp["error"]["data"]["requested"], "1900-01-01");
+        assert_eq!(
+            resp["error"]["data"]["supported"][0],
+            MODERN_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn ping_is_legacy_only() {
+        // Removed in 2026-07-28. A modern client gets method-not-found rather
+        // than a misleading success; a legacy client is unaffected.
+        let modern = dispatch(&modern_req(8, "ping", json!({})));
+        assert_eq!(modern["error"]["code"], -32601);
+
+        let legacy = dispatch(&json!({
+            "jsonrpc": "2.0", "id": 9, "method": "ping", "params": {}
+        }));
+        assert!(legacy["result"].is_object(), "legacy ping still succeeds");
+        assert!(legacy.get("error").is_none());
+    }
+
+    #[test]
+    fn upstream_era_does_not_leak_between_requests() {
+        // The era rides a thread-local, so a modern request must not leave the
+        // next (legacy) request decorated. Code mode re-enters dispatch, which is
+        // exactly where a leak would show up.
+        let modern = dispatch(&modern_req(6, "tools/list", json!({})));
+        assert_eq!(modern["result"]["resultType"], "complete");
+
+        let legacy = dispatch(&json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}
+        }));
+        assert!(
+            legacy["result"].get("resultType").is_none(),
+            "era leaked into the following legacy request"
+        );
     }
 
     #[test]
