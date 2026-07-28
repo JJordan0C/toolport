@@ -20,6 +20,12 @@ use std::time::{Duration, Instant};
 /// subscribed upstream clients only.
 pub type ResourceUpdatedSink = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Called from a downstream drain when a server emits `notifications/progress`
+/// (SOU-444 part 2). Carries the whole notification, because routing it is the
+/// gateway's job: only the gateway knows which upstream client minted the
+/// `progressToken` it relayed on this server's behalf.
+pub type ProgressSink = Arc<dyn Fn(Value) + Send + Sync>;
+
 use serde_json::{json, Value};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -40,14 +46,14 @@ pub const PER_HOP_META_KEYS: [&str; 3] = [
     "io.modelcontextprotocol/clientCapabilities",
 ];
 
-/// `progressToken` is deliberately withheld for now. The stdio read loop drops
-/// every notification it does not recognise, so `notifications/progress` from a
-/// downstream server currently goes nowhere. Relaying the token would invite
-/// that traffic into a black hole and could push a server into a streaming mode
-/// for a client that will never see the updates. Released in the second half of
-/// SOU-444, once progress notifications can be routed back to the originating
-/// request.
-const WITHHELD_META_KEYS: [&str; 1] = ["progressToken"];
+/// Keys relayed only once Toolport can honour what they ask for.
+///
+/// `progressToken` lived here until the gateway learned to route
+/// `notifications/progress` back to the client that minted it (SOU-444 part 2);
+/// relaying a token whose notifications we then dropped would have invited that
+/// traffic into a black hole. Empty today, kept because the next revision brings
+/// more keys with the same "relay only when we can service it" shape.
+const WITHHELD_META_KEYS: [&str; 0] = [];
 
 /// The part of an upstream client's `_meta` that may travel downstream.
 ///
@@ -756,17 +762,38 @@ fn resource_updated_uri(line: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Parse a `notifications/progress` line, or `None` if it is anything else.
+///
+/// Progress relates to one in-flight request and is correlated by the
+/// `progressToken` the client minted, so the whole notification is handed to the
+/// gateway rather than a single extracted field.
+fn progress_notification(line: &str) -> Option<Value> {
+    // Cheap gate: skip the JSON parse for ordinary request/response lines.
+    if !line.contains("notifications/progress") {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("method").and_then(|m| m.as_str()) != Some("notifications/progress") {
+        return None;
+    }
+    // A token is what makes the notification routable; without one it can only be
+    // dropped, so filter it here rather than waking the gateway for nothing.
+    v.get("params").and_then(|p| p.get("progressToken"))?;
+    Some(v)
+}
+
 /// Forward one drained stdout line to the request loop, first flagging `dirty` if
 /// the server (once `armed`) announced a tool-list change, and invoking the
-/// resource-updated sink for `notifications/resources/updated` (SOU-394).
-/// Returns false when the receiver is gone (transport closed) so the drain loop
-/// can stop.
+/// resource-updated sink for `notifications/resources/updated` (SOU-394) and the
+/// progress sink for `notifications/progress` (SOU-444). Returns false when the
+/// receiver is gone (transport closed) so the drain loop can stop.
 fn forward_line(
     line: String,
     tx: &Sender<String>,
     dirty: &Option<Arc<AtomicU8>>,
     armed: &Arc<AtomicBool>,
     resource_updated: &Option<ResourceUpdatedSink>,
+    progress: &Arc<Mutex<Option<ProgressSink>>>,
 ) -> bool {
     if armed.load(Ordering::SeqCst) {
         if let Some(flag) = dirty {
@@ -778,6 +805,17 @@ fn forward_line(
         if let Some(sink) = resource_updated {
             if let Some(uri) = resource_updated_uri(&line) {
                 sink(uri);
+            }
+        }
+        // Parse first: the cheap gate inside keeps this off the hot path, so the
+        // lock is only taken for lines that really are progress notifications.
+        if let Some(note) = progress_notification(&line) {
+            let sink = progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(sink) = sink {
+                sink(note);
             }
         }
     }
@@ -1268,6 +1306,10 @@ pub struct StdioTransport {
     /// Answers server-initiated JSON-RPC (e.g. `roots/list`) by forwarding to the
     /// upstream MCP client. Set by the gateway before the connect handshake.
     server_handler: Option<ServerRequestHandler>,
+    /// Routes `notifications/progress` back to the client that minted the token
+    /// (SOU-444). Shared with the stdout drain thread so the gateway can bind it
+    /// after the transport is spawned, keeping `spawn_watched`'s signature stable.
+    progress: Arc<Mutex<Option<ProgressSink>>>,
 }
 
 /// Owns a Windows Job Object configured to terminate every assigned process
@@ -1643,6 +1685,8 @@ impl StdioTransport {
         let (tx, rx) = std::sync::mpsc::channel();
         let armed = Arc::new(AtomicBool::new(false));
         let drain_armed = Arc::clone(&armed);
+        let progress: Arc<Mutex<Option<ProgressSink>>> = Arc::new(Mutex::new(None));
+        let drain_progress = Arc::clone(&progress);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
@@ -1661,7 +1705,14 @@ impl StdioTransport {
                             );
                             break;
                         }
-                        if !forward_line(line, &tx, &dirty, &drain_armed, &resource_updated) {
+                        if !forward_line(
+                            line,
+                            &tx,
+                            &dirty,
+                            &drain_armed,
+                            &resource_updated,
+                            &drain_progress,
+                        ) {
                             break;
                         }
                     }
@@ -1705,7 +1756,18 @@ impl StdioTransport {
             armed,
             launcher: is_download_launcher(command, args),
             server_handler: None,
+            progress,
         })
+    }
+
+    /// Bind the sink that routes this server's `notifications/progress` back to
+    /// the client that minted the token (SOU-444). Set by the gateway after
+    /// spawn, so the drain thread picks it up without a constructor change.
+    pub fn set_progress_sink(&mut self, sink: Option<ProgressSink>) {
+        *self
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = sink;
     }
 
     /// Build a useful error for when the child's stdout closed (it exited or
@@ -2040,6 +2102,9 @@ pub struct HttpTransport {
     /// Fan `notifications/resources/updated` seen mid-SSE to subscribed
     /// upstream clients (SOU-394 follow-up for remote downstreams).
     resource_updated: Option<ResourceUpdatedSink>,
+    /// Route `notifications/progress` seen mid-SSE back to the client that minted
+    /// the token (SOU-444).
+    progress: Option<ProgressSink>,
 }
 
 impl HttpTransport {
@@ -2084,6 +2149,7 @@ impl HttpTransport {
             refresh,
             server_handler: None,
             resource_updated: None,
+            progress: None,
         }
     }
 
@@ -2091,6 +2157,12 @@ impl HttpTransport {
     /// response streams (SOU-394).
     pub fn set_resource_updated_sink(&mut self, sink: Option<ResourceUpdatedSink>) {
         self.resource_updated = sink;
+    }
+
+    /// Bind the sink that routes this server's `notifications/progress` back to
+    /// the client that minted the token (SOU-444).
+    pub fn set_progress_sink(&mut self, sink: Option<ProgressSink>) {
+        self.progress = sink;
     }
 
     /// Answer a server-initiated JSON-RPC request inline (SSE mid-stream or
@@ -2220,6 +2292,15 @@ impl HttpTransport {
                 if let Some(sink) = &self.resource_updated {
                     if let Some(uri) = resource_updated_uri(data) {
                         sink(uri);
+                        continue;
+                    }
+                }
+                // Progress for the request this stream belongs to (SOU-444).
+                // Routed by token, so it is consumed here rather than being
+                // mistaken for the response frame.
+                if let Some(sink) = &self.progress {
+                    if let Some(note) = progress_notification(data) {
+                        sink(note);
                         continue;
                     }
                 }
@@ -3981,23 +4062,24 @@ mod tests {
         let armed = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
         let no_sink = None;
+        let no_progress = Arc::new(std::sync::Mutex::new(None));
 
         // Unarmed (still in the handshake window): the line is forwarded but the
         // change is not acted on.
-        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink));
+        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink, &no_progress));
         assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), 0);
         assert_eq!(rx.recv().unwrap(), notif);
 
         // Armed: the same notification now sets the TOOLS bit.
         armed.store(true, Ordering::SeqCst);
-        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink));
+        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink, &no_progress));
         assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), change::TOOLS);
         assert_eq!(rx.recv().unwrap(), notif);
 
         // A resources/list_changed sets the RESOURCES bit alongside it (OR, not
         // overwrite), so distinct changes between watcher ticks aren't lost.
         let res_notif = r#"{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}"#;
-        assert!(forward_line(res_notif.to_string(), &tx, &dirty, &armed, &no_sink));
+        assert!(forward_line(res_notif.to_string(), &tx, &dirty, &armed, &no_sink, &no_progress));
         assert_eq!(
             dirty.as_ref().unwrap().load(Ordering::SeqCst),
             change::TOOLS | change::RESOURCES
@@ -4007,13 +4089,13 @@ mod tests {
         // An ordinary line is always forwarded and never flags a change.
         let resp = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
         let dirty2 = Some(Arc::new(AtomicU8::new(0)));
-        assert!(forward_line(resp.to_string(), &tx, &dirty2, &armed, &no_sink));
+        assert!(forward_line(resp.to_string(), &tx, &dirty2, &armed, &no_sink, &no_progress));
         assert_eq!(dirty2.as_ref().unwrap().load(Ordering::SeqCst), 0);
         assert_eq!(rx.recv().unwrap(), resp);
 
         // A closed receiver makes forward_line report "stop".
         drop(rx);
-        assert!(!forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink));
+        assert!(!forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink, &no_progress));
     }
 
     #[test]
@@ -4052,16 +4134,17 @@ mod tests {
         let armed = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
         let sink_opt = Some(sink);
+        let no_progress = Arc::new(Mutex::new(None));
         let line = r#"{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"fixture://r"}}"#;
 
         // Unarmed: no sink call.
-        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &sink_opt));
+        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &sink_opt, &no_progress));
         assert!(seen.lock().unwrap().is_empty());
         assert_eq!(rx.recv().unwrap(), line);
 
         // Armed: sink receives the URI; dirty bits stay clear (not a list change).
         armed.store(true, Ordering::SeqCst);
-        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &sink_opt));
+        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &sink_opt, &no_progress));
         assert_eq!(seen.lock().unwrap().as_slice(), &["fixture://r".to_string()]);
         assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), 0);
         assert_eq!(rx.recv().unwrap(), line);

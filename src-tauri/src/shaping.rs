@@ -525,11 +525,16 @@ mod tests {
         assert!(kept.get("io.modelcontextprotocol/protocolVersion").is_none());
         assert!(kept.get("io.modelcontextprotocol/clientInfo").is_none());
         assert!(kept.get("io.modelcontextprotocol/clientCapabilities").is_none());
-        assert!(kept.get("progressToken").is_none(), "withheld until SOU-444 part 2");
+        // Relayed since SOU-444 part 2: the gateway now routes the resulting
+        // `notifications/progress` back to the client that minted the token.
+        assert_eq!(kept["progressToken"], "p-1");
 
         // Nothing relayable means no `_meta` at all, not an empty object, so the
         // request stays byte-identical to what Toolport sent before SOU-444.
-        assert!(relayable_meta(Some(&json!({ "progressToken": "p" }))).is_none());
+        assert!(relayable_meta(Some(
+            &json!({ "io.modelcontextprotocol/clientInfo": { "name": "x" } })
+        ))
+        .is_none());
         assert!(relayable_meta(None).is_none());
 
         // The wholesale-forward path (completion/complete) strips the same keys.

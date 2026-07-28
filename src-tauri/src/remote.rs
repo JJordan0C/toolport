@@ -10,8 +10,8 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::downstream::{
-    DownstreamServer, HttpTransport, RefreshFn, ResourceUpdatedSink, ServerRequestHandler,
-    Transport,
+    DownstreamServer, HttpTransport, ProgressSink, RefreshFn, ResourceUpdatedSink,
+    ServerRequestHandler, Transport,
 };
 use crate::registry::ServerEntry;
 use crate::{oauth, secrets};
@@ -339,16 +339,19 @@ fn first_vaulted_secret(server: &ServerEntry) -> Option<String> {
 ///    OAuth. Without this fallback, "Manage secrets" tokens were silently ignored
 ///    for HTTP servers.
 pub fn connect_remote(server: &ServerEntry) -> Result<DownstreamServer, String> {
-    connect_remote_with_handler(server, None, None)
+    connect_remote_with_handler(server, None, None, None)
 }
 
 /// Like [`connect_remote`], but wires server-initiated JSON-RPC (sampling, roots, …)
 /// through `handler` when the downstream server asks mid-call, and optionally fans
-/// `notifications/resources/updated` from SSE response streams (SOU-394).
+/// `notifications/resources/updated` from SSE response streams (SOU-394), and
+/// routes `notifications/progress` back to the client that minted the token
+/// (SOU-444).
 pub fn connect_remote_with_handler(
     server: &ServerEntry,
     server_handler: Option<ServerRequestHandler>,
     resource_updated: Option<ResourceUpdatedSink>,
+    progress: Option<ProgressSink>,
 ) -> Result<DownstreamServer, String> {
     guard_connect_target(server)?;
     let url = server.url.as_deref().unwrap_or("");
@@ -367,6 +370,7 @@ pub fn connect_remote_with_handler(
         transport.set_server_request_handler(handler.clone());
     }
     transport.set_resource_updated_sink(resource_updated.clone());
+    transport.set_progress_sink(progress.clone());
     match DownstreamServer::connect(server_id.to_string(), Box::new(transport)) {
         Ok(ds) => Ok(ds),
         Err(e) if is_auth_error(&e) => match refresh_token(server_id) {
@@ -376,6 +380,7 @@ pub fn connect_remote_with_handler(
                     transport.set_server_request_handler(handler);
                 }
                 transport.set_resource_updated_sink(resource_updated);
+                transport.set_progress_sink(progress);
                 DownstreamServer::connect(server_id.to_string(), Box::new(transport))
             }
             Err(_) => Err(e),

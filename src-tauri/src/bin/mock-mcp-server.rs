@@ -186,6 +186,8 @@ fn tool_list(cfg: &Config, grown: bool) -> Value {
                 "inputSchema": { "type": "object", "properties": {} } }),
         json!({ "name": "echo_meta", "description": "Return the request's params._meta verbatim.",
                 "inputSchema": { "type": "object", "properties": {} } }),
+        json!({ "name": "progress_ping", "description": "Emit notifications/progress, then reply.",
+                "inputSchema": { "type": "object", "properties": {} } }),
     ];
     if grown {
         tools.push(json!({ "name": "greet", "description": "Greet someone by name.",
@@ -279,8 +281,10 @@ fn era_gate(cfg: &Config, state: &State, method: &str, req: &Value, id: &Value) 
     }
 }
 
-/// Handle one request, returning its response.
-fn handle(cfg: &Config, state: &mut State, req: &Value) -> Option<Value> {
+/// Handle one request, returning its response. `pre` collects notifications the
+/// server wants to emit *before* the response, which is how real servers stream
+/// progress: the client sees them while its request is still in flight.
+fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) -> Option<Value> {
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
     // Notifications carry no id and get no response, but still drive state.
@@ -340,6 +344,21 @@ fn handle(cfg: &Config, state: &mut State, req: &Value) -> Option<Value> {
                     ),
                 ));
             }
+            // Stream a progress notification for the token the caller supplied,
+            // before the response, so the gateway's routing can be exercised
+            // end to end (SOU-444).
+            if name == "progress_ping" {
+                if let Some(token) = params
+                    .and_then(|p| p.get("_meta"))
+                    .and_then(|m| m.get("progressToken"))
+                {
+                    pre.push(json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/progress",
+                        "params": { "progressToken": token, "progress": 1, "total": 2 }
+                    }));
+                }
+            }
             let text = match name {
                 "echo" => args.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
                 "add" => {
@@ -395,7 +414,19 @@ fn main() {
         };
         record(&cfg, &req);
         let was_grown = state.grown;
-        if let Some(resp) = handle(&cfg, &mut state, &req) {
+        let mut pre = Vec::new();
+        let resp = handle(&cfg, &mut state, &req, &mut pre);
+        // Emitted before the response, so the client reads them while its request
+        // is still in flight - the realistic ordering for streamed progress.
+        if !pre.is_empty() {
+            for note in &pre {
+                if writeln!(out, "{note}").is_err() {
+                    return;
+                }
+            }
+            let _ = out.flush();
+        }
+        if let Some(resp) = resp {
             if writeln!(out, "{resp}").is_err() {
                 break;
             }

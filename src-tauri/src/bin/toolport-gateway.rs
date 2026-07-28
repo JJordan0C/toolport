@@ -432,6 +432,30 @@ impl ResourceSubscriptionTable {
 /// [`ResourceUpdatedSink`] that closes over the producer id.
 type ResourceUpdatedDispatch = Arc<dyn Fn(String, String) + Send + Sync>;
 
+/// Shared `(producer, notification)` dispatch for `notifications/progress`,
+/// bound per downstream server so delivery can verify who emitted it (SOU-444).
+type ProgressDispatch = Arc<dyn Fn(String, Value) + Send + Sync>;
+
+/// Process-wide progress dispatch, installed once at startup.
+///
+/// The resource-updated dispatch is threaded through `build_router` because
+/// subscriptions are rebuilt alongside the router. Progress needs none of that:
+/// it depends only on singletons that live for the whole process (stdout, the
+/// HTTP session table, and the in-flight token map), and every downstream
+/// connection wants the same one. A set-once global keeps it out of four
+/// intermediate signatures that have nothing else to do with it.
+static PROGRESS_DISPATCH: std::sync::OnceLock<ProgressDispatch> = std::sync::OnceLock::new();
+
+/// In-flight `progressToken` routes, shared by every downstream connection.
+static PROGRESS_ROUTES: std::sync::OnceLock<Arc<Mutex<ProgressRoutes>>> =
+    std::sync::OnceLock::new();
+
+/// The live token table, created on first use so tests can exercise routing
+/// without standing up a full gateway.
+fn progress_routes() -> &'static Arc<Mutex<ProgressRoutes>> {
+    PROGRESS_ROUTES.get_or_init(|| Arc::new(Mutex::new(ProgressRoutes::default())))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum BoundedLine {
     Eof,
@@ -3305,6 +3329,13 @@ fn execute_call(
         profiler.mark_preflight();
     }
 
+    // Route this call's progress notifications back to the client that minted the
+    // token, for exactly as long as the call is in flight (SOU-444). Registered
+    // against the raw server id, matching what the per-server sink binds, so the
+    // spoof check compares like with like. Held in a named binding so the RAII
+    // guard lives across the call rather than dropping immediately.
+    let _progress_route = register_progress(progress_routes(), client_meta, server_id);
+
     let started = Instant::now();
     match exec_router.route_call_with_cancel(name, arguments, cancel.clone(), client_meta) {
         Ok(result) => {
@@ -4381,6 +4412,9 @@ fn handle_request_with_cancel(
                 }
             }
             let client_meta = req.get("params").and_then(|p| p.get("_meta")).cloned();
+            let _progress_route = router.resource_server(uri).and_then(|owner| {
+                register_progress(progress_routes(), client_meta.as_ref(), owner)
+            });
             match router.read_resource_with_cancel(uri, cancel.clone(), client_meta.as_ref()) {
                 Ok(mut result) => {
                     // Content defense: a resource is as attacker-controllable as a tool
@@ -4446,6 +4480,9 @@ fn handle_request_with_cancel(
                 }
             }
             let client_meta = params.and_then(|p| p.get("_meta")).cloned();
+            let _progress_route = router.prompt_server(name).and_then(|owner| {
+                register_progress(progress_routes(), client_meta.as_ref(), owner)
+            });
             match router.get_prompt_with_cancel(name, arguments, cancel.clone(), client_meta.as_ref())
             {
                 Ok(mut result) => {
@@ -4720,6 +4757,11 @@ fn connect_one(
     let resource_updated = resource_updated
         .as_ref()
         .map(|d| bind_resource_updated_sink(d, &server.id));
+    // Same, for progress routing (SOU-444). Read from the process-wide dispatch
+    // rather than a threaded parameter: see PROGRESS_DISPATCH.
+    let progress = PROGRESS_DISPATCH
+        .get()
+        .map(|d| bind_progress_sink(d, &server.id));
     let result = if let Some(command) = &server.command {
         let mut env: Vec<(String, String)> = Vec::new();
         for e in &server.env {
@@ -4760,6 +4802,7 @@ fn connect_one(
         ) {
             Ok(mut t) => {
                 t.set_server_request_handler(server_handler);
+                t.set_progress_sink(progress);
                 DownstreamServer::connect(server.id.clone(), Box::new(t))
             }
             Err(e) => Err(e),
@@ -4769,6 +4812,7 @@ fn connect_one(
             server,
             Some(Arc::clone(&server_handler)),
             resource_updated,
+            progress,
         )
     } else {
         Err("no command or url".to_string())
@@ -4921,6 +4965,158 @@ fn deliver_resource_updated(
             }
         }
     }
+}
+
+/// One in-flight `progressToken` Toolport relayed on a client's behalf.
+struct ProgressRoute {
+    /// Which upstream client minted the token: a real `Mcp-Session-Id`, or
+    /// [`RESOURCE_SUB_STDIO`] for the single stdio client.
+    session: String,
+    /// The downstream server the token was relayed to. Recorded so a different
+    /// server cannot emit progress for it.
+    producer: String,
+}
+
+/// Live `progressToken` -> originating client map (SOU-444).
+///
+/// Progress is request-scoped, so an entry lives exactly as long as the
+/// downstream call that carries the token. Tracking the producer is what stops a
+/// hostile or buggy server emitting progress for a token it was never given -
+/// the same cross-server spoof lesson as SOU-398, applied to a notification that
+/// carries a client-chosen correlator instead of a URI.
+#[derive(Default)]
+struct ProgressRoutes {
+    active: HashMap<String, ProgressRoute>,
+}
+
+/// RAII registration: the entry is removed when the call finishes, however it
+/// finishes. A leaked token would let a server keep pushing progress into a
+/// client's stream long after its request completed.
+struct ProgressRegistration {
+    table: Arc<Mutex<ProgressRoutes>>,
+    key: String,
+}
+
+impl Drop for ProgressRegistration {
+    fn drop(&mut self) {
+        self.table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .remove(&self.key);
+    }
+}
+
+/// Register the `progressToken` in `client_meta` (if any) for the duration of one
+/// downstream call. Returns `None` when the client asked for no progress, which
+/// is the common case.
+fn register_progress(
+    table: &Arc<Mutex<ProgressRoutes>>,
+    client_meta: Option<&Value>,
+    producer: &str,
+) -> Option<ProgressRegistration> {
+    let token = client_meta?.get("progressToken")?;
+    let key = rpc_id_key(token)?;
+    let session = ACTIVE_MCP_SESSION.with(|cell| {
+        cell.borrow()
+            .clone()
+            .unwrap_or_else(|| RESOURCE_SUB_STDIO.to_string())
+    });
+    table
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .active
+        .insert(
+            key.clone(),
+            ProgressRoute {
+                session,
+                producer: producer.to_string(),
+            },
+        );
+    Some(ProgressRegistration {
+        table: Arc::clone(table),
+        key,
+    })
+}
+
+/// Deliver one `notifications/progress` to the client that minted its token,
+/// dropping anything unroutable or spoofed (SOU-444).
+fn deliver_progress(
+    stdout: &Arc<Mutex<std::io::Stdout>>,
+    mcp_sessions: &Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    routes: &Arc<Mutex<ProgressRoutes>>,
+    producer: &str,
+    note: &Value,
+) {
+    let Some(token) = note.get("params").and_then(|p| p.get("progressToken")) else {
+        return;
+    };
+    let Some(key) = rpc_id_key(token) else {
+        return;
+    };
+    let session = {
+        let table = routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match table.active.get(&key) {
+            Some(route) if route.producer == producer => route.session.clone(),
+            Some(route) => {
+                eprintln!(
+                    "toolport: progress for token from '{producer}' dropped \
+                     (token belongs to '{}')",
+                    route.producer
+                );
+                return;
+            }
+            // No in-flight request owns this token: a late notification for a
+            // finished call, or one Toolport never relayed. Either way, drop it.
+            None => return,
+        }
+    };
+    if session == RESOURCE_SUB_STDIO {
+        let mut out = stdout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = write_json_line(&mut *out, note);
+        return;
+    }
+    let Ok(json) = serde_json::to_string(note) else {
+        return;
+    };
+    let sessions = mcp_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(target) = sessions.get(&session) else {
+        return;
+    };
+    if target.is_expired() || target.closed.load(Ordering::SeqCst) {
+        return;
+    }
+    if !target.push_message(json, None) {
+        eprintln!("toolport: MCP session outbound queue full; progress dropped");
+    }
+}
+
+/// Build the shared dispatch that routes progress notifications to the client
+/// that minted the token. Bound per downstream via [`bind_progress_sink`].
+fn make_progress_sink(
+    stdout: Arc<Mutex<std::io::Stdout>>,
+    mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    routes: Arc<Mutex<ProgressRoutes>>,
+) -> ProgressDispatch {
+    Arc::new(move |producer: String, note: Value| {
+        deliver_progress(&stdout, &mcp_sessions, &routes, &producer, &note);
+    })
+}
+
+/// Bind a shared progress dispatch to one producer server id, so the
+/// transport-level sink only needs the notification (SOU-444).
+fn bind_progress_sink(dispatch: &ProgressDispatch, producer: &str) -> downstream::ProgressSink {
+    let dispatch = Arc::clone(dispatch);
+    let producer = producer.to_string();
+    Arc::new(move |note: Value| {
+        dispatch(producer.clone(), note);
+    })
 }
 
 /// Build the shared dispatch that fans resource-updated notifications to
@@ -8906,6 +9102,14 @@ fn main() {
         Arc::clone(&mcp_sessions),
         Arc::clone(&resource_subs),
     ));
+    // Progress routing (SOU-444). Installed before any downstream connects, so
+    // every transport binds a sink; `connect_one` reads it from here rather than
+    // taking it as a parameter.
+    let _ = PROGRESS_DISPATCH.set(make_progress_sink(
+        Arc::clone(&stdout),
+        Arc::clone(&mcp_sessions),
+        Arc::clone(progress_routes()),
+    ));
     // Single-flight for every router build/swap (startup, watcher self-heal, and
     // ${ROOT} rebuilds). Created up front so the startup build can share it.
     let rebuild_lock = Arc::new(Mutex::new(()));
@@ -12490,6 +12694,140 @@ mod tests {
             "subscribed session missing update: {chunk1}"
         );
         assert!(chunk2.is_none(), "unsubscribed session must not receive update");
+    }
+
+    /// Set the active MCP session for the duration of `f`, restoring it after, so
+    /// one test cannot leak a session id into the next.
+    fn with_active_session<T>(sid: &str, f: impl FnOnce() -> T) -> T {
+        ACTIVE_MCP_SESSION.with(|cell| {
+            let previous = cell.borrow().clone();
+            *cell.borrow_mut() = Some(sid.to_string());
+            let out = f();
+            *cell.borrow_mut() = previous;
+            out
+        })
+    }
+
+    fn progress_note(token: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": { "progressToken": token, "progress": 1, "total": 4 }
+        })
+    }
+
+    fn drain_session(state: &GatewayState, sid: &str) -> Vec<String> {
+        let sessions = state.mcp_sessions.lock().unwrap();
+        let sess = sessions.get(sid).unwrap();
+        let mut out = sess.outbound.lock().unwrap();
+        out.drain(..).map(|m| m.json).collect()
+    }
+
+    #[test]
+    fn progress_reaches_only_the_client_that_minted_the_token() {
+        // SOU-444: progress is request-scoped, so it must land on the one client
+        // whose request carried the token, never fan out like a subscription.
+        let state = http_state(false);
+        let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
+        let s2 = mint_mcp_session(&state, None).ok().expect("mint s2");
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+
+        let registration = with_active_session(&s1, || {
+            register_progress(&routes, Some(&json!({ "progressToken": "tok-1" })), "alpha")
+        });
+        assert!(registration.is_some(), "a token should register a route");
+
+        deliver_progress(
+            &state.stdout,
+            &state.mcp_sessions,
+            &routes,
+            "alpha",
+            &progress_note("tok-1"),
+        );
+
+        let got = drain_session(&state, &s1);
+        assert_eq!(got.len(), 1, "the minting client gets the progress");
+        assert!(got[0].contains("tok-1"));
+        assert!(
+            drain_session(&state, &s2).is_empty(),
+            "another client must never see it"
+        );
+    }
+
+    #[test]
+    fn progress_drops_cross_server_spoof_and_stale_tokens() {
+        // Same lesson as SOU-398, on a notification whose correlator is chosen by
+        // the client: a server must not be able to push progress for a token it
+        // was never given, and a finished call must stop accepting progress.
+        let state = http_state(false);
+        let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+
+        let registration = with_active_session(&s1, || {
+            register_progress(&routes, Some(&json!({ "progressToken": "tok-1" })), "alpha")
+        });
+
+        // beta was never given this token.
+        deliver_progress(
+            &state.stdout,
+            &state.mcp_sessions,
+            &routes,
+            "beta",
+            &progress_note("tok-1"),
+        );
+        assert!(
+            drain_session(&state, &s1).is_empty(),
+            "a server must not push progress for another server's token"
+        );
+
+        // A token nobody registered is dropped rather than broadcast.
+        deliver_progress(
+            &state.stdout,
+            &state.mcp_sessions,
+            &routes,
+            "alpha",
+            &progress_note("never-issued"),
+        );
+        assert!(drain_session(&state, &s1).is_empty(), "unknown token dropped");
+
+        // The rightful owner still gets through...
+        deliver_progress(
+            &state.stdout,
+            &state.mcp_sessions,
+            &routes,
+            "alpha",
+            &progress_note("tok-1"),
+        );
+        assert_eq!(drain_session(&state, &s1).len(), 1);
+
+        // ...until the call ends. Dropping the RAII guard unregisters the token, so
+        // a server cannot keep pushing into the client's stream afterwards.
+        drop(registration);
+        assert!(
+            routes.lock().unwrap().active.is_empty(),
+            "the route must not outlive the call"
+        );
+        deliver_progress(
+            &state.stdout,
+            &state.mcp_sessions,
+            &routes,
+            "alpha",
+            &progress_note("tok-1"),
+        );
+        assert!(
+            drain_session(&state, &s1).is_empty(),
+            "progress after the call completed must be dropped"
+        );
+    }
+
+    #[test]
+    fn no_progress_token_registers_no_route() {
+        // The common case: clients that never ask for progress cost nothing and
+        // leave no state behind.
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        assert!(register_progress(&routes, None, "alpha").is_none());
+        assert!(register_progress(&routes, Some(&json!({ "traceparent": "x" })), "alpha").is_none());
+        assert!(routes.lock().unwrap().active.is_empty());
     }
 
     #[test]

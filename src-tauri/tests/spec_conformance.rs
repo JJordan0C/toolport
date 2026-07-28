@@ -19,7 +19,7 @@
 //!    work lands.
 
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use conduit_lib::downstream::{DownstreamServer, StdioTransport, Transport, TransportError};
@@ -398,18 +398,58 @@ fn fully_stripped_meta_leaves_no_empty_object() {
     );
 }
 
-/// SOU-444, part two. `progressToken` is deliberately withheld until the gateway
-/// can route `notifications/progress` back to the originating request: the stdio
-/// read loop drops every notification it does not recognise, so relaying the
-/// token today would invite progress traffic into a black hole.
-///
-/// Remove the `#[ignore]` (and `WITHHELD_META_KEYS` in `downstream.rs`) when
-/// progress routing lands.
+/// SOU-444 part 2. `progressToken` is relayed now that the gateway routes the
+/// resulting `notifications/progress` back to the client that minted it.
 #[test]
-#[ignore = "SOU-444 part 2: progressToken withheld until notifications/progress can be routed back"]
 fn progress_token_reaches_downstream_server() {
     let received = relayed_meta(&json!({ "progressToken": "p-1" }));
     assert_eq!(received["progressToken"], "p-1");
+}
+
+/// The whole progress chain, not just its ends: a server emits
+/// `notifications/progress` mid-call, the stdout drain recognises it, and the
+/// bound sink receives it while the originating request is still in flight.
+///
+/// Before SOU-444 the drain dropped every notification it did not recognise, so
+/// this traffic went nowhere.
+#[test]
+fn downstream_progress_notification_reaches_the_bound_sink() {
+    let dirty = Arc::new(AtomicU8::new(0));
+    let mut transport = StdioTransport::spawn_watched(mock_bin(), &[], &[], None, dirty, None)
+        .expect("spawn fixture");
+
+    let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_seen = Arc::clone(&seen);
+    transport.set_progress_sink(Some(Arc::new(move |note: Value| {
+        sink_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(note);
+    })));
+
+    let mut server =
+        DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
+
+    let result = server
+        .call_with_cancel(
+            "progress_ping",
+            json!({}),
+            None,
+            Some(&json!({ "progressToken": "tok-e2e" })),
+        )
+        .expect("progress_ping call");
+    assert_eq!(result["isError"], false, "the call itself still succeeds");
+
+    // The notification is emitted before the response, so by the time the call
+    // returns the drain has already seen it.
+    let got = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert_eq!(got.len(), 1, "expected exactly one progress notification, got {got:?}");
+    assert_eq!(got[0]["method"], "notifications/progress");
+    assert_eq!(
+        got[0]["params"]["progressToken"], "tok-e2e",
+        "the token must round-trip so the gateway can route it back"
+    );
+    assert_eq!(got[0]["params"]["total"], 2);
 }
 
 /// SOU-445. A dual-era gateway must connect to a modern, stateless server by
