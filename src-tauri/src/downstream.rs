@@ -2081,6 +2081,12 @@ impl Transport for StdioTransport {
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
+        // Same as the request path: a modern connection stamps its protocol
+        // metadata on notifications too, so every message tells one story.
+        let mut params = params;
+        if let Some(protocol) = &self.protocol_meta {
+            merge_protocol_meta(&mut params, protocol);
+        }
         let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         let mut stdin = self
             .stdin
@@ -2628,6 +2634,14 @@ impl Transport for HttpTransport {
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
+        // Notifications carry the connection's protocol metadata too, so a modern
+        // server sees a consistent story on every message rather than only on
+        // requests. (The revision leaves notification headers undefined, so this
+        // is consistency rather than a hard requirement.)
+        let mut params = params;
+        if let Some(protocol) = &self.protocol_meta {
+            merge_protocol_meta(&mut params, protocol);
+        }
         let body = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         self.post(&body, false)?;
         Ok(())
@@ -2719,10 +2733,13 @@ impl DownstreamServer {
                 // has no such method. Confirm with `server/discover`, which every
                 // modern server MUST implement, rather than guessing from an
                 // error code the spec leaves implementation-defined.
-                let probe = transport.request(
-                    "server/discover",
-                    json!({ "_meta": protocol_meta_for(MODERN_PROTOCOL_VERSION) }),
-                );
+                // Stamp the modern metadata BEFORE probing, not after. On HTTP the
+                // transport derives `MCP-Protocol-Version` from it, and that header
+                // MUST match the body's `_meta`; probing first would send a legacy
+                // header with a modern body and a strict server would reject the
+                // very request meant to detect it, with HeaderMismatch (-32020).
+                transport.set_protocol_meta(Some(protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+                let probe = transport.request("server/discover", json!({}));
                 let discovered = match probe {
                     Ok(discovered) => discovered,
                     // This is the pivot of the compatibility ladder. A RECOGNIZED
@@ -2738,12 +2755,14 @@ impl DownstreamServer {
                         // this is usually a clean incompatibility, but the ladder
                         // is written to negotiate rather than to assume.
                         match offered.iter().find(|v| v.as_str() == MODERN_PROTOCOL_VERSION) {
-                            Some(version) => transport
-                                .request(
-                                    "server/discover",
-                                    json!({ "_meta": protocol_meta_for(version) }),
-                                )
-                                .map_err(|e| e.to_string())?,
+                            Some(version) => {
+                                // Re-stamp before retrying so header and body agree
+                                // on the newly chosen version too.
+                                transport.set_protocol_meta(Some(protocol_meta_for(version)));
+                                transport
+                                    .request("server/discover", json!({}))
+                                    .map_err(|e| e.to_string())?
+                            }
                             None => {
                                 return Err(format!(
                                     "server speaks MCP {offered:?}; Toolport speaks \

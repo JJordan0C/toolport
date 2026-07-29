@@ -1,7 +1,7 @@
 //! Result-shaping: keep oversized tool results from blowing the model's context
 //! WITHOUT losing data. When a downstream tool returns a result larger than the
 //! byte budget, the full body is cached in-process and the model gets a truncated
-//! head plus a Toolport-stamped marker carrying a cursor. `conduit_fetch_result`
+//! head plus a Toolport-stamped marker carrying a cursor. `toolport_fetch_result`
 //! pages through the cached full result. Lossless: nothing is dropped, only
 //! deferred, and the full data stays retrievable.
 //!
@@ -203,6 +203,15 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
                 .sum()
         })
         .unwrap_or(0);
+    // If the preserved envelope alone meets the budget, no head size makes the
+    // shaped result fit and the 256-byte floor below would emit an oversized
+    // result anyway. Leave it unshaped, as with the other cases where shaping
+    // cannot honour its contract. Deliberately gated on the envelope only: the
+    // marker reserve is allowed to exceed a very small budget exactly as it did
+    // before, so tiny-budget shaping keeps working.
+    if preserved_bytes >= budget {
+        return false;
+    }
     // Reserve room for the marker, then show as much of the body head as fits the
     // BYTE budget (not a char count, or multi-byte text would blow past it).
     let head_byte_limit = budget.saturating_sub(512 + preserved_bytes).max(256);
@@ -248,7 +257,7 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
     let marker = format!(
         "\n\n[Toolport shaped this result: it was ~{} KB, larger than the {} KB context \
          budget. Showing the first {} of {} characters. The rest is held temporarily, call \
-         conduit_fetch_result with {{\"cursor\":\"{}\",\"offset\":{}}} to read it. If that \
+         toolport_fetch_result with {{\"cursor\":\"{}\",\"offset\":{}}} to read it. If that \
          later reports the cursor expired, just re-run this tool call for a fresh result.]",
         size / 1024,
         budget / 1024,
@@ -369,7 +378,7 @@ pub fn fetch_result(cursor: &str, offset: usize, len: usize, requester: Option<&
     let footer = if remaining > 0 {
         format!(
             "\n\n[Toolport: characters {offset}..{end} of {total}. {remaining} remain, call \
-             conduit_fetch_result with offset={end} for the next slice.]"
+             toolport_fetch_result with offset={end} for the next slice.]"
         )
     } else {
         format!("\n\n[Toolport: end of result ({total} characters).]")
@@ -397,7 +406,7 @@ mod tests {
         let mut r = big_text_result(10_000);
         assert!(shape_result(&mut r, 2048, None));
         let text = r["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("conduit_fetch_result"));
+        assert!(text.contains("toolport_fetch_result"));
         assert!(text.len() < 10_000);
         // The marker carries a cursor that fetch_result can page.
         assert!(text.contains("\"cursor\":\"r"));

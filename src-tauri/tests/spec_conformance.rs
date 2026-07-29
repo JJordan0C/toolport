@@ -492,8 +492,11 @@ fn gateway_connects_to_a_modern_server() {
     );
 
     // Every post-handshake request carries its own protocol version and identity.
+    // Counted so the loop cannot pass by matching nothing.
+    let mut checked = 0;
     for record in transcript.iter().filter(|r| r["method"] == "tools/list" || r["method"] == "tools/call")
     {
+        checked += 1;
         let meta = &record["params"]["_meta"];
         assert_eq!(
             meta["io.modelcontextprotocol/protocolVersion"], MODERN,
@@ -504,6 +507,10 @@ fn gateway_connects_to_a_modern_server() {
             "Toolport identifies itself on the downstream hop, not the upstream client"
         );
     }
+    assert!(
+        checked >= 2,
+        "expected the tools/list and tools/call records to be checked, saw {checked}"
+    );
 
     let _ = std::fs::remove_file(&path);
 }

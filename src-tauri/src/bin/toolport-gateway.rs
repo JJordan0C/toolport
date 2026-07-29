@@ -7979,7 +7979,14 @@ fn handle_mcp_http(
             let is_initialize = method_name == "initialize";
             // 2026-07-28 removed protocol-level sessions (SOU-447). A modern
             // request declares its own version, so it is served statelessly.
-            let is_modern = upstream_declared_version(&req).is_some();
+            //
+            // Gate on the version VALUE, not merely on a version being present, so
+            // this matches the modern-era test in `handle_request_with_cancel`.
+            // Keying on presence alone would let a client that names a legacy
+            // version in `_meta` skip the session requirement here while still
+            // being served legacy-shaped results there.
+            let is_modern =
+                upstream_declared_version(&req) == Some(MODERN_PROTOCOL_VERSION);
 
             // Session rules. Modern requests have none; legacy `initialize` may
             // omit a session id (and gets a new one), and every other legacy
