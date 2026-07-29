@@ -190,9 +190,22 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
     let structured = result.get("structuredContent").cloned();
 
     let total = body.chars().count();
+    // Envelope fields carried across (see below) are part of the shaped result, so
+    // they have to come out of the budget too. Without this, preserving a large
+    // `_meta` could push a "shaped" result back over the limit and `true` would no
+    // longer mean "fits" (#511 review).
+    let preserved_bytes: usize = result
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "content" | "structuredContent" | "isError"))
+                .map(|(key, value)| key.len() + value_size(value) + 4)
+                .sum()
+        })
+        .unwrap_or(0);
     // Reserve room for the marker, then show as much of the body head as fits the
     // BYTE budget (not a char count, or multi-byte text would blow past it).
-    let head_byte_limit = budget.saturating_sub(512).max(256);
+    let head_byte_limit = budget.saturating_sub(512 + preserved_bytes).max(256);
     let head = head_within_bytes(&body, head_byte_limit).to_string();
     let head_chars = head.chars().count();
     let is_error = result

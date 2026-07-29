@@ -2345,6 +2345,24 @@ impl HttpTransport {
         self.progress = sink;
     }
 
+    /// The protocol version this connection declares in the `MCP-Protocol-Version`
+    /// header.
+    ///
+    /// From 2026-07-28 the header **MUST** equal the
+    /// `io.modelcontextprotocol/protocolVersion` carried in the body's `_meta`,
+    /// and a server that sees them disagree rejects the request with `400` and
+    /// `HeaderMismatch` (-32020). So this has to follow whatever the connection
+    /// negotiated, not a constant. Legacy connections have no protocol `_meta`
+    /// and keep sending [`PROTOCOL_VERSION`] exactly as before.
+    fn wire_protocol_version(&self) -> String {
+        self.protocol_meta
+            .as_ref()
+            .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
+            .and_then(Value::as_str)
+            .unwrap_or(PROTOCOL_VERSION)
+            .to_string()
+    }
+
     /// Answer a server-initiated JSON-RPC request inline (SSE mid-stream or
     /// standalone). Returns true when the message was handled.
     fn handle_inline_server_request(&mut self, v: &Value) -> Result<bool, TransportError> {
@@ -2397,13 +2415,14 @@ impl HttpTransport {
         let payload = body.to_string();
         self.refresh_before_send();
         let mut refreshed = false;
+        let wire_version = self.wire_protocol_version();
         let resp = loop {
             let mut req = self
                 .inline_agent
                 .post(&self.url)
                 .set("Content-Type", "application/json")
                 .set("Accept", "application/json, text/event-stream")
-                .set("MCP-Protocol-Version", PROTOCOL_VERSION);
+                .set("MCP-Protocol-Version", &wire_version);
             if let Some(sid) = &self.session_id {
                 req = req.set("Mcp-Session-Id", sid);
             }
@@ -2509,13 +2528,14 @@ impl HttpTransport {
         // contention). Only 429 and transport-retry signals bubble up as
         // TransportError::Retry so the Router can sleep *outside* the lock.
         let mut refreshed = false;
+        let wire_version = self.wire_protocol_version();
         let resp = loop {
             let mut req = self
                 .agent
                 .post(&self.url)
                 .set("Content-Type", "application/json")
                 .set("Accept", "application/json, text/event-stream")
-                .set("MCP-Protocol-Version", PROTOCOL_VERSION);
+                .set("MCP-Protocol-Version", &wire_version);
             if let Some(sid) = &self.session_id {
                 req = req.set("Mcp-Session-Id", sid);
             }
@@ -4404,6 +4424,30 @@ mod tests {
         );
         assert_eq!(resource_updated_uri(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#), None);
         assert_eq!(resource_updated_uri("not json"), None);
+    }
+
+    #[test]
+    fn http_protocol_header_follows_the_negotiated_version() {
+        // From 2026-07-28 the MCP-Protocol-Version header MUST equal the
+        // `_meta` version in the body. A hardcoded header would disagree with the
+        // `_meta` that `set_protocol_meta` stamps, and a modern server would
+        // answer 400 HeaderMismatch (-32020) to every request. Invisible to the
+        // stdio tests, which have no headers at all (#511 review).
+        use super::{HttpTransport, Transport, MODERN_PROTOCOL_VERSION, PROTOCOL_VERSION};
+
+        let mut t = HttpTransport::new("https://example.invalid/mcp");
+        assert_eq!(
+            t.wire_protocol_version(),
+            PROTOCOL_VERSION,
+            "a legacy connection declares exactly what it always did"
+        );
+
+        t.set_protocol_meta(Some(super::protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+        assert_eq!(
+            t.wire_protocol_version(),
+            MODERN_PROTOCOL_VERSION,
+            "the header must follow the negotiated version, not a constant"
+        );
     }
 
     #[test]

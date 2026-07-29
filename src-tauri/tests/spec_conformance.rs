@@ -13,10 +13,13 @@
 //! 2. **Pin today's wire format.** `downstream_transcript_pins_current_wire_format`
 //!    records the exact JSON-RPC the gateway emits downstream. Any change to it
 //!    is then a deliberate edit to this file, never an accident.
-//! 3. **Document known gaps executably.** The `#[ignore]`d tests at the bottom
-//!    encode behaviour the spec requires and Toolport does not yet have. They are
-//!    the acceptance criteria for their issues: delete the `#[ignore]` when the
-//!    work lands.
+//! 3. **Prove the dual-era guarantees.** Both directions are covered: Toolport
+//!    connecting to a modern server and serving a modern client, each paired with
+//!    a test that the legacy path sees byte-identical traffic.
+//!
+//! Gaps were tracked here as `#[ignore]`d acceptance criteria while the work was
+//! in flight, which is a good pattern to reuse. Every test in this file runs
+//! today.
 
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
