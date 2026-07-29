@@ -4427,6 +4427,56 @@ mod tests {
     }
 
     #[test]
+    fn modern_server_offering_another_version_is_not_reported_as_legacy() {
+        // The compatibility ladder's pivot. A server that refuses `initialize`
+        // AND answers the probe with a recognized modern error IS modern, it just
+        // does not speak our version. Reporting the initialize refusal there sends
+        // someone chasing a handshake bug on a reachable server (#511 review).
+        use super::{DownstreamServer, Transport, TransportError};
+        use std::collections::VecDeque;
+
+        struct Probe {
+            responses: VecDeque<Result<Value, TransportError>>,
+        }
+        impl Transport for Probe {
+            fn request(&mut self, _method: &str, _params: Value) -> Result<Value, TransportError> {
+                self.responses.pop_front().expect("a response per request")
+            }
+            fn notify(&mut self, _m: &str, _p: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let transport = Probe {
+            responses: VecDeque::from(vec![
+                // initialize: refused, as a modern server must.
+                Err(TransportError::Rpc(json!({
+                    "code": -32601, "message": "initialize is not part of 2026-07-28"
+                }))),
+                // server/discover: recognized modern error naming what it speaks.
+                Err(TransportError::Rpc(json!({
+                    "code": super::UNSUPPORTED_PROTOCOL_VERSION,
+                    "message": "Unsupported protocol version",
+                    "data": { "supported": ["2027-05-01"], "requested": "2026-07-28" }
+                }))),
+            ]),
+        };
+
+        let err = match DownstreamServer::connect("mock".to_string(), Box::new(transport)) {
+            Err(err) => err,
+            Ok(_) => panic!("no mutually supported version, so connect must fail"),
+        };
+        assert!(
+            err.contains("2027-05-01") && err.contains(super::MODERN_PROTOCOL_VERSION),
+            "the error must name what each side speaks, got: {err}"
+        );
+        assert!(
+            !err.contains("initialize is not part of"),
+            "a modern server must not be reported via the initialize refusal, got: {err}"
+        );
+    }
+
+    #[test]
     fn http_protocol_header_follows_the_negotiated_version() {
         // From 2026-07-28 the MCP-Protocol-Version header MUST equal the
         // `_meta` version in the body. A hardcoded header would disagree with the

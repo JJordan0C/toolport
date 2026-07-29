@@ -568,6 +568,30 @@ mod tests {
     }
 
     #[test]
+    fn preserved_envelope_fields_do_not_push_a_shaped_result_over_budget() {
+        // Preserved fields are part of the shaped result, so they come out of the
+        // same budget. Before this, a large `_meta` was copied in AFTER the head
+        // was sized, so `true` could mean "shaped, and still oversized" (#511
+        // review). The guarantee is that a `true` return fits.
+        let budget = 4096;
+        let mut r = json!({
+            "content": [{ "type": "text", "text": "x".repeat(50_000) }],
+            "isError": false,
+            // Deliberately bulky: about half the budget on its own.
+            "_meta": { "com.example/ctx": "m".repeat(2_000) }
+        });
+        assert!(shape_result(&mut r, budget, None));
+
+        let size = serde_json::to_string(&r).map(|s| s.len()).unwrap_or(0);
+        assert!(
+            size <= budget,
+            "a shaped result must fit the budget, got {size} bytes against {budget}"
+        );
+        // ...and the bulky field really was preserved, not dropped to make it fit.
+        assert_eq!(r["_meta"]["com.example/ctx"].as_str().map(str::len), Some(2_000));
+    }
+
+    #[test]
     fn shaping_preserves_meta_and_unknown_envelope_fields() {
         // Shaping truncates the BODY. Everything else in the envelope belongs to
         // the downstream server: `_meta`, and whatever a future revision or
