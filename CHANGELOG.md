@@ -4,6 +4,16 @@ All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 Entries before the rename below shipped under the project's former name, Conduit.
 
+## [Unreleased]
+
+### Added
+
+- **Kilo Code** is detected and configured, bringing the client count to 28. It
+  uses the same top-level `mcp` shape as OpenCode, so it reuses that adapter
+  rather than adding a parallel one, and `kilo.jsonc` is treated as whole-app
+  state: an unparseable file errors instead of being replaced, since it holds
+  much more than MCP servers. (#553)
+
 ## [1.10.0] - 2026-07-29
 
 Toolport speaks the current MCP revision, stale gateways actually stop after an
