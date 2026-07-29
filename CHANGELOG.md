@@ -38,6 +38,12 @@ that was already running when you upgraded will respawn the old binary even thou
 Toolport has re-pointed its config. Restart the client app itself to pick up the new
 gateway. Clients started after the upgrade are unaffected.
 
+**Toolport now names the apps you need to restart.** Rather than leaving that as a note
+in the release, it checks after the reaper has run: any obsolete gateway still standing
+is one a client has already relaunched from its cached command, so no further stopping
+will help. Toolport resolves which application spawned it and reports that, once per
+app rather than once per respawn. (SOU-435)
+
 **The Shared HTTP bridge comes back after the reaper stops it.** Reaping a bridge whose
 binary was replaced left HTTP and OpenAPI clients with nothing listening until someone
 reopened Settings.

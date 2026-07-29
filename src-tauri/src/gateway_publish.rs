@@ -177,6 +177,23 @@ pub struct GatewayProcess {
     pub path: Option<PathBuf>,
     /// Process image basename, e.g. `toolport-gateway-1.9.4.exe` or `toolport-gateway`.
     pub basename: String,
+    /// The process that spawned this gateway, when it could be resolved.
+    ///
+    /// Never used for the keep/kill decision, only to name the application a user
+    /// has to restart (SOU-435). An MCP client reads its config once at its own
+    /// startup and caches the spawn command, so a client running since before an
+    /// upgrade relaunches the old versioned path forever. Killing that gateway
+    /// just makes the same client respawn the same obsolete binary.
+    pub parent: Option<ParentProcess>,
+}
+
+/// The process that spawned a gateway. Identity only, no path: this exists to put
+/// a name in front of the user ("restart Claude"), not to make any decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentProcess {
+    pub pid: u32,
+    /// Process image basename, e.g. `claude.exe`, `grok.exe`, `Code`.
+    pub basename: String,
 }
 
 /// Inputs for the pure keep/kill decision. Built at the call site so tests do not
@@ -305,23 +322,29 @@ fn basename_from_exe_link(path: &Path) -> String {
         .unwrap_or_else(|| cleaned.to_string())
 }
 
-/// Parse one line of `ps -ax -o pid= -o ucomm=` (or `comm=`) into `(pid, name)`.
+/// Parse one line of `ps -ax -o pid= -o ppid= -o ucomm=` into `(pid, ppid, name)`.
+///
 /// Pure helper for the macOS enumerator line format. Does **not** prove the `ps`
 /// argv itself is correct — a broken `-axo pid= comm=` still needs a macOS
 /// smoke / CI job (WS4-1 / WS4-8).
+///
+/// `ppid` is carried so a gateway can name the client that spawned it without a
+/// second `ps` (SOU-435). Both numeric fields are taken positionally and the rest
+/// of the line is the name, so a process name containing spaces still parses.
 #[cfg(any(target_os = "macos", test))]
-fn parse_ps_pid_name_line(line: &str) -> Option<(u32, String)> {
+fn parse_ps_pid_ppid_name_line(line: &str) -> Option<(u32, u32, String)> {
     let line = line.trim();
     if line.is_empty() {
         return None;
     }
     let mut parts = line.split_whitespace();
     let pid = parts.next()?.parse().ok()?;
+    let ppid = parts.next()?.parse().ok()?;
     let name = parts.collect::<Vec<_>>().join(" ");
     if name.is_empty() {
         return None;
     }
-    Some((pid, name))
+    Some((pid, ppid, name))
 }
 
 /// True only for names like `toolport-gateway-1.9.4`, not `toolport-gateway-shim`.
@@ -442,6 +465,64 @@ pub fn decide_reap(proc: &GatewayProcess, ctx: &ReapContext) -> ReapDecision {
     ReapDecision::Keep
 }
 
+/// An application that keeps relaunching an obsolete gateway and therefore has to
+/// be restarted by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientNeedingRestart {
+    /// Basename of the client application, e.g. `claude.exe`.
+    pub client: String,
+    /// The obsolete gateway image it relaunched, e.g. `toolport-gateway-1.9.4.exe`.
+    pub gateway: String,
+}
+
+/// Is `basename` one of our own processes rather than a third-party MCP client?
+///
+/// The supervised HTTP bridge is spawned by the Toolport app itself, so it would
+/// otherwise be reported as a client the user must restart.
+fn is_our_own_process(basename: &str) -> bool {
+    let lower = basename.to_ascii_lowercase();
+    lower.starts_with("toolport") || lower.starts_with("conduit")
+}
+
+/// Clients still relaunching an obsolete gateway *after* a reaper pass has run.
+///
+/// The reaper stops obsolete gateways, but it cannot make a client pick up new
+/// code: the spawn command was cached when that client started, and the versioned
+/// filename scheme means the path it cached will never contain anything newer. So
+/// a gateway the reaper would still call `Kill` on, seen after the reap, is not a
+/// process that survived - it is one a client has already relaunched, and it will
+/// keep coming back until that application restarts (SOU-435).
+///
+/// Deduplicated per (client, gateway) so one entry per app the user has to act on,
+/// not one per respawn. Pure so the grouping is testable without a process table.
+pub fn clients_needing_restart(
+    procs: &[GatewayProcess],
+    ctx: &ReapContext,
+) -> Vec<ClientNeedingRestart> {
+    let mut out: Vec<ClientNeedingRestart> = Vec::new();
+    for proc in procs {
+        if decide_reap(proc, ctx) != ReapDecision::Kill {
+            continue;
+        }
+        // No parent means no name to show. Staying silent beats telling someone to
+        // restart "something".
+        let Some(parent) = proc.parent.as_ref() else {
+            continue;
+        };
+        if is_our_own_process(&parent.basename) {
+            continue;
+        }
+        let advice = ClientNeedingRestart {
+            client: parent.basename.clone(),
+            gateway: proc.basename.clone(),
+        };
+        if !out.contains(&advice) {
+            out.push(advice);
+        }
+    }
+    out
+}
+
 fn label_process(proc: &GatewayProcess) -> String {
     match &proc.path {
         Some(p) => format!("{} (pid {} @ {})", proc.basename, proc.pid, p.display()),
@@ -547,6 +628,27 @@ pub fn stop_stale_gateways_with_keep(extra_keep: &[PathBuf]) -> Vec<String> {
     report.killed_labels()
 }
 
+/// Applications that will keep relaunching an obsolete gateway until restarted.
+///
+/// Call this AFTER a reap pass. Anything it returns has already survived one, so
+/// it is a client relaunching from a cached spawn command rather than a process
+/// the reaper missed (SOU-435).
+pub fn clients_needing_gateway_restart(extra_keep: &[PathBuf]) -> Vec<ClientNeedingRestart> {
+    let mut keep = default_keep_paths();
+    for p in extra_keep {
+        if !keep.iter().any(|e| paths_equal(e, p)) {
+            keep.push(p.clone());
+        }
+    }
+    let ctx = ReapContext {
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        keep_paths: keep,
+        keep_pids: vec![std::process::id()],
+        kill_all: false,
+    };
+    clients_needing_restart(&list_gateway_processes(), &ctx)
+}
+
 // ----- OS process list / kill ------------------------------------------------
 
 #[cfg(windows)]
@@ -589,18 +691,26 @@ fn windows_list_gateway_processes() -> Vec<GatewayProcess> {
         }
         let mut entry: PROCESSENTRY32W = zeroed();
         entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
-        let mut out = Vec::new();
+        let mut out: Vec<(GatewayProcess, u32)> = Vec::new();
+        // Every pid in the snapshot, so a parent can be named without a second
+        // pass over the process table or an OpenProcess on a foreign app.
+        let mut names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
         if Process32FirstW(snap, &mut entry) != 0 {
             loop {
                 let basename = widestr_to_string(&entry.szExeFile);
+                let pid = entry.th32ProcessID;
+                names.insert(pid, basename.clone());
                 if is_gateway_basename(&basename) {
-                    let pid = entry.th32ProcessID;
                     let path = windows_process_path(pid);
-                    out.push(GatewayProcess {
-                        pid,
-                        path,
-                        basename,
-                    });
+                    out.push((
+                        GatewayProcess {
+                            pid,
+                            path,
+                            basename,
+                            parent: None,
+                        },
+                        entry.th32ParentProcessID,
+                    ));
                 }
                 if Process32NextW(snap, &mut entry) == 0 {
                     break;
@@ -608,7 +718,17 @@ fn windows_list_gateway_processes() -> Vec<GatewayProcess> {
             }
         }
         CloseHandle(snap);
-        out
+        // Resolve after the walk: a parent can appear later in the snapshot than
+        // its child, so this cannot be done inline.
+        out.into_iter()
+            .map(|(mut proc, ppid)| {
+                proc.parent = names.get(&ppid).map(|basename| ParentProcess {
+                    pid: ppid,
+                    basename: basename.clone(),
+                });
+                proc
+            })
+            .collect()
     }
 }
 
@@ -713,6 +833,7 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
                 pid,
                 path: exe,
                 basename: exe_base,
+                parent: linux_parent_of(pid),
             });
             continue;
         }
@@ -721,9 +842,42 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
             pid,
             path,
             basename,
+            parent: linux_parent_of(pid),
         });
     }
     out
+}
+
+/// Parent identity from `/proc/<pid>/status` + `/proc/<ppid>/comm` (SOU-435).
+///
+/// `status` rather than `stat`: `stat` puts `comm` in parentheses as field 2 and a
+/// process name may itself contain `) `, so positional parsing of that file is not
+/// safe. `status` is line-oriented and `PPid:` is unambiguous.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_parent_of(pid: u32) -> Option<ParentProcess> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let ppid: u32 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))?
+        .trim()
+        .parse()
+        .ok()?;
+    // pid 0 is the kernel scheduler, never an application to restart.
+    if ppid == 0 {
+        return None;
+    }
+    // `comm` is truncated to 15 chars, which is fine for a display name.
+    let basename = std::fs::read_to_string(format!("/proc/{ppid}/comm"))
+        .ok()?
+        .trim()
+        .to_string();
+    if basename.is_empty() {
+        return None;
+    }
+    Some(ParentProcess {
+        pid: ppid,
+        basename,
+    })
 }
 
 /// macOS: `ps` for pid + accounting name (`ucomm`), then `proc_pidpath` for the
@@ -733,7 +887,7 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
 #[cfg(target_os = "macos")]
 fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
     let Ok(out) = std::process::Command::new("ps")
-        .args(["-ax", "-o", "pid=", "-o", "ucomm="])
+        .args(["-ax", "-o", "pid=", "-o", "ppid=", "-o", "ucomm="])
         .output()
     else {
         return Vec::new();
@@ -749,28 +903,45 @@ fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
         return Vec::new();
     }
     let text = String::from_utf8_lossy(&out.stdout);
+    // One pass over the whole table: `-ax` already lists every process, so the
+    // parent's name is here and needs no second `ps` (SOU-435).
+    let rows: Vec<(u32, u32, String)> = text
+        .lines()
+        .filter_map(parse_ps_pid_ppid_name_line)
+        .collect();
+    let names: std::collections::HashMap<u32, &str> = rows
+        .iter()
+        .map(|(pid, _, ucomm)| (*pid, ucomm.as_str()))
+        .collect();
+
     let mut procs = Vec::new();
-    for line in text.lines() {
-        let Some((pid, ucomm)) = parse_ps_pid_name_line(line) else {
-            continue;
-        };
+    for (pid, ppid, ucomm) in &rows {
         // ucomm is the accounting basename; filter before the more expensive path lookup.
-        if !is_gateway_basename(&ucomm) {
+        if !is_gateway_basename(ucomm) {
             continue;
         }
-        let path = macos_proc_pidpath(pid);
+        let path = macos_proc_pidpath(*pid);
         let basename = path
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or(ucomm);
+            .unwrap_or_else(|| ucomm.clone());
         if !is_gateway_basename(&basename) {
             continue;
         }
+        // pid 1 is launchd, never an application a user can restart.
+        let parent = (*ppid > 1)
+            .then(|| names.get(ppid))
+            .flatten()
+            .map(|name| ParentProcess {
+                pid: *ppid,
+                basename: (*name).to_string(),
+            });
         procs.push(GatewayProcess {
-            pid,
+            pid: *pid,
             path,
             basename,
+            parent,
         });
     }
     procs
@@ -878,6 +1049,23 @@ mod tests {
             pid,
             basename: basename.into(),
             path: path.map(PathBuf::from),
+            parent: None,
+        }
+    }
+
+    /// Same, but spawned by a named client (SOU-435).
+    fn proc_from(
+        pid: u32,
+        basename: &str,
+        path: Option<&str>,
+        parent: (u32, &str),
+    ) -> GatewayProcess {
+        GatewayProcess {
+            parent: Some(ParentProcess {
+                pid: parent.0,
+                basename: parent.1.into(),
+            }),
+            ..proc(pid, basename, path)
         }
     }
 
@@ -1164,6 +1352,7 @@ mod tests {
                     pid: 1,
                     path: Some(keep),
                     basename: "toolport-gateway".into(),
+                    parent: None,
                 },
                 &c
             ),
@@ -1176,6 +1365,7 @@ mod tests {
                     pid: 2,
                     path: Some(deleted),
                     basename: "toolport-gateway".into(),
+                    parent: None,
                 },
                 &c
             ),
@@ -1186,25 +1376,116 @@ mod tests {
     /// WS4-1 / WS4-8: pure parse of `ps -o pid= -o ucomm=` lines (including padded pid).
     /// Does not prove the `ps` argv itself — that still needs a macOS smoke.
     #[test]
-    fn parse_ps_pid_name_line_accepts_padded_pid_and_ucomm() {
+    fn clients_needing_restart_names_the_app_behind_a_respawned_gateway() {
+        // The whole point of SOU-435: the reaper killed these, the client
+        // relaunched them from a cached command, and no amount of reaping fixes
+        // that. The user has to restart the app, so we have to name it.
+        let c = ctx("1.9.7", &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.7.exe"], false);
+        let procs = vec![
+            proc_from(
+                101,
+                "toolport-gateway-1.9.4.exe",
+                Some(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.4.exe"),
+                (900, "grok.exe"),
+            ),
+            proc_from(
+                102,
+                "toolport-gateway-1.9.6.exe",
+                Some(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.6.exe"),
+                (901, "claude.exe"),
+            ),
+        ];
+        let advice = clients_needing_restart(&procs, &c);
         assert_eq!(
-            parse_ps_pid_name_line("  123 toolport-gateway"),
-            Some((123, "toolport-gateway".into()))
+            advice,
+            vec![
+                ClientNeedingRestart {
+                    client: "grok.exe".into(),
+                    gateway: "toolport-gateway-1.9.4.exe".into()
+                },
+                ClientNeedingRestart {
+                    client: "claude.exe".into(),
+                    gateway: "toolport-gateway-1.9.6.exe".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn clients_needing_restart_ignores_current_and_unattributable_gateways() {
+        let keep = r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.7.exe";
+        let c = ctx("1.9.7", &[keep], false);
+
+        // A gateway on the CURRENT version is not stale, so its client is fine.
+        let current = proc_from(200, "toolport-gateway-1.9.7.exe", Some(keep), (900, "claude.exe"));
+        assert!(clients_needing_restart(&[current], &c).is_empty());
+
+        // Stale but no resolvable parent: telling someone to restart "something"
+        // is worse than staying quiet.
+        let orphan = proc(
+            201,
+            "toolport-gateway-1.9.4.exe",
+            Some(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.4.exe"),
+        );
+        assert!(clients_needing_restart(&[orphan], &c).is_empty());
+
+        // Spawned by the Toolport app itself (the supervised HTTP bridge), which
+        // the user cannot act on and should never be told to restart.
+        let ours = proc_from(
+            202,
+            "toolport-gateway-1.9.4.exe",
+            Some(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.4.exe"),
+            (903, "Toolport.exe"),
+        );
+        assert!(clients_needing_restart(&[ours], &c).is_empty());
+    }
+
+    #[test]
+    fn clients_needing_restart_reports_one_entry_per_app_not_per_respawn() {
+        // A client that has been restarting its gateway in a loop produces many
+        // processes. The user still only needs to be told once.
+        let c = ctx("1.9.7", &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.7.exe"], false);
+        let stale = r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.4.exe";
+        let procs = vec![
+            proc_from(301, "toolport-gateway-1.9.4.exe", Some(stale), (900, "grok.exe")),
+            proc_from(302, "toolport-gateway-1.9.4.exe", Some(stale), (900, "grok.exe")),
+            proc_from(303, "toolport-gateway-1.9.4.exe", Some(stale), (900, "grok.exe")),
+        ];
+        assert_eq!(clients_needing_restart(&procs, &c).len(), 1);
+    }
+
+    #[test]
+    fn parse_ps_pid_ppid_name_line_accepts_padded_columns_and_ucomm() {
+        assert_eq!(
+            parse_ps_pid_ppid_name_line("  123   1 toolport-gateway"),
+            Some((123, 1, "toolport-gateway".into()))
         );
         assert_eq!(
-            parse_ps_pid_name_line("45678 toolport-gateway-1.9.4"),
-            Some((45678, "toolport-gateway-1.9.4".into()))
+            parse_ps_pid_ppid_name_line("45678 4321 toolport-gateway-1.9.4"),
+            Some((45678, 4321, "toolport-gateway-1.9.4".into()))
         );
-        assert_eq!(parse_ps_pid_name_line(""), None);
-        assert_eq!(parse_ps_pid_name_line("not-a-pid toolport-gateway"), None);
-        assert_eq!(parse_ps_pid_name_line("99"), None);
+        assert_eq!(parse_ps_pid_ppid_name_line(""), None);
+        assert_eq!(parse_ps_pid_ppid_name_line("not-a-pid 1 toolport-gateway"), None);
+        // A missing ppid column must not be read as the name, which is how a
+        // wrong `-o` argv would silently produce nonsense parents (SOU-435).
+        assert_eq!(parse_ps_pid_ppid_name_line("99 toolport-gateway"), None);
+        assert_eq!(parse_ps_pid_ppid_name_line("99 1"), None);
+        assert_eq!(parse_ps_pid_ppid_name_line("99"), None);
         // Full-path comm= style still parses; basename filter is applied by the caller.
         assert_eq!(
-            parse_ps_pid_name_line("  42 /Applications/Toolport.app/Contents/MacOS/toolport-gateway"),
+            parse_ps_pid_ppid_name_line(
+                "  42 7 /Applications/Toolport.app/Contents/MacOS/toolport-gateway"
+            ),
             Some((
                 42,
+                7,
                 "/Applications/Toolport.app/Contents/MacOS/toolport-gateway".into()
             ))
+        );
+        // A name with spaces survives, since only the first two columns are positional.
+        assert_eq!(
+            parse_ps_pid_ppid_name_line("5 2 Some App Helper"),
+            Some((5, 2, "Some App Helper".into()))
         );
     }
 

@@ -3363,11 +3363,19 @@ pub fn run() {
                         repoint.customized.join(", ")
                     );
                 }
-                // Stop obsolete gateway processes so each client respawns the current binary
-                // on its next MCP request (no full agent restart required when the host
-                // auto-respawns). Path-based identity on all OS (SOU-414); not gated on
-                // repoint (SOU-306). Pass resolve_gateway_path so the nested macOS helper /
-                // AppImage stable path is kept even when publish is Windows-only.
+                // Stop obsolete gateway processes. Path-based identity on all OS
+                // (SOU-414); not gated on repoint (SOU-306). Pass resolve_gateway_path so
+                // the nested macOS helper / AppImage stable path is kept even when publish
+                // is Windows-only.
+                //
+                // This does NOT deliver new gateway code to a client that is already
+                // running. An MCP client reads its config once at its own startup and
+                // caches the spawn command, and the versioned filename scheme means the
+                // path it cached will never contain anything newer, so killing that
+                // gateway just makes the same client relaunch the same obsolete binary.
+                // Reaping still earns its keep on genuinely orphaned processes and on any
+                // client started after the repoint; everything else needs the application
+                // restarted, which is why the delayed pass below reports who (SOU-435).
                 //
                 // Run once immediately, then again after a short delay so a client that
                 // race-respawns an old path between repoint and the first kill is cleaned up
@@ -3395,6 +3403,30 @@ pub fn run() {
                             again.len(),
                             again.join("; ")
                         );
+                    }
+                    // Anything obsolete still standing after two passes is being
+                    // relaunched from a cached spawn command, so no further reaping
+                    // will help. Name the applications instead (SOU-435).
+                    let keep = clients::resolve_gateway_path()
+                        .map(|p| vec![p])
+                        .unwrap_or_default();
+                    let restart = crate::gateway_publish::clients_needing_gateway_restart(&keep);
+                    if !restart.is_empty() {
+                        eprintln!(
+                            "toolport: {} app(s) are still launching an obsolete gateway and \
+                             need restarting: {}",
+                            restart.len(),
+                            restart
+                                .iter()
+                                .map(|r| format!("{} ({})", r.client, r.gateway))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        );
+                        let payload: Vec<serde_json::Value> = restart
+                            .iter()
+                            .map(|r| serde_json::json!({ "client": r.client, "gateway": r.gateway }))
+                            .collect();
+                        let _ = migrate_handle.emit("gateway-restart-needed", payload);
                     }
                 });
             });
