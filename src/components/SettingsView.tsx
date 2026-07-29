@@ -593,6 +593,16 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
       .catch(() => {});
   }, []);
 
+  // Populate on mount rather than only after the button is pressed. The launch
+  // toast is fire-and-forget and Tauri does not replay events, so a webview that
+  // mounts late (hidden autostart on a loaded machine) never sees it; without
+  // this, that information is lost for the whole session (#542 review).
+  useEffect(() => {
+    clientsNeedingRestart()
+      .then(setNeedRestart)
+      .catch(() => {});
+  }, []);
+
   const toggleAutostart = async (on: boolean) => {
     setBusy(true);
     try {
@@ -1275,10 +1285,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             <span className="flex min-w-0 flex-1 flex-col leading-tight">
               <span className="font-medium">Stop old gateways</span>
               <span className="text-xs text-muted-foreground">
-                End leftover gateway processes from earlier installs. An app that was
-                already running caches the gateway command when it starts, so it
-                relaunches the old one until you restart the app itself. Toolport lists
-                any below.
+                End leftover gateway processes from earlier installs. Most hosts respawn
+                MCP and pick up the current binary on the next tool call. On Windows the
+                gateway filename carries its version, so an app that was already running
+                keeps launching the old one until you restart that app.
               </span>
             </span>
             <button
@@ -1287,7 +1297,14 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               onClick={async () => {
                 setReapBusy(true);
                 setReapResult(null);
-                setNeedRestart([]);
+                try {
+                  // Sample BEFORE stopping anything: reaping clears the very
+                  // processes this reads, so asking afterwards reported nothing
+                  // in the case it exists for (#542 review).
+                  setNeedRestart(await clientsNeedingRestart());
+                } catch {
+                  // Advisory only. A failure here must not mask the reap result.
+                }
                 try {
                   const stopped = await stopStaleGateways();
                   setReapResult(
@@ -1295,9 +1312,6 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                       ? "No old gateway processes found."
                       : `Stopped ${stopped.length}: ${stopped.join("; ")}`,
                   );
-                  // Only meaningful after the reap: whatever is still on an old
-                  // binary now has been relaunched, not missed.
-                  setNeedRestart(await clientsNeedingRestart());
                 } catch (e) {
                   toastError(`Couldn't stop old gateways: ${e}`);
                 } finally {

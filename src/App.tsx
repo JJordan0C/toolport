@@ -288,10 +288,13 @@ function App() {
       (event) => {
         const apps = event.payload ?? [];
         if (apps.length === 0) return;
-        const names = apps.map((a) => a.client).join(", ");
+        // One app can appear more than once, since the backend keys on
+        // (client, gateway) and two windows started either side of different
+        // upgrades yield two rows. Name it once (#542 review).
+        const names = [...new Set(apps.map((a) => a.client))];
         toast.warning(
-          `Restart ${names} to finish upgrading. ${
-            apps.length === 1 ? "It is" : "They are"
+          `Restart ${names.join(", ")} to finish upgrading. ${
+            names.length === 1 ? "It is" : "They are"
           } still launching an older gateway.`,
           { duration: 10_000 },
         );

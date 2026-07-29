@@ -379,12 +379,16 @@ export type ClientNeedingRestart = {
 };
 
 /**
- * Apps still launching an obsolete gateway. Stopping those processes cannot fix
- * this: a client caches the spawn command at its own startup, so it relaunches
- * the same old binary until the app itself is restarted.
+ * Apps launching an obsolete gateway that only restarting them can fix.
  *
- * Call after {@link stopStaleGateways} — anything returned has already survived a
- * reap, so it is a relaunch rather than a process that was missed.
+ * Every result names a versioned gateway image, whose path can never hold newer
+ * code, so a client that cached it relaunches the same binary forever. That is the
+ * Windows publish scheme; elsewhere the gateway path is stable and replaced in
+ * place, so a cached command picks up the new binary on its own and nothing is
+ * reported.
+ *
+ * Call BEFORE {@link stopStaleGateways}, not after. Reaping clears the processes
+ * this reads, so sampling afterwards reports nothing in the case it exists for.
  */
 export function clientsNeedingRestart(): Promise<ClientNeedingRestart[]> {
   return invoke<ClientNeedingRestart[]>("clients_needing_restart");

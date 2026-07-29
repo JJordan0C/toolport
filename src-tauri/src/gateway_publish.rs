@@ -181,9 +181,9 @@ pub struct GatewayProcess {
     ///
     /// Never used for the keep/kill decision, only to name the application a user
     /// has to restart (SOU-435). An MCP client reads its config once at its own
-    /// startup and caches the spawn command, so a client running since before an
-    /// upgrade relaunches the old versioned path forever. Killing that gateway
-    /// just makes the same client respawn the same obsolete binary.
+    /// startup and caches the spawn command; whether that traps it on old code
+    /// depends on the filename, so see [`clients_needing_restart`] rather than
+    /// assuming it always does.
     pub parent: Option<ParentProcess>,
 }
 
@@ -485,14 +485,40 @@ fn is_our_own_process(basename: &str) -> bool {
     lower.starts_with("toolport") || lower.starts_with("conduit")
 }
 
-/// Clients still relaunching an obsolete gateway *after* a reaper pass has run.
+/// Is this "parent" the init system or the kernel rather than an application?
 ///
-/// The reaper stops obsolete gateways, but it cannot make a client pick up new
-/// code: the spawn command was cached when that client started, and the versioned
-/// filename scheme means the path it cached will never contain anything newer. So
-/// a gateway the reaper would still call `Kill` on, seen after the reap, is not a
-/// process that survived - it is one a client has already relaunched, and it will
-/// keep coming back until that application restarts (SOU-435).
+/// An orphaned gateway is reparented to pid 1 on Unix, and Windows reports pid 0 /
+/// pid 4 for its kernel processes. None of them is something a user can restart,
+/// and each platform previously guarded a different subset of these, so the same
+/// orphan produced "restart systemd" on Linux and nothing on macOS. Name-matched
+/// as well as pid-matched because a systemd *user* session is a child subreaper
+/// with a pid of its own (#542 review).
+fn is_init_like(parent: &ParentProcess) -> bool {
+    if parent.pid <= 1 || parent.pid == 4 {
+        return true;
+    }
+    let lower = parent.basename.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "systemd" | "init" | "launchd" | "system" | "[system process]"
+    )
+}
+
+/// Applications running an obsolete gateway they will relaunch from a cached path.
+///
+/// An MCP client reads its config once at its own startup and caches the spawn
+/// command. Whether that matters depends on the filename it cached:
+///
+/// * A **versioned** image (`toolport-gateway-1.9.4.exe`) names a path whose
+///   contents never change, so the client relaunches obsolete code forever and
+///   only restarting the application fixes it. This is the Windows publish scheme,
+///   which exists to dodge the Windows file lock.
+/// * An **unversioned** image is replaced in place on upgrade, so the very same
+///   cached path yields the new binary on the next spawn. Nothing to advise. This
+///   is macOS and Linux, where `should_publish_client_gateway` is always false.
+///
+/// Keying on the image rather than on `cfg!(windows)` states the actual mechanism,
+/// and stays correct if the publish scheme ever moves platforms (#542 review).
 ///
 /// Deduplicated per (client, gateway) so one entry per app the user has to act on,
 /// not one per respawn. Pure so the grouping is testable without a process table.
@@ -505,12 +531,24 @@ pub fn clients_needing_restart(
         if decide_reap(proc, ctx) != ReapDecision::Kill {
             continue;
         }
+        // A path we could not read means a process we could not inspect - a
+        // foreign user's session, or one whose ACL denied us. `decide_reap` still
+        // reaches Kill there via the basename-only fallback, but that path skips
+        // the `path_looks_like_our_install` guard, and we cannot stop the process
+        // either. Advising a restart for someone else's app is worse than silence.
+        if proc.path.is_none() {
+            continue;
+        }
+        // Unversioned images self-heal on the next spawn; see above.
+        if !is_versioned_gateway_basename(&proc.basename) {
+            continue;
+        }
         // No parent means no name to show. Staying silent beats telling someone to
         // restart "something".
         let Some(parent) = proc.parent.as_ref() else {
             continue;
         };
-        if is_our_own_process(&parent.basename) {
+        if is_our_own_process(&parent.basename) || is_init_like(parent) {
             continue;
         }
         let advice = ClientNeedingRestart {
@@ -612,42 +650,47 @@ pub fn stop_stale_gateways() -> Vec<String> {
 /// Like [`stop_stale_gateways`], with extra keep-paths (e.g. nested macOS helper
 /// from `clients::resolve_gateway_path`).
 pub fn stop_stale_gateways_with_keep(extra_keep: &[PathBuf]) -> Vec<String> {
-    let mut keep = default_keep_paths();
-    for p in extra_keep {
-        if !keep.iter().any(|e| paths_equal(e, p)) {
-            keep.push(p.clone());
-        }
-    }
-    let ctx = ReapContext {
-        current_version: env!("CARGO_PKG_VERSION").to_string(),
-        keep_paths: keep,
-        keep_pids: vec![std::process::id()],
-        kill_all: false,
-    };
+    let ctx = stale_reap_context(extra_keep);
     let report = reap_with_context(&ctx);
     log_reap_report("stale reaper", &report);
     report.killed_labels()
 }
 
-/// Applications that will keep relaunching an obsolete gateway until restarted.
+/// The one `ReapContext` both the reaper and the restart report are built from.
 ///
-/// Call this AFTER a reap pass. Anything it returns has already survived one, so
-/// it is a client relaunching from a cached spawn command rather than a process
-/// the reaper missed (SOU-435).
-pub fn clients_needing_gateway_restart(extra_keep: &[PathBuf]) -> Vec<ClientNeedingRestart> {
+/// Shared deliberately: they were byte-identical copies, and a keep rule added to
+/// one would have made the restart panel name apps whose gateway the reaper is
+/// intentionally keeping - wrong advice with no compiler signal (#542 review).
+fn stale_reap_context(extra_keep: &[PathBuf]) -> ReapContext {
     let mut keep = default_keep_paths();
     for p in extra_keep {
         if !keep.iter().any(|e| paths_equal(e, p)) {
             keep.push(p.clone());
         }
     }
-    let ctx = ReapContext {
+    ReapContext {
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         keep_paths: keep,
         keep_pids: vec![std::process::id()],
         kill_all: false,
-    };
-    clients_needing_restart(&list_gateway_processes(), &ctx)
+    }
+}
+
+/// Applications that will keep relaunching an obsolete gateway until restarted.
+///
+/// Call this BEFORE reaping, not after. `reap_with_context` kills, waits, and then
+/// re-kills anything still stale, so immediately afterwards the table it would
+/// read has just been cleared. A client's respawn takes far longer than that
+/// window, so the report came back empty in exactly the case it exists for, and
+/// was non-empty mainly when a kill had FAILED - which is a permissions problem,
+/// not a cached-command one, and would have produced the opposite advice
+/// (#542 review).
+///
+/// Read before the reap the signal is unambiguous: an obsolete versioned gateway
+/// with a live parent is an application currently running old code, whether or not
+/// stopping the process happens to succeed a moment later.
+pub fn clients_needing_gateway_restart(extra_keep: &[PathBuf]) -> Vec<ClientNeedingRestart> {
+    clients_needing_restart(&list_gateway_processes(), &stale_reap_context(extra_keep))
 }
 
 // ----- OS process list / kill ------------------------------------------------
@@ -723,13 +766,70 @@ fn windows_list_gateway_processes() -> Vec<GatewayProcess> {
         // its child, so this cannot be done inline.
         out.into_iter()
             .map(|(mut proc, ppid)| {
-                proc.parent = names.get(&ppid).map(|basename| ParentProcess {
-                    pid: ppid,
-                    basename: basename.clone(),
-                });
+                proc.parent = names
+                    .get(&ppid)
+                    .filter(|_| windows_parent_predates_child(ppid, proc.pid))
+                    .map(|basename| ParentProcess {
+                        pid: ppid,
+                        basename: basename.clone(),
+                    });
                 proc
             })
             .collect()
+    }
+}
+
+/// Guard against a recycled parent pid naming an unrelated application.
+///
+/// Unlike Unix, Windows never reparents an orphan and never clears the dead
+/// parent's pid from the child, so `th32ParentProcessID` dangles once the parent
+/// exits - and orphaned gateways are exactly the population the reaper exists to
+/// clean up. Windows then recycles pids freely, so the dangling value can point at
+/// something started later, and the user is told to restart an app that never
+/// spawned a gateway (#542 review).
+///
+/// A real parent always starts before its child. Fails closed: if either creation
+/// time is unreadable we drop the attribution rather than guess, because a wrong
+/// app name is worse than none.
+#[cfg(windows)]
+fn windows_parent_predates_child(ppid: u32, child_pid: u32) -> bool {
+    match (
+        windows_process_start_time(ppid),
+        windows_process_start_time(child_pid),
+    ) {
+        (Some(parent), Some(child)) => parent <= child,
+        _ => false,
+    }
+}
+
+/// Process creation time as a raw FILETIME tick count, for ordering only.
+#[cfg(windows)]
+fn windows_process_start_time(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut created: FILETIME = std::mem::zeroed();
+        let mut exited: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        let ok = GetProcessTimes(
+            handle,
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        );
+        CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        Some(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
     }
 }
 
@@ -1418,7 +1518,15 @@ mod tests {
         let c = ctx("1.9.7", &[keep], false);
 
         // A gateway on the CURRENT version is not stale, so its client is fine.
-        let current = proc_from(200, "toolport-gateway-1.9.7.exe", Some(keep), (900, "claude.exe"));
+        // Deliberately at a DIFFERENT path from the keep path: passing `keep` here
+        // exits `decide_reap` at the keep-paths check, so the version comparison
+        // this test is named for never ran (#542 review).
+        let current = proc_from(
+            200,
+            "toolport-gateway-1.9.7.exe",
+            Some(r"D:\elsewhere\Toolport\bin\toolport-gateway-1.9.7.exe"),
+            (900, "claude.exe"),
+        );
         assert!(clients_needing_restart(&[current], &c).is_empty());
 
         // Stale but no resolvable parent: telling someone to restart "something"
@@ -1439,6 +1547,61 @@ mod tests {
             (903, "Toolport.exe"),
         );
         assert!(clients_needing_restart(&[ours], &c).is_empty());
+    }
+
+    #[test]
+    fn clients_needing_restart_is_silent_where_a_cached_path_self_heals() {
+        // An UNVERSIONED image is replaced in place on upgrade, so the very same
+        // cached command yields the new binary on the next spawn and there is
+        // nothing for the user to do. That is macOS and Linux, where the Windows
+        // versioned-publish scheme never runs. Reporting there would repeat the
+        // false claim SOU-435 was filed against, in the other direction (#542).
+        let c = ctx("1.9.7", &["/Applications/Toolport.app/Contents/MacOS/toolport-gateway"], false);
+        let unversioned = proc_from(
+            400,
+            "toolport-gateway",
+            Some("/Applications/Toolport.app/Contents/Helpers/old/toolport-gateway"),
+            (900, "Claude"),
+        );
+        // The reaper still stops it; only the ADVICE is withheld.
+        assert_eq!(decide_reap(&unversioned, &c), ReapDecision::Kill);
+        assert!(clients_needing_restart(&[unversioned], &c).is_empty());
+    }
+
+    #[test]
+    fn clients_needing_restart_never_names_init_or_an_uninspectable_process() {
+        let keep = r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.7.exe";
+        let c = ctx("1.9.7", &[keep], false);
+        let stale = r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.4.exe";
+
+        // Orphans reparent to init. Each platform previously guarded a different
+        // subset of these, so the same orphan said "restart systemd" on Linux and
+        // nothing on macOS. A systemd *user* session has a pid of its own, which
+        // is why the name is matched too (#542 review).
+        for parent in [(1u32, "systemd"), (1, "launchd"), (0, "[System Process]"), (4, "System")] {
+            let orphan = proc_from(410, "toolport-gateway-1.9.4.exe", Some(stale), parent);
+            assert!(
+                clients_needing_restart(&[orphan], &c).is_empty(),
+                "{} must never be named as an app to restart",
+                parent.1
+            );
+        }
+        // A systemd user session: pid is ordinary, only the name gives it away.
+        let user_session = proc_from(411, "toolport-gateway-1.9.4.exe", Some(stale), (2481, "systemd"));
+        assert!(clients_needing_restart(&[user_session], &c).is_empty());
+
+        // No readable path means a process we could not inspect (another user's
+        // session, or ACL denied). `decide_reap` still reaches Kill via the
+        // basename-only fallback, but we cannot stop it and it is not ours to
+        // advise on.
+        let foreign = GatewayProcess {
+            pid: 412,
+            path: None,
+            basename: "toolport-gateway-1.9.4.exe".into(),
+            parent: Some(ParentProcess { pid: 900, basename: "claude.exe".into() }),
+        };
+        assert_eq!(decide_reap(&foreign, &c), ReapDecision::Kill);
+        assert!(clients_needing_restart(&[foreign], &c).is_empty());
     }
 
     #[test]

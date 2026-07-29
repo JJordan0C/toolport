@@ -2784,12 +2784,14 @@ fn stop_stale_gateways(bridge: State<HttpBridgeState>) -> Vec<String> {
     reap_stale_and_restore_bridge(bridge.inner())
 }
 
-/// Applications still launching an obsolete gateway, which only restarting them
-/// can fix (SOU-435).
+/// Applications launching an obsolete gateway, which only restarting them can fix
+/// (SOU-435).
 ///
-/// Meant to be called AFTER [`stop_stale_gateways`]: anything reported here has
-/// already survived a reap, so it is a client relaunching from a spawn command it
-/// cached at its own startup, not a process the reaper failed to stop.
+/// Safe to call at any time, and specifically NOT dependent on a reap having run:
+/// each result names a versioned gateway image, whose path can never hold newer
+/// code, so the advice holds whether or not that process is stopped. Reading it
+/// *after* a reap is what was wrong, since reaping empties the table this reads
+/// (#542 review).
 #[tauri::command]
 fn clients_needing_restart() -> Vec<crate::gateway_publish::ClientNeedingRestart> {
     let extra_keep = clients::resolve_gateway_path()
@@ -3383,14 +3385,15 @@ pub fn run() {
                 // the nested macOS helper / AppImage stable path is kept even when publish
                 // is Windows-only.
                 //
-                // This does NOT deliver new gateway code to a client that is already
-                // running. An MCP client reads its config once at its own startup and
-                // caches the spawn command, and the versioned filename scheme means the
-                // path it cached will never contain anything newer, so killing that
-                // gateway just makes the same client relaunch the same obsolete binary.
-                // Reaping still earns its keep on genuinely orphaned processes and on any
-                // client started after the repoint; everything else needs the application
-                // restarted, which is why the delayed pass below reports who (SOU-435).
+                // Reaping alone does not always deliver new gateway code. A client reads
+                // its config once at its own startup and caches the spawn command. Where
+                // the gateway path is stable (macOS, Linux) it is replaced in place, so
+                // that cached command yields the new binary on the next spawn and the
+                // reap is sufficient. Where the filename carries the version (the Windows
+                // publish scheme, which exists to dodge the file lock) the cached path can
+                // never hold newer code, so the client relaunches the same obsolete binary
+                // and only restarting that application fixes it. The delayed pass below
+                // reports which apps are in that state (SOU-435).
                 //
                 // Run once immediately, then again after a short delay so a client that
                 // race-respawns an old path between repoint and the first kill is cleaned up
@@ -3409,6 +3412,14 @@ pub fn run() {
                 }
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(3));
+                    // Read BEFORE the second reap. Reaping clears the very table
+                    // this reads, so sampling afterwards reported nothing in the
+                    // case it exists for (SOU-435, #542 review).
+                    let keep = clients::resolve_gateway_path()
+                        .map(|p| vec![p])
+                        .unwrap_or_default();
+                    let restart = crate::gateway_publish::clients_needing_gateway_restart(&keep);
+
                     let again = reap_stale_and_restore_bridge(
                         migrate_handle.state::<HttpBridgeState>().inner(),
                     );
@@ -3419,16 +3430,13 @@ pub fn run() {
                             again.join("; ")
                         );
                     }
-                    // Anything obsolete still standing after two passes is being
-                    // relaunched from a cached spawn command, so no further reaping
-                    // will help. Name the applications instead (SOU-435).
-                    let keep = clients::resolve_gateway_path()
-                        .map(|p| vec![p])
-                        .unwrap_or_default();
-                    let restart = crate::gateway_publish::clients_needing_gateway_restart(&keep);
+
+                    // Stopping these does not help: each names a versioned image, so
+                    // the path the client cached can never hold newer code and it
+                    // relaunches the same binary until the app itself restarts.
                     if !restart.is_empty() {
                         eprintln!(
-                            "toolport: {} app(s) are still launching an obsolete gateway and \
+                            "toolport: {} app(s) are launching an obsolete gateway and \
                              need restarting: {}",
                             restart.len(),
                             restart
@@ -3437,11 +3445,9 @@ pub fn run() {
                                 .collect::<Vec<_>>()
                                 .join("; ")
                         );
-                        let payload: Vec<serde_json::Value> = restart
-                            .iter()
-                            .map(|r| serde_json::json!({ "client": r.client, "gateway": r.gateway }))
-                            .collect();
-                        let _ = migrate_handle.emit("gateway-restart-needed", payload);
+                        // Emit the struct, so its `Serialize` stays the single
+                        // definition of the wire shape (#542 review).
+                        let _ = migrate_handle.emit("gateway-restart-needed", &restart);
                     }
                 });
             });
