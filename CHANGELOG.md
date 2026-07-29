@@ -24,9 +24,9 @@ code-mode hardening.
 
 **Toolport speaks MCP 2026-07-28 over stdio, in both directions.** A client on the
 new revision can talk to Toolport, and Toolport can talk to a server on it, with
-every existing client and server continuing to see byte-identical traffic. Adopting
-a new protocol era normally means picking a side; here both run on the same
-endpoint, detected per connection, with nothing to migrate and nothing to configure.
+every existing client and server continuing to see byte-identical traffic. Both eras
+run on the same stdio endpoint and are detected per connection, so there is nothing
+to migrate and nothing to configure.
 
 Over Streamable HTTP, Toolport stays on the established revision for now. A modern
 client receives exactly the response the spec defines as the fall-back signal, so it
@@ -114,24 +114,21 @@ calls, and a corrupt registry no longer boots with code mode enabled.
 
 ### Thanks
 
-Real thanks to everyone who sent a patch this cycle. Several of these were more
-careful than they needed to be, which showed:
+Patches this cycle came from:
 
-- **[AnayGarodia](https://github.com/AnayGarodia)** for five in one go (#545, #546,
-  #547, #548, #549). The classifier tests hold up under mutation, which is rarer
-  than it should be.
-- **[Vermitrude](https://github.com/Vermitrude)** for the OpenCode/Crush paste
-  disambiguation (#497), and for splitting the remainder out honestly rather than
-  claiming the whole issue.
-- **[snowyukitty](https://github.com/snowyukitty)** for the rate-limit counter fix
-  (#543), including a test guard that cannot pass on a dirty working directory.
-- **[rohankumardubey](https://github.com/rohankumardubey)** for client-migration
-  gateway-filtering coverage (#510).
-- **[cyforkk](https://github.com/cyforkk)** for normalising the error strings (#539).
-- **[HaimiyaWasn](https://github.com/HaimiyaWasn)** for the CONTRIBUTING correction
-  (#540).
+- **[AnayGarodia](https://github.com/AnayGarodia)** - benchmark and security docs, the
+  share-link copy fix, `fmtMs`/`fmtDollars` extraction, and tests for the
+  import-review classifiers (#545, #546, #547, #548, #549).
+- **[Vermitrude](https://github.com/Vermitrude)** - OpenCode/Crush paste
+  disambiguation (#497).
+- **[snowyukitty](https://github.com/snowyukitty)** - keeping unbound rate-limit
+  counters in memory (#543).
+- **[rohankumardubey](https://github.com/rohankumardubey)** - test coverage for
+  gateway filtering during client migration (#510).
+- **[cyforkk](https://github.com/cyforkk)** - normalised the error strings (#539).
+- **[HaimiyaWasn](https://github.com/HaimiyaWasn)** - CONTRIBUTING correction (#540).
 
-If we missed you, open an issue. Credit should follow the work.
+If we missed you, open an issue.
 
 ## [1.9.6] - 2026-07-27
 
