@@ -33,10 +33,14 @@ process listing used an argv that Apple's `ps` rejects, so it saw zero gateways;
 Linux a binary replaced in place is now correctly treated as obsolete rather than
 protected. Settings gains a **Stop old gateways** action. (SOU-414)
 
-Note the limit: an AI client caches the gateway command when **it** starts, so a client
-that was already running when you upgraded will respawn the old binary even though
-Toolport has re-pointed its config. Restart the client app itself to pick up the new
-gateway. Clients started after the upgrade are unaffected.
+Note the limit: an AI client caches the gateway command when **it** starts, so whether
+stopping the old process is enough depends on the path that got cached. Where the binary
+is replaced in place, the same path already resolves to the new one and the next spawn
+picks it up. Where the path is one an upgrade never rewrites, it does not: on Windows the
+filename carries its version (so an upgrade never has to overwrite a locked file), and on
+any OS an app can still be pinned to an install location you have since moved away from.
+In those cases, restart the client app itself. Clients started after the upgrade are
+unaffected.
 
 **The Shared HTTP bridge comes back after the reaper stops it.** Reaping a bridge whose
 binary was replaced left HTTP and OpenAPI clients with nothing listening until someone
