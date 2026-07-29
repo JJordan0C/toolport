@@ -219,7 +219,6 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
     // starting estimate.
     let mut head_byte_limit = budget.saturating_sub(512 + preserved_bytes);
     let head = head_within_bytes(&body, head_byte_limit).to_string();
-    let head_chars = head.chars().count();
     let is_error = result
         .get("isError")
         .and_then(|v| v.as_bool())

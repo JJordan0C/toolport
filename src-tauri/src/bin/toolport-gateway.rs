@@ -5183,6 +5183,10 @@ struct ProgressRoute {
     client_token: Value,
 }
 
+/// Depth of the stdio progress hand-off queue. Bounded so a client that stops
+/// reading costs dropped notifications rather than a stalled drain thread.
+const PROGRESS_STDIO_QUEUE: usize = 256;
+
 /// Source of gateway-minted progress tokens. Process-wide and monotonic, so a
 /// token is never reused while an earlier call is still in flight.
 static PROGRESS_TOKEN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -5293,7 +5297,7 @@ fn prepare_progress(
 /// Deliver one `notifications/progress` to the client that minted its token,
 /// dropping anything unroutable or spoofed (SOU-444).
 fn deliver_progress(
-    stdout: &Arc<Mutex<std::io::Stdout>>,
+    stdio: &std::sync::mpsc::SyncSender<Value>,
     mcp_sessions: &Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
     routes: &Arc<Mutex<ProgressRoutes>>,
     producer: &str,
@@ -5334,10 +5338,15 @@ fn deliver_progress(
     }
     let note = &note;
     if session == RESOURCE_SUB_STDIO {
-        let mut out = stdout
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = write_json_line(&mut *out, note);
+        // Hand off rather than write here. This runs on the downstream drain
+        // thread, BEFORE that thread forwards response lines to the request loop.
+        // A blocking flush to a client that stopped reading would stall the drain,
+        // so the in-flight call never completes while still holding the per-server
+        // slot mutex, wedging that server for every client. Bounded and dropping
+        // when full, exactly as the HTTP session queue already behaves (SOU-474).
+        if stdio.try_send(note.clone()).is_err() {
+            eprintln!("toolport: stdio progress queue full or closed; progress dropped");
+        }
         return;
     }
     let Ok(json) = serde_json::to_string(note) else {
@@ -5364,8 +5373,23 @@ fn make_progress_sink(
     mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
     routes: Arc<Mutex<ProgressRoutes>>,
 ) -> ProgressDispatch {
+    // One writer thread owns the blocking write to the stdio client, fed by a
+    // bounded queue. Delivery runs on the downstream drain thread, which must
+    // never block (see `deliver_progress`).
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Value>(PROGRESS_STDIO_QUEUE);
+    std::thread::spawn(move || {
+        for note in rx {
+            let mut out = stdout
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if write_json_line(&mut *out, &note).is_err() {
+                // The stdio client is gone; nothing further will be readable.
+                break;
+            }
+        }
+    });
     Arc::new(move |producer: String, note: Value| {
-        deliver_progress(&stdout, &mcp_sessions, &routes, &producer, &note);
+        deliver_progress(&tx, &mcp_sessions, &routes, &producer, &note);
     })
 }
 
@@ -7336,7 +7360,23 @@ fn process_request(
         .clone();
     // Resource subscriptions need the live GatewayState (session table + sink)
     // and the same ownership/scope path as resources/read (SOU-394).
+    //
+    // They return before `handle_request_with_cancel`, which is where the version
+    // check and the era guard live, so both have to be applied here or these two
+    // methods would disagree with every other method about what a valid request
+    // is: an unsupported version would be served, and a modern client's result
+    // would come back undecorated (SOU-474).
     if method == "resources/subscribe" || method == "resources/unsubscribe" {
+        let id = req.get("id").cloned().filter(|id| !id.is_null());
+        let declared = upstream_declared_version(req).map(str::to_string);
+        if let (Some(id), Some(version)) = (id, declared.as_deref()) {
+            if !SUPPORTED_UPSTREAM_VERSIONS.contains(&version) {
+                return Some(unsupported_version_error(id, version));
+            }
+        }
+        let _era = UpstreamEraGuard::enter(
+            declared.filter(|v| v.as_str() == MODERN_PROTOCOL_VERSION),
+        );
         return handle_resource_subscription(state, &router, req, allowed, method);
     }
     handle_request_with_cancel(
@@ -13104,6 +13144,15 @@ mod tests {
         assert!(chunk2.is_none(), "unsubscribed session must not receive update");
     }
 
+    /// A stdio progress channel plus its receiver, so a test can assert what the
+    /// writer thread would have written.
+    fn stdio_progress_channel() -> (
+        std::sync::mpsc::SyncSender<Value>,
+        std::sync::mpsc::Receiver<Value>,
+    ) {
+        std::sync::mpsc::sync_channel(PROGRESS_STDIO_QUEUE)
+    }
+
     fn progress_note(token: &str) -> Value {
         json!({
             "jsonrpc": "2.0",
@@ -13307,6 +13356,7 @@ mod tests {
         let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
         let s2 = mint_mcp_session(&state, None).ok().expect("mint s2");
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio_tx, _stdio_rx) = stdio_progress_channel();
 
         let (_registration, wire_token) =
             register_progress(&routes, Some(&json!({ "progressToken": "tok-1" })), "alpha", &s1)
@@ -13317,7 +13367,7 @@ mod tests {
         );
 
         deliver_progress(
-            &state.stdout,
+            &stdio_tx,
             &state.mcp_sessions,
             &routes,
             "alpha",
@@ -13350,6 +13400,7 @@ mod tests {
         let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
         let s2 = mint_mcp_session(&state, None).ok().expect("mint s2");
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio_tx, _stdio_rx) = stdio_progress_channel();
 
         // Same client token, same downstream server, two different clients.
         let (_r1, wire1) =
@@ -13364,7 +13415,7 @@ mod tests {
         );
 
         let note = progress_note(&wire1);
-        deliver_progress(&state.stdout, &state.mcp_sessions, &routes, "alpha", &note);
+        deliver_progress(&stdio_tx, &state.mcp_sessions, &routes, "alpha", &note);
 
         let first = drain_session(&state, &s1);
         assert_eq!(first.len(), 1, "progress goes to the client that asked");
@@ -13383,6 +13434,7 @@ mod tests {
         let state = http_state(false);
         let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio_tx, _stdio_rx) = stdio_progress_channel();
 
         let (registration, wire_token) =
             register_progress(&routes, Some(&json!({ "progressToken": "tok-1" })), "alpha", &s1)
@@ -13390,7 +13442,7 @@ mod tests {
 
         // beta was never given this token.
         deliver_progress(
-            &state.stdout,
+            &stdio_tx,
             &state.mcp_sessions,
             &routes,
             "beta",
@@ -13403,7 +13455,7 @@ mod tests {
 
         // A token nobody registered is dropped rather than broadcast.
         deliver_progress(
-            &state.stdout,
+            &stdio_tx,
             &state.mcp_sessions,
             &routes,
             "alpha",
@@ -13413,7 +13465,7 @@ mod tests {
 
         // The rightful owner still gets through...
         deliver_progress(
-            &state.stdout,
+            &stdio_tx,
             &state.mcp_sessions,
             &routes,
             "alpha",
@@ -13429,7 +13481,7 @@ mod tests {
             "the route must not outlive the call"
         );
         deliver_progress(
-            &state.stdout,
+            &stdio_tx,
             &state.mcp_sessions,
             &routes,
             "alpha",
@@ -13439,6 +13491,54 @@ mod tests {
             drain_session(&state, &s1).is_empty(),
             "progress after the call completed must be dropped"
         );
+    }
+
+    #[test]
+    fn stdio_progress_is_handed_off_without_blocking_the_caller() {
+        // The stdio delivery branch had no test at all, and it is the primary
+        // Toolport deployment. It must also never block: this runs on the
+        // downstream drain thread, before that thread forwards response lines, so
+        // a blocking write to a client that stopped reading would wedge the server
+        // for every client (SOU-474).
+        let state = http_state(false);
+        let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio_tx, stdio_rx) = stdio_progress_channel();
+
+        let (_reg, wire) = register_progress(
+            &routes,
+            Some(&json!({ "progressToken": "tok-1" })),
+            "alpha",
+            RESOURCE_SUB_STDIO,
+        )
+        .expect("registers");
+
+        deliver_progress(
+            &stdio_tx,
+            &state.mcp_sessions,
+            &routes,
+            "alpha",
+            &progress_note(&wire),
+        );
+
+        let delivered = stdio_rx
+            .try_recv()
+            .expect("the stdio client's progress must be queued");
+        // Translated back to the client's own token, same as the HTTP path.
+        assert_eq!(delivered["params"]["progressToken"], "tok-1");
+
+        // Fill the queue, then confirm a further send is DROPPED rather than
+        // blocking. Without the bound this call would hang forever.
+        for _ in 0..PROGRESS_STDIO_QUEUE {
+            let _ = stdio_tx.try_send(json!({}));
+        }
+        deliver_progress(
+            &stdio_tx,
+            &state.mcp_sessions,
+            &routes,
+            "alpha",
+            &progress_note(&wire),
+        );
+        // Reaching here at all is the assertion: a blocking send would never return.
     }
 
     #[test]
@@ -13489,6 +13589,7 @@ mod tests {
         // The common case: clients that never ask for progress cost nothing and
         // leave no state behind.
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let (stdio_tx, _stdio_rx) = stdio_progress_channel();
         assert!(register_progress(&routes, None, "alpha", "stdio").is_none());
         assert!(register_progress(&routes, Some(&json!({ "traceparent": "x" })), "alpha", "stdio").is_none());
         assert!(routes.lock().unwrap().active.is_empty());
