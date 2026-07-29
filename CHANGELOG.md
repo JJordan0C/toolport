@@ -4,10 +4,34 @@ All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 Entries before the rename below shipped under the project's former name, Conduit.
 
-## [Unreleased]
+## [1.10.0] - 2026-07-29
 
-Stale gateways actually stop after an upgrade, approvals stay bound to what you
-approved, and a batch of transport and code-mode hardening.
+Toolport speaks the current MCP revision, stale gateways actually stop after an
+upgrade, approvals stay bound to what you approved, and a batch of transport and
+code-mode hardening.
+
+### Added
+
+**Toolport speaks MCP 2026-07-28 over stdio, in both directions.** A client on the
+new revision can talk to Toolport, and Toolport can talk to a server on it, with
+every existing client and server continuing to see byte-identical traffic. Adopting
+a new protocol era normally means picking a side; here both run on the same
+endpoint, detected per connection, with nothing to migrate and nothing to configure.
+
+Over Streamable HTTP, Toolport stays on the established revision for now. A modern
+client receives exactly the response the spec defines as the fall-back signal, so it
+negotiates down cleanly instead of failing. That half arrives with
+`subscriptions/listen`.
+
+Three things now work through the gateway that could not before:
+
+- **Progress notifications reach your client.** A server reporting progress during a
+  long call has it relayed back, routed to the client that asked for it.
+- **Large results keep their full envelope.** Shaping an oversized result preserves
+  `_meta` and any fields Toolport does not recognise, so nothing a server sends is
+  dropped in transit.
+- **Structured error codes survive the hop**, so a client can act on a
+  machine-readable code rather than parsing a message string.
 
 ### Security
 
@@ -63,6 +87,41 @@ succeeding.
 **Code mode budget and isolation.** `fetchResult` shares the call and wall-clock budget
 rather than paging without limit, async workers reinstall the active session for host
 calls, and a corrupt registry no longer boots with code mode enabled.
+
+### Also in this release
+
+- Pasting a Crush config no longer fails as a malformed OpenCode one. Both use a
+  top-level `mcp` key, so the shape of `command` decides which it is. (#497)
+- Rate-limit counters stay in memory until a data directory is bound, instead of
+  writing a stray counter file into the working directory. (#543)
+- The share-link copy button confirms it copied, and says so when it could not.
+  (#549)
+- Coverage for the import-review shell and private-host classifiers, and for
+  gateway filtering during client migration. (#547, #510)
+- `fmtMs` and `fmtDollars` moved into `lib/utils` with tests. (#548)
+- Error strings, the benchmark write-up, the security notes, and CONTRIBUTING all
+  say what the code actually does. (#539, #545, #546, #540)
+
+### Thanks
+
+Real thanks to everyone who sent a patch this cycle. Several of these were more
+careful than they needed to be, which showed:
+
+- **[AnayGarodia](https://github.com/AnayGarodia)** for five in one go (#545, #546,
+  #547, #548, #549). The classifier tests hold up under mutation, which is rarer
+  than it should be.
+- **[Vermitrude](https://github.com/Vermitrude)** for the OpenCode/Crush paste
+  disambiguation (#497), and for splitting the remainder out honestly rather than
+  claiming the whole issue.
+- **[snowyukitty](https://github.com/snowyukitty)** for the rate-limit counter fix
+  (#543), including a test guard that cannot pass on a dirty working directory.
+- **[rohankumardubey](https://github.com/rohankumardubey)** for client-migration
+  gateway-filtering coverage (#510).
+- **[cyforkk](https://github.com/cyforkk)** for normalising the error strings (#539).
+- **[HaimiyaWasn](https://github.com/HaimiyaWasn)** for the CONTRIBUTING correction
+  (#540).
+
+If we missed you, open an issue. Credit should follow the work.
 
 ## [1.9.6] - 2026-07-27
 

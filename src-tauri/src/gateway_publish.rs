@@ -1050,6 +1050,60 @@ mod tests {
     }
 
     #[test]
+    fn version_parsing_survives_a_two_digit_minor() {
+        // 1.9 -> 1.10 is the transition where a version parser usually bites, and
+        // every other case here stops at a single-digit minor. Nothing compares
+        // versions by ordering (a lexical compare would put "1.10.0" before
+        // "1.9.7"), so equality is all that has to hold, but it has to hold for
+        // the reaper to recognise its own image after the bump.
+        assert!(looks_like_version_suffix("1.10.0"));
+        assert!(looks_like_version_suffix("1.10.0-rc.1"));
+        assert!(is_versioned_gateway_basename("toolport-gateway-1.10.0.exe"));
+        assert!(is_versioned_gateway_basename("conduit-gateway-1.10.0"));
+
+        // The current image is kept and an older one is killed across the boundary,
+        // in both directions, so neither is mistaken for the other.
+        assert!(basename_matches_current_version(
+            "toolport-gateway-1.10.0.exe",
+            "1.10.0"
+        ));
+        assert!(!basename_matches_current_version(
+            "toolport-gateway-1.9.7.exe",
+            "1.10.0"
+        ));
+        assert!(!basename_matches_current_version(
+            "toolport-gateway-1.10.0.exe",
+            "1.9.7"
+        ));
+
+        let c = ctx("1.10.0", &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.10.0.exe"], false);
+        assert_eq!(
+            decide_reap(
+                &proc(
+                    1,
+                    "toolport-gateway-1.10.0.exe",
+                    Some(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.10.0.exe")
+                ),
+                &c
+            ),
+            ReapDecision::Keep,
+            "the current 1.10.0 image must survive its own reaper"
+        );
+        assert_eq!(
+            decide_reap(
+                &proc(
+                    2,
+                    "toolport-gateway-1.9.7.exe",
+                    Some(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.7.exe")
+                ),
+                &c
+            ),
+            ReapDecision::Kill,
+            "a pre-bump 1.9.7 image is obsolete once 1.10.0 is current"
+        );
+    }
+
+    #[test]
     fn decide_kill_all_kills_everything_gateway() {
         let c = ctx("1.9.6", &[r"C:\keep\toolport-gateway-1.9.6.exe"], true);
         assert_eq!(
