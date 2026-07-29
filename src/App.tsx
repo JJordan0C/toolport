@@ -34,6 +34,7 @@ import {
   setAllEnabled,
   setServerEnabled,
   teamSyncWait,
+  type ClientNeedingRestart,
 } from "@/lib/api";
 import {
   importableServers,
@@ -278,28 +279,26 @@ function App() {
     };
   }, []);
 
-  // An app that was running before an upgrade keeps launching the gateway version
-  // it cached at its own startup, and stopping that process only makes it come
-  // back. Nothing Toolport does fixes it, so say which apps to restart (SOU-435).
-  // Fires once per launch, after the reaper has had its second pass.
+  // An app that was running before an upgrade can keep launching the gateway it
+  // cached at its own startup, when that path is one upgrades never rewrite. Then
+  // stopping the process only makes it come back, so name the apps to restart
+  // (SOU-435). Fires once per launch, from the first reaper pass, which is the only
+  // one whose snapshot still holds the evidence.
   useEffect(() => {
-    const unlisten = listen<{ client: string; gateway: string }[]>(
-      "gateway-restart-needed",
-      (event) => {
-        const apps = event.payload ?? [];
-        if (apps.length === 0) return;
-        // One app can appear more than once, since the backend keys on
-        // (client, gateway) and two windows started either side of different
-        // upgrades yield two rows. Name it once (#542 review).
-        const names = [...new Set(apps.map((a) => a.client))];
-        toast.warning(
-          `Restart ${names.join(", ")} to finish upgrading. ${
-            names.length === 1 ? "It is" : "They are"
-          } still launching an older gateway.`,
-          { duration: 10_000 },
-        );
-      },
-    );
+    const unlisten = listen<ClientNeedingRestart[]>("gateway-restart-needed", (event) => {
+      const apps = event.payload ?? [];
+      if (apps.length === 0) return;
+      // One app can appear more than once, since the backend keys on
+      // (client, gateway) and two windows started either side of different
+      // upgrades yield two rows. Name it once (#542 review).
+      const names = [...new Set(apps.map((a) => a.client))];
+      toast.warning(
+        `Restart ${names.join(", ")} to finish upgrading. ${
+          names.length === 1 ? "It is" : "They are"
+        } still launching an older gateway.`,
+        { duration: 10_000 },
+      );
+    });
     return () => {
       void unlisten.then((f) => f());
     };

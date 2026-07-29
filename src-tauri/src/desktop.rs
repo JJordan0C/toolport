@@ -2780,24 +2780,36 @@ fn stop_spawned_gateways() -> u32 {
 /// current resolved binary. Safe to run any time; used from Settings and launch.
 /// Returns labels of processes that were stopped.
 #[tauri::command]
-fn stop_stale_gateways(bridge: State<HttpBridgeState>) -> Vec<String> {
-    reap_stale_and_restore_bridge(bridge.inner())
+fn stop_stale_gateways(
+    bridge: State<HttpBridgeState>,
+    advice: State<RestartAdvice>,
+) -> Vec<String> {
+    // Refreshes the stored advice from its own pre-kill snapshot, so the Settings
+    // panel is current after the button runs without a second query.
+    reap_stale_and_restore_bridge(bridge.inner(), Some(advice.inner()))
 }
 
 /// Applications launching an obsolete gateway, which only restarting them can fix
 /// (SOU-435).
+/// Last known restart advice, recorded by whichever reaper pass produced it.
 ///
-/// Safe to call at any time, and specifically NOT dependent on a reap having run:
-/// each result names a versioned gateway image, whose path can never hold newer
-/// code, so the advice holds whether or not that process is stopped. Reading it
-/// *after* a reap is what was wrong, since reaping empties the table this reads
-/// (#542 review).
+/// Held rather than recomputed on demand because the advice is only knowable from
+/// the pre-kill process table: a fresh query can only be asked after some reap has
+/// already destroyed the evidence. Reading state also means the Settings view no
+/// longer walks the whole process table on the main thread every time the tab is
+/// opened (#542 review).
+#[derive(Default)]
+struct RestartAdvice(Mutex<Vec<crate::gateway_publish::ClientNeedingRestart>>);
+
 #[tauri::command]
-fn clients_needing_restart() -> Vec<crate::gateway_publish::ClientNeedingRestart> {
-    let extra_keep = clients::resolve_gateway_path()
-        .map(|p| vec![p])
-        .unwrap_or_default();
-    crate::gateway_publish::clients_needing_gateway_restart(&extra_keep)
+fn clients_needing_restart(
+    advice: State<RestartAdvice>,
+) -> Vec<crate::gateway_publish::ClientNeedingRestart> {
+    advice
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// Run the stale reaper, then bring the supervised HTTP bridge back if the reaper
@@ -2812,7 +2824,10 @@ fn clients_needing_restart() -> Vec<crate::gateway_publish::ClientNeedingRestart
 ///
 /// Connected clients are unaffected by the new process: they authenticate with the
 /// per-client bearers in `http_clients`, not the bridge's own env token.
-fn reap_stale_and_restore_bridge(bridge: &HttpBridgeState) -> Vec<String> {
+fn reap_stale_and_restore_bridge(
+    bridge: &HttpBridgeState,
+    advice: Option<&RestartAdvice>,
+) -> Vec<String> {
     let mut extra_keep = Vec::new();
     if let Some(p) = clients::resolve_gateway_path() {
         extra_keep.push(p);
@@ -2823,7 +2838,16 @@ fn reap_stale_and_restore_bridge(bridge: &HttpBridgeState) -> Vec<String> {
         let mut b = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         http_bridge_alive(&mut b).then(|| b.port).flatten()
     };
-    let killed = crate::gateway_publish::stop_stale_gateways_with_keep(&extra_keep);
+    let report = crate::gateway_publish::reap_stale(&extra_keep);
+    let killed = report.killed_labels();
+    // Recorded from the pre-kill snapshot inside the reap, which is the only place
+    // it can be known (#542 review).
+    if let Some(advice) = advice {
+        *advice
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = report.needs_restart.clone();
+    }
     if let Some(port) = was_serving {
         let still_serving = {
             let mut b = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3177,6 +3201,7 @@ pub fn run() {
         .manage(Mutex::new(registry))
         .manage(Mutex::new(HttpBridge::default()))
         .manage(PendingShare::default())
+        .manage(RestartAdvice::default())
         .invoke_handler(tauri::generate_handler![
             detect_clients,
             get_registry,
@@ -3402,7 +3427,16 @@ pub fn run() {
                 // Both passes go through `reap_stale_and_restore_bridge` so a supervised
                 // HTTP bridge the reaper stops (correctly, when its binary was replaced)
                 // comes back instead of leaving HTTP/OpenAPI clients dark (SOU-418).
-                let stale = reap_stale_and_restore_bridge(migrate_handle.state::<HttpBridgeState>().inner());
+                // The FIRST pass is the one that matters for the advice: it runs
+                // before anything has been killed, so its snapshot still contains the
+                // obsolete gateways their clients are running. The earlier attempt to
+                // sample "before the reap" only moved ahead of the SECOND pass and so
+                // still read a table this first pass had cleared (#542 review).
+                let advice_state = migrate_handle.state::<RestartAdvice>();
+                let stale = reap_stale_and_restore_bridge(
+                    migrate_handle.state::<HttpBridgeState>().inner(),
+                    Some(advice_state.inner()),
+                );
                 if !stale.is_empty() {
                     eprintln!(
                         "toolport: stopped {} stale gateway process(es): {}",
@@ -3410,18 +3444,19 @@ pub fn run() {
                         stale.join("; ")
                     );
                 }
+                let restart = advice_state
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(3));
-                    // Read BEFORE the second reap. Reaping clears the very table
-                    // this reads, so sampling afterwards reported nothing in the
-                    // case it exists for (SOU-435, #542 review).
-                    let keep = clients::resolve_gateway_path()
-                        .map(|p| vec![p])
-                        .unwrap_or_default();
-                    let restart = crate::gateway_publish::clients_needing_gateway_restart(&keep);
-
+                    // Deliberately does NOT refresh the advice: by now the first pass
+                    // has killed the evidence, so this pass would only ever record an
+                    // emptier answer (or one made of failed kills).
                     let again = reap_stale_and_restore_bridge(
                         migrate_handle.state::<HttpBridgeState>().inner(),
+                        None,
                     );
                     if !again.is_empty() {
                         eprintln!(

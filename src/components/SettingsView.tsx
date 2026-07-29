@@ -575,6 +575,9 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   // Apps relaunching an obsolete gateway from a cached spawn command. Stopping
   // the process cannot fix these; only restarting the app does (SOU-435).
   const [needRestart, setNeedRestart] = useState<ClientNeedingRestart[]>([]);
+  // Rows are keyed on (client, gateway), so one app can appear twice with two
+  // different gateways. Pluralize on distinct APPS, matching the toast (#542).
+  const restartAppCount = new Set(needRestart.map((c) => c.client)).size;
   const [autostartOn, setAutostartOn] = useState(false);
 
   const httpClients = registry?.httpClients ?? [];
@@ -597,6 +600,9 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   // toast is fire-and-forget and Tauri does not replay events, so a webview that
   // mounts late (hidden autostart on a loaded machine) never sees it; without
   // this, that information is lost for the whole session (#542 review).
+  //
+  // Cheap now: this reads advice the launch reaper already recorded, so it is a
+  // clone of a small Vec rather than a process-table walk on every tab switch.
   useEffect(() => {
     clientsNeedingRestart()
       .then(setNeedRestart)
@@ -1285,10 +1291,12 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             <span className="flex min-w-0 flex-1 flex-col leading-tight">
               <span className="font-medium">Stop old gateways</span>
               <span className="text-xs text-muted-foreground">
-                End leftover gateway processes from earlier installs. Most hosts respawn
-                MCP and pick up the current binary on the next tool call. On Windows the
-                gateway filename carries its version, so an app that was already running
-                keeps launching the old one until you restart that app.
+                End leftover gateway processes from earlier installs. Where the gateway
+                path stays the same across upgrades, a host that respawns MCP picks up the
+                new binary on its own. Where the filename carries its version, or the old
+                one still sits at a path an upgrade never touches, an app that was already
+                running keeps launching it until you restart that app. Anything in that
+                state is listed below.
               </span>
             </span>
             <button
@@ -1297,14 +1305,9 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               onClick={async () => {
                 setReapBusy(true);
                 setReapResult(null);
-                try {
-                  // Sample BEFORE stopping anything: reaping clears the very
-                  // processes this reads, so asking afterwards reported nothing
-                  // in the case it exists for (#542 review).
-                  setNeedRestart(await clientsNeedingRestart());
-                } catch {
-                  // Advisory only. A failure here must not mask the reap result.
-                }
+                // Cleared first so a failed refresh below cannot leave a stale
+                // amber panel sitting next to a fresh success message (#542).
+                setNeedRestart([]);
                 try {
                   const stopped = await stopStaleGateways();
                   setReapResult(
@@ -1312,6 +1315,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                       ? "No old gateway processes found."
                       : `Stopped ${stopped.length}: ${stopped.join("; ")}`,
                   );
+                  // Ordering no longer matters: the backend records this from the
+                  // pre-kill snapshot taken inside the reap it just ran, so reading
+                  // it afterwards returns that snapshot, not an emptied table.
+                  setNeedRestart(await clientsNeedingRestart());
                 } catch (e) {
                   toastError(`Couldn't stop old gateways: ${e}`);
                 } finally {
@@ -1327,11 +1334,11 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           {needRestart.length > 0 && (
             <div className="flex flex-col gap-1 rounded-md border border-amber-500/40 bg-amber-500/5 px-2.5 py-2">
               <span className="text-xs font-medium">
-                Restart {needRestart.length === 1 ? "this app" : "these apps"} to finish
+                Restart {restartAppCount === 1 ? "this app" : "these apps"} to finish
                 upgrading
               </span>
               <span className="text-xs text-muted-foreground">
-                {needRestart.length === 1 ? "It is" : "They are"} still launching an older
+                {restartAppCount === 1 ? "It is" : "They are"} still launching an older
                 gateway from a command cached at startup, so stopping the process just
                 brings it back.
               </span>

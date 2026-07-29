@@ -230,6 +230,14 @@ pub struct ReapReport {
     pub killed: Vec<String>,
     pub kept: Vec<String>,
     pub failed: Vec<String>,
+    /// Apps that will relaunch an obsolete gateway, computed from the process table
+    /// as it was **before** anything was killed (SOU-435).
+    ///
+    /// Carried on the report rather than exposed as a separate query because the
+    /// answer only exists pre-kill. Sampling afterwards reads a table this very
+    /// function just cleared, which is how two call sites in a row ended up silent
+    /// in the exact case the feature is for (#542 review).
+    pub needs_restart: Vec<ClientNeedingRestart>,
 }
 
 impl ReapReport {
@@ -504,21 +512,37 @@ fn is_init_like(parent: &ParentProcess) -> bool {
     )
 }
 
+/// Will the path this client cached start yielding new code by itself?
+///
+/// The question is NOT versioned-vs-unversioned. It is whether the cached path
+/// still names a file that upgrades replace:
+///
+/// * `/proc/<pid>/exe` ending ` (deleted)` means the file WAS replaced underneath
+///   the running process (an in-place package upgrade), so the same cached path
+///   already resolves to the new binary and the next spawn picks it up. Nothing to
+///   advise.
+/// * Anything else that reached a `Kill` verdict does not self-heal. A versioned
+///   image (`toolport-gateway-1.9.4.exe`) names a path whose contents never change.
+///   An *unversioned* image only reaches `Kill` when its path differs from every
+///   keep path, i.e. a stale install *location* - which an upgrade does not touch
+///   either, so it is equally frozen.
+///
+/// The previous version of this gated on `is_versioned_gateway_basename`, which got
+/// the unversioned case exactly backwards: it stayed silent for a client pinned to
+/// an old install location (a real regression), while the genuine self-heal case it
+/// meant to exclude never reaches here at all, because a path equal to a keep path
+/// is `Keep` (#542 review).
+fn cached_path_self_heals(proc: &GatewayProcess) -> bool {
+    proc.path
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .is_some_and(|p| p.ends_with(" (deleted)"))
+}
+
 /// Applications running an obsolete gateway they will relaunch from a cached path.
 ///
 /// An MCP client reads its config once at its own startup and caches the spawn
-/// command. Whether that matters depends on the filename it cached:
-///
-/// * A **versioned** image (`toolport-gateway-1.9.4.exe`) names a path whose
-///   contents never change, so the client relaunches obsolete code forever and
-///   only restarting the application fixes it. This is the Windows publish scheme,
-///   which exists to dodge the Windows file lock.
-/// * An **unversioned** image is replaced in place on upgrade, so the very same
-///   cached path yields the new binary on the next spawn. Nothing to advise. This
-///   is macOS and Linux, where `should_publish_client_gateway` is always false.
-///
-/// Keying on the image rather than on `cfg!(windows)` states the actual mechanism,
-/// and stays correct if the publish scheme ever moves platforms (#542 review).
+/// command; see [`cached_path_self_heals`] for when that traps it on old code.
 ///
 /// Deduplicated per (client, gateway) so one entry per app the user has to act on,
 /// not one per respawn. Pure so the grouping is testable without a process table.
@@ -537,10 +561,18 @@ pub fn clients_needing_restart(
         // the `path_looks_like_our_install` guard, and we cannot stop the process
         // either. Advising a restart for someone else's app is worse than silence.
         if proc.path.is_none() {
+            // Logged rather than dropped silently: this is the one branch that
+            // withholds advice for a reason the user cannot see, so a support case
+            // ("why does it keep coming back and say nothing?") is otherwise
+            // untraceable (#542 review).
+            eprintln!(
+                "toolport: {} (pid {}) looks obsolete but its path could not be read, \
+                 so it is not attributed to an app",
+                proc.basename, proc.pid
+            );
             continue;
         }
-        // Unversioned images self-heal on the next spawn; see above.
-        if !is_versioned_gateway_basename(&proc.basename) {
+        if cached_path_self_heals(proc) {
             continue;
         }
         // No parent means no name to show. Staying silent beats telling someone to
@@ -572,6 +604,12 @@ fn label_process(proc: &GatewayProcess) -> String {
 fn reap_with_context(ctx: &ReapContext) -> ReapReport {
     let mut report = ReapReport::default();
     let procs = list_gateway_processes();
+    // Decide the restart advice from THIS snapshot, before a single kill. After the
+    // kills below (and the verify pass, which kills again) the table no longer
+    // contains the evidence, so anything computed later is either empty or is
+    // dominated by kills that failed - a permissions problem, and the opposite
+    // advice (#542 review).
+    report.needs_restart = clients_needing_restart(&procs, ctx);
     let mut to_kill: Vec<GatewayProcess> = Vec::new();
     for proc in procs {
         match decide_reap(&proc, ctx) {
@@ -650,10 +688,20 @@ pub fn stop_stale_gateways() -> Vec<String> {
 /// Like [`stop_stale_gateways`], with extra keep-paths (e.g. nested macOS helper
 /// from `clients::resolve_gateway_path`).
 pub fn stop_stale_gateways_with_keep(extra_keep: &[PathBuf]) -> Vec<String> {
+    reap_stale(extra_keep).killed_labels()
+}
+
+/// Reap obsolete gateways and report both what was stopped and which apps will
+/// relaunch one anyway.
+///
+/// One call rather than a reap plus a follow-up query: the advice is only knowable
+/// from the pre-kill process table, so a separate query could only ever be asked at
+/// the wrong moment. Two call sites managed exactly that (#542 review).
+pub fn reap_stale(extra_keep: &[PathBuf]) -> ReapReport {
     let ctx = stale_reap_context(extra_keep);
     let report = reap_with_context(&ctx);
     log_reap_report("stale reaper", &report);
-    report.killed_labels()
+    report
 }
 
 /// The one `ReapContext` both the reaper and the restart report are built from.
@@ -676,22 +724,11 @@ fn stale_reap_context(extra_keep: &[PathBuf]) -> ReapContext {
     }
 }
 
-/// Applications that will keep relaunching an obsolete gateway until restarted.
-///
-/// Call this BEFORE reaping, not after. `reap_with_context` kills, waits, and then
-/// re-kills anything still stale, so immediately afterwards the table it would
-/// read has just been cleared. A client's respawn takes far longer than that
-/// window, so the report came back empty in exactly the case it exists for, and
-/// was non-empty mainly when a kill had FAILED - which is a permissions problem,
-/// not a cached-command one, and would have produced the opposite advice
-/// (#542 review).
-///
-/// Read before the reap the signal is unambiguous: an obsolete versioned gateway
-/// with a live parent is an application currently running old code, whether or not
-/// stopping the process happens to succeed a moment later.
-pub fn clients_needing_gateway_restart(extra_keep: &[PathBuf]) -> Vec<ClientNeedingRestart> {
-    clients_needing_restart(&list_gateway_processes(), &stale_reap_context(extra_keep))
-}
+// There is deliberately no standalone `clients_needing_gateway_restart()` query.
+// It existed, and both of its call sites asked it at the wrong moment, because the
+// only table that holds the answer is the one the reaper is about to clear. The
+// advice now rides out on `ReapReport::needs_restart` from [`reap_stale`], which
+// makes asking at the wrong moment unrepresentable (#542 review).
 
 // ----- OS process list / kill ------------------------------------------------
 
@@ -1550,22 +1587,56 @@ mod tests {
     }
 
     #[test]
-    fn clients_needing_restart_is_silent_where_a_cached_path_self_heals() {
-        // An UNVERSIONED image is replaced in place on upgrade, so the very same
-        // cached command yields the new binary on the next spawn and there is
-        // nothing for the user to do. That is macOS and Linux, where the Windows
-        // versioned-publish scheme never runs. Reporting there would repeat the
-        // false claim SOU-435 was filed against, in the other direction (#542).
-        let c = ctx("1.9.7", &["/Applications/Toolport.app/Contents/MacOS/toolport-gateway"], false);
-        let unversioned = proc_from(
+    fn clients_needing_restart_is_silent_only_when_the_binary_was_replaced_in_place() {
+        // A ` (deleted)` exe is the ONE self-healing case: the file was replaced
+        // underneath the running process, so the very same cached path already
+        // resolves to the new binary and the next spawn picks it up.
+        // An AppImage stable copy, which `path_looks_like_our_install` recognizes.
+        // A bare `/usr/bin` .deb path does NOT match that helper, so it never
+        // reaches a Kill verdict at all and would make this test vacuous.
+        let c = ctx(
+            "1.9.7",
+            &["/home/me/.local/share/Toolport/toolport-gateway"],
+            false,
+        );
+        let replaced = proc_from(
             400,
             "toolport-gateway",
-            Some("/Applications/Toolport.app/Contents/Helpers/old/toolport-gateway"),
+            Some("/home/me/.local/share/Toolport/toolport-gateway (deleted)"),
+            (900, "Cursor"),
+        );
+        // The reaper still stops it (that is what kills the old inode); only the
+        // ADVICE is withheld, because restarting the app is not required.
+        assert_eq!(decide_reap(&replaced, &c), ReapDecision::Kill);
+        assert!(clients_needing_restart(&[replaced], &c).is_empty());
+    }
+
+    #[test]
+    fn clients_needing_restart_reports_a_client_pinned_to_a_stale_install_location() {
+        // An unversioned image reaches Kill only when its path differs from every
+        // keep path, which means a stale install LOCATION - a file no upgrade
+        // touches. So it does not self-heal and the user does have to restart.
+        //
+        // Gating on `is_versioned_gateway_basename` got this backwards and stayed
+        // silent here, which was a regression against the first version of the
+        // feature (#542 review).
+        let c = ctx("1.9.7", &["/Applications/Toolport.app/Contents/MacOS/toolport-gateway"], false);
+        let moved_app = proc_from(
+            401,
+            "toolport-gateway",
+            // The user ran Toolport from ~/Downloads, configured clients, then moved
+            // the app. This file still exists and is never upgraded.
+            Some("/Users/me/Downloads/Toolport.app/Contents/MacOS/toolport-gateway"),
             (900, "Claude"),
         );
-        // The reaper still stops it; only the ADVICE is withheld.
-        assert_eq!(decide_reap(&unversioned, &c), ReapDecision::Kill);
-        assert!(clients_needing_restart(&[unversioned], &c).is_empty());
+        assert_eq!(decide_reap(&moved_app, &c), ReapDecision::Kill);
+        assert_eq!(
+            clients_needing_restart(&[moved_app], &c),
+            vec![ClientNeedingRestart {
+                client: "Claude".into(),
+                gateway: "toolport-gateway".into()
+            }]
+        );
     }
 
     #[test]
