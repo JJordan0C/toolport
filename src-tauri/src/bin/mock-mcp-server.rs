@@ -239,8 +239,11 @@ fn era_gate(cfg: &Config, state: &State, method: &str, req: &Value, id: &Value) 
         return None;
     }
     if cfg.revision.is_modern() {
-        // A modern server has no handshake and no `ping`.
-        if method == "initialize" || method == "notifications/initialized" || method == "ping" {
+        // A modern server has no handshake and no `ping`. `notifications/initialized`
+        // belongs to the same list but is deliberately absent: it carries no id, so
+        // it never reaches this gate and cannot be answered with an error at all.
+        // `handle` enforces it directly (SOU-474 #11).
+        if method == "initialize" || method == "ping" {
             // The spec asks a modern-only server to name its supported versions
             // in any error it returns to `initialize`, since legacy clients have
             // no fall-forward mechanism and this may be their only diagnostic.
@@ -292,6 +295,23 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
     let id = match req.get("id") {
         Some(id) if !id.is_null() => id.clone(),
         _ => {
+            // A modern server has no handshake, so `notifications/initialized`
+            // is legacy traffic that must never arrive. It cannot be refused
+            // with an error response - it has no id - so `era_gate` structurally
+            // could not enforce it, and listing it there merely looked like
+            // enforcement while this arm silently accepted the handshake and
+            // even marked the server initialized (SOU-474 #11).
+            //
+            // Dying is the enforcement a fixture has: the client sees the stream
+            // close and the test fails, instead of passing against a mock that
+            // quietly tolerated what it claims to reject.
+            if cfg.strict && cfg.revision.is_modern() && method == "notifications/initialized" {
+                eprintln!(
+                    "mock-mcp-server: strict {} server received legacy '{method}'",
+                    cfg.revision.as_str()
+                );
+                std::process::exit(97);
+            }
             if method == "notifications/initialized" {
                 state.initialized = true;
             }

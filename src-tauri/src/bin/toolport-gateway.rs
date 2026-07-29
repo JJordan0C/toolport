@@ -124,7 +124,24 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 }
 
 /// Protocol versions Toolport serves to upstream clients, newest first.
-const SUPPORTED_UPSTREAM_VERSIONS: [&str; 2] = [MODERN_PROTOCOL_VERSION, PROTOCOL_VERSION];
+///
+/// Every entry below `MODERN_PROTOCOL_VERSION` is a legacy revision: the gateway's
+/// own behaviour does not vary across them (revision differences are additive and
+/// ride through from the downstream server), so serving them costs nothing and
+/// refusing them would strand clients Toolport already answers.
+///
+/// This list must stay a superset of what the `initialize` arm accepts. That arm
+/// deliberately echoes whatever the client asks for and validates nothing - legacy
+/// wire behaviour is pinned and must not change - so a revision it would happily
+/// serve while this list omitted it got `-32022` on every request the moment the
+/// client declared it in `_meta` instead (SOU-474 #7).
+const SUPPORTED_UPSTREAM_VERSIONS: [&str; 5] = [
+    MODERN_PROTOCOL_VERSION,
+    "2025-11-25",
+    PROTOCOL_VERSION,
+    "2025-03-26",
+    "2024-11-05",
+];
 
 /// The protocol version a modern client declared on this request.
 ///
@@ -564,7 +581,53 @@ static PROGRESS_ROUTES: std::sync::OnceLock<Arc<Mutex<ProgressRoutes>>> =
 ///
 /// False in HTTP bridge mode. Defaults to true when unset so direct unit-test
 /// callers keep the stdio behaviour they were written against.
-static HAS_STDIO_CLIENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+///
+/// Tri-state (`0` unset, `1` no stdio client, `2` stdio client) rather than a
+/// `OnceLock`: a write-once cell cannot be set by a test without pinning the
+/// value for every other test in the binary, so no test ever set it and every
+/// one of them silently resolved to the stdio branch - including the ones whose
+/// whole point was an HTTP gateway (SOU-474 #9).
+static HAS_STDIO_CLIENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn set_has_stdio_client(present: bool) {
+    HAS_STDIO_CLIENT.store(if present { 2 } else { 1 }, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn has_stdio_client() -> bool {
+    // Unset resolves to true: see the note above.
+    HAS_STDIO_CLIENT.load(std::sync::atomic::Ordering::SeqCst) != 1
+}
+
+/// Serializes tests that override [`HAS_STDIO_CLIENT`], which is process-global.
+#[cfg(test)]
+static STDIO_CLIENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Sets [`HAS_STDIO_CLIENT`] for the duration of a test and restores it on drop,
+/// holding a lock so two tests cannot observe each other's override.
+#[cfg(test)]
+struct StdioClientOverride {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    previous: u8,
+}
+
+#[cfg(test)]
+impl StdioClientOverride {
+    fn set(present: bool) -> Self {
+        let guard = STDIO_CLIENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = HAS_STDIO_CLIENT.load(std::sync::atomic::Ordering::SeqCst);
+        set_has_stdio_client(present);
+        Self { _guard: guard, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for StdioClientOverride {
+    fn drop(&mut self) {
+        HAS_STDIO_CLIENT.store(self.previous, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// Where progress for the request being served should be delivered, or `None`
 /// when there is no channel to deliver it on.
@@ -578,7 +641,7 @@ static HAS_STDIO_CLIENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 fn progress_target() -> Option<String> {
     progress_target_for(
         ACTIVE_MCP_SESSION.with(|cell| cell.borrow().clone()),
-        HAS_STDIO_CLIENT.get().copied().unwrap_or(true),
+        has_stdio_client(),
     )
 }
 
@@ -3489,7 +3552,14 @@ fn execute_call(
     // against the raw server id, matching what the per-server sink binds, so the
     // spoof check compares like with like. Held in a named binding so the RAII
     // guard lives across the call rather than dropping immediately.
-    let (_progress_route, relay_owned) = prepare_progress(client_meta, server_id);
+    //
+    // The producer must come from the router that will actually execute the call,
+    // not the request snapshot `server_id` was resolved from. A rebuild during a
+    // HITL hold can re-route the tool to a different server, and a route
+    // registered against the pre-hold producer fails the spoof check on every
+    // notification the new one sends - silently dropping the whole stream (SOU-474).
+    let exec_server_id = exec_router.route_of(name).map_or(server_id, |(srv, _)| srv);
+    let (_progress_route, relay_owned) = prepare_progress(client_meta, exec_server_id);
     let client_meta = relay_owned.as_ref().or(client_meta);
 
     let started = Instant::now();
@@ -9455,7 +9525,7 @@ fn main() {
     ));
     // In HTTP bridge mode nothing reads this process's stdout, so it is not a
     // delivery channel for server-to-client messages (SOU-447).
-    let _ = HAS_STDIO_CLIENT.set(!http_mode);
+    set_has_stdio_client(!http_mode);
     // Single-flight for every router build/swap (startup, watcher self-heal, and
     // ${ROOT} rebuilds). Created up front so the startup build can share it.
     let rebuild_lock = Arc::new(Mutex::new(()));
@@ -13206,6 +13276,71 @@ mod tests {
     }
 
     #[test]
+    fn a_legacy_revision_declared_in_meta_is_served_not_rejected() {
+        // `initialize` echoes whatever version the client asks for and validates
+        // nothing, so Toolport does serve 2025-11-25. Declaring that same revision
+        // in `_meta` instead used to draw `-32022` on EVERY request, so a client
+        // that had merely adopted the newer way of naming its version was locked
+        // out of a gateway that would have answered it (SOU-474 #7).
+        for version in ["2025-11-25", "2025-03-26", "2024-11-05"] {
+            let req = json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": version } }
+            });
+            let resp = dispatch(&req);
+            assert!(
+                resp.get("error").is_none(),
+                "{version} is served via initialize, so it must not be refused in _meta: {resp}"
+            );
+            // Served in its own era's shape: legacy results carry no modern
+            // decoration, so the legacy wire format stays byte-identical.
+            assert!(
+                resp["result"].get("resultType").is_none(),
+                "{version} is a legacy revision and must not get modern decoration: {resp}"
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_versions_cover_every_revision_initialize_accepts() {
+        // `server/discover` is how a modern client learns what to ask for. If it
+        // under-reports, a client picks a version Toolport serves but did not
+        // advertise - or worse, concludes it cannot talk to us at all.
+        //
+        // The revisions are written out rather than read from
+        // SUPPORTED_UPSTREAM_VERSIONS on purpose: iterating the constant under
+        // test only ever proves it agrees with itself, and stayed green against
+        // the two-entry list this test exists to catch.
+        const PUBLISHED_MCP_REVISIONS: [&str; 5] = [
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25",
+            "2026-07-28",
+        ];
+        let advertised = dispatch(&modern_req(1, "server/discover", json!({})))["result"]
+            ["supportedVersions"]
+            .clone();
+
+        for version in PUBLISHED_MCP_REVISIONS {
+            // Ground truth: `initialize` echoes the version back, which is what
+            // "Toolport serves this revision" means for a legacy client.
+            let init = dispatch(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": version }
+            }));
+            assert_eq!(
+                init["result"]["protocolVersion"], version,
+                "initialize should serve {version}"
+            );
+            assert!(
+                advertised.as_array().is_some_and(|a| a.iter().any(|v| v == version)),
+                "initialize serves {version} but server/discover does not advertise it: {advertised}"
+            );
+        }
+    }
+
+    #[test]
     fn server_discover_answers_modern_clients() {
         // Servers MUST implement server/discover. It is also the stdio probe a
         // dual-era client uses to decide which era Toolport speaks (SOU-446).
@@ -13346,6 +13481,54 @@ mod tests {
             outer["result"].get("resultType").is_none(),
             "outer legacy response was decorated after a nested modern dispatch"
         );
+    }
+
+    #[test]
+    fn prepare_progress_withholds_the_token_when_nothing_can_deliver_it() {
+        // The shipping function, not its pure helpers. `progress_target_for` was
+        // unit-tested in every combination while `prepare_progress` - which reads
+        // the real globals - had no coverage, so a global that silently resolved
+        // to the stdio branch in every test went unnoticed (SOU-474 #9).
+        let meta = json!({ "progressToken": "tok-1", "traceparent": "keep-me" });
+
+        // A modern HTTP client: no session, no stdio. Nothing can carry progress,
+        // so the server must not be asked to produce it.
+        let _no_stdio = StdioClientOverride::set(false);
+        ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = None);
+        assert_eq!(progress_target(), None, "no session and no stdio: nowhere to deliver");
+
+        let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
+        assert!(registration.is_none(), "nothing to register against");
+        let relayed = relayed.expect("_meta is still relayed, minus the token");
+        assert!(
+            relayed.get("progressToken").is_none(),
+            "progressToken must be stripped when it cannot be delivered: {relayed}"
+        );
+        assert_eq!(
+            relayed.get("traceparent").and_then(|v| v.as_str()),
+            Some("keep-me"),
+            "unrelated _meta keys must survive: {relayed}"
+        );
+    }
+
+    #[test]
+    fn prepare_progress_registers_a_route_for_a_stdio_client() {
+        // The other side of the same decision: a stdio client IS a delivery
+        // channel, so the token is registered and rewritten rather than dropped.
+        let _stdio = StdioClientOverride::set(true);
+        ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = None);
+        assert_eq!(
+            progress_target().as_deref(),
+            Some(RESOURCE_SUB_STDIO),
+            "a stdio client is reached on stdout"
+        );
+
+        let meta = json!({ "progressToken": 7 });
+        let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
+        assert!(registration.is_some(), "a deliverable token gets a live route");
+        let relayed = relayed.expect("relayed _meta");
+        let token = relayed.get("progressToken").expect("token is rewritten, not dropped");
+        assert_ne!(token, &json!(7), "the downstream token must be Toolport's own");
     }
 
     #[test]
@@ -13525,6 +13708,22 @@ mod tests {
             .expect("the stdio client's progress must be queued");
         // Translated back to the client's own token, same as the HTTP path.
         assert_eq!(delivered["params"]["progressToken"], "tok-1");
+
+        // The producer check guards this branch too. It was only ever asserted on
+        // the HTTP session path, so a server pushing progress for a token it was
+        // never given would have been caught for HTTP clients and forwarded to the
+        // stdio one - the primary deployment (SOU-474).
+        deliver_progress(
+            &stdio_tx,
+            &state.mcp_sessions,
+            &routes,
+            "beta",
+            &progress_note(&wire),
+        );
+        assert!(
+            stdio_rx.try_recv().is_err(),
+            "a server must not push progress for another server's token"
+        );
 
         // Fill the queue, then confirm a further send is DROPPED rather than
         // blocking. Without the bound this call would hang forever.

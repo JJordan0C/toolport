@@ -743,3 +743,204 @@ fn legacy_servers_see_no_era_detection_traffic() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// The GATEWAY must forward `icons`, not merely the fixture emit them.
+///
+/// `fixture_advertises_icons_from_2025_11_25` drives the fixture through a raw
+/// transport, so it only ever proved the mock's own output. The actual risk is on
+/// Toolport's side - a gateway that rebuilds tool objects field-by-field drops
+/// unknown keys - and nothing exercised the aggregation that would do it
+/// (SOU-474, untested paths).
+#[test]
+fn the_gateway_forwards_icons_through_tool_aggregation() {
+    use conduit_lib::router::Router;
+
+    let env = env_for(Some("2025-11-25"), false, None);
+    let dirty = Arc::new(AtomicU8::new(0));
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+        .expect("spawn fixture");
+    let server =
+        DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
+
+    // Non-vacuity: the server really did hand us icons, so a later assertion
+    // failing means the gateway dropped them rather than the fixture omitting them.
+    let raw_has_icons = server
+        .tools
+        .iter()
+        .any(|t| t["name"] == "echo" && t.get("icons").is_some());
+    assert!(raw_has_icons, "fixture must supply icons for this test to mean anything");
+
+    let mut router = Router::new();
+    router.add(server);
+    let exposed = router.aggregated_tools();
+    let echo = exposed
+        .iter()
+        .find(|t| t["name"].as_str().is_some_and(|n| n.ends_with("echo")))
+        .unwrap_or_else(|| panic!("echo must survive aggregation, got {exposed:#?}"));
+
+    let icons = echo
+        .get("icons")
+        .unwrap_or_else(|| panic!("the gateway dropped `icons` during aggregation: {echo}"));
+    assert!(icons.is_array(), "icons must survive intact, got {icons}");
+}
+
+/// Pin what a LEGACY server sees when the client's request does carry `_meta`.
+///
+/// `legacy_servers_see_no_era_detection_traffic` asserts `_meta` is absent
+/// outright, which only holds because its calls send none. `WITHHELD_META_KEYS`
+/// is now empty, so a legacy client's `progressToken` IS relayed downstream and
+/// the server starts emitting `notifications/progress` on connections that never
+/// saw them before. That is intended - the client asked for it - but it was new
+/// server-to-client traffic covered by no pin at all (SOU-474 #6).
+///
+/// The real invariant is narrower than "no `_meta`": Toolport must not put its
+/// OWN protocol metadata on a legacy hop, while still relaying what the client
+/// sent.
+#[test]
+fn a_legacy_server_sees_client_meta_relayed_but_never_protocol_meta() {
+    let path = scratch_path("legacy-client-meta");
+    let _ = std::fs::remove_file(&path);
+    let env = env_for(Some("2025-06-18"), true, Some(&path.to_string_lossy()));
+
+    let dirty = Arc::new(AtomicU8::new(0));
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+        .expect("spawn fixture");
+    let mut server =
+        DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
+    assert!(!server.era().is_modern(), "this pin is about the legacy hop");
+
+    let client_meta = json!({
+        "progressToken": "client-tok",
+        "traceparent": "00-abc-def-01",
+    });
+    server
+        .call_with_cancel("echo", json!({ "text": "hi" }), None, Some(&client_meta))
+        .expect("call");
+    drop(server);
+
+    let transcript = read_transcript(&path);
+    let call = transcript
+        .iter()
+        .find(|r| r["method"] == "tools/call")
+        .unwrap_or_else(|| panic!("expected a recorded tools/call, got {transcript:#?}"));
+    let meta = call["params"]["_meta"]
+        .as_object()
+        .unwrap_or_else(|| panic!("the client's _meta must reach the server, got {call}"));
+
+    // Relayed: the client asked for progress and for its trace context to travel.
+    assert_eq!(
+        meta.get("progressToken").and_then(|v| v.as_str()),
+        Some("client-tok"),
+        "progressToken is relayed now that progress can be routed back: {call}"
+    );
+    assert_eq!(
+        meta.get("traceparent").and_then(|v| v.as_str()),
+        Some("00-abc-def-01"),
+        "unknown _meta keys must pass through untouched: {call}"
+    );
+    // Withheld: Toolport speaks for itself on the downstream hop, and a legacy
+    // server must never see 2026-07-28 protocol metadata.
+    for key in meta.keys() {
+        assert!(
+            !key.starts_with("io.modelcontextprotocol/"),
+            "a legacy server must see no protocol _meta, got '{key}' in {call}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Prove the strict modern fixture's handshake gate can actually fire.
+///
+/// `notifications/initialized` was listed among the methods a strict modern
+/// fixture rejects, but it carries no id, so it returned from `handle` long
+/// before the gate was consulted - and that early return marked the server
+/// initialized. The gate read as enforcement while the fixture quietly accepted
+/// the exact traffic it advertised refusing (SOU-474 #11).
+///
+/// Checks all three cases the way a fixture gate has to be checked: it fires on
+/// the violation, stays silent when the method is absent, and stays silent for a
+/// legacy fixture where the handshake is legitimate.
+#[test]
+fn strict_modern_fixture_refuses_the_legacy_handshake_notification() {
+    use std::io::Write;
+
+    /// Feed one line to a fixture, close stdin, and report whether it died.
+    fn feed(revision: &str, strict: bool, line: &str) -> Option<i32> {
+        let mut cmd = std::process::Command::new(mock_bin());
+        cmd.env("MOCK_MCP_REVISION", revision)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        if strict {
+            cmd.env("MOCK_MCP_STRICT", "1");
+        }
+        let mut child = cmd.spawn().expect("spawn fixture");
+        {
+            let mut stdin = child.stdin.take().expect("fixture stdin");
+            let _ = writeln!(stdin, "{line}");
+        }
+        child.wait().expect("fixture should exit").code()
+    }
+
+    const HANDSHAKE: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+    // Another id-less notification, to show the gate is specific rather than
+    // just killing the process on any notification.
+    const OTHER: &str = r#"{"jsonrpc":"2.0","method":"notifications/cancelled"}"#;
+
+    // Positive: the violation is refused.
+    assert_eq!(
+        feed("2026-07-28", true, HANDSHAKE),
+        Some(97),
+        "a strict modern fixture must refuse the legacy handshake notification"
+    );
+    // Absent: a different notification is fine.
+    assert_eq!(
+        feed("2026-07-28", true, OTHER),
+        Some(0),
+        "only the handshake notification is refused"
+    );
+    // Negative: on a legacy fixture the same notification is legitimate.
+    assert_eq!(
+        feed("2025-06-18", true, HANDSHAKE),
+        Some(0),
+        "a legacy fixture must still accept its own handshake"
+    );
+    // And strict mode is what arms it: a non-strict modern fixture tolerates it.
+    assert_eq!(
+        feed("2026-07-28", false, HANDSHAKE),
+        Some(0),
+        "the gate belongs to strict mode"
+    );
+}
+
+/// The negotiated legacy version must be the one the SERVER answered with, not
+/// Toolport's default.
+///
+/// Every other legacy assertion uses a 2025-06-18 fixture, which is byte-identical
+/// to the `PROTOCOL_VERSION` fallback - so `Era::Legacy { version }` could be
+/// replaced by the constant outright and the whole suite stayed green (SOU-474 #8).
+/// This pins it at a revision the fallback cannot produce.
+#[test]
+fn legacy_era_pins_the_version_the_server_actually_answered() {
+    for revision in ["2024-11-05", "2025-03-26", "2025-11-25"] {
+        assert_ne!(
+            revision,
+            conduit_lib::downstream::PROTOCOL_VERSION,
+            "this test is only meaningful at a revision the fallback cannot produce"
+        );
+        let env = env_for(Some(revision), true, None);
+        let dirty = Arc::new(AtomicU8::new(0));
+        let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+            .expect("spawn fixture");
+        let server = DownstreamServer::connect("mock".to_string(), Box::new(transport))
+            .unwrap_or_else(|e| panic!("connect to a {revision} server: {e}"));
+
+        assert!(!server.era().is_modern(), "{revision} is a legacy revision");
+        assert_eq!(
+            server.era().version(),
+            revision,
+            "the era must carry the server's own version, not the fallback"
+        );
+    }
+}
