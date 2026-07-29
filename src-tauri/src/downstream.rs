@@ -2290,6 +2290,19 @@ pub struct HttpTransport {
     /// `None` or error keeps the current token; a forced refresh must return a new
     /// raw token or the authentication failure is surfaced.
     refresh: Option<RefreshFn>,
+    /// The token a forced refresh last produced, if any.
+    ///
+    /// The forced-refresh budget is per *token*, not per call. A 401 answered by
+    /// minting a fresh token, where that fresh token then 401s too, is not an
+    /// expiry problem, so refreshing again cannot help - and against a provider
+    /// that rotates the refresh token on use, each needless exchange consumes a
+    /// link in the chain. Connect alone posts twice (`initialize`, then the
+    /// `server/discover` era probe), so a per-call budget spends two (SOU-474).
+    ///
+    /// Cleared implicitly: once a proactive refresh swaps in a different token,
+    /// `auth` no longer matches this and the budget is available again, so a
+    /// long-lived session still self-heals when its token later expires.
+    forced_refresh_token: Option<String>,
     server_handler: Option<ServerRequestHandler>,
     /// Fan `notifications/resources/updated` seen mid-SSE to subscribed
     /// upstream clients (SOU-394 follow-up for remote downstreams).
@@ -2342,6 +2355,7 @@ impl HttpTransport {
             next_id: 1,
             auth,
             refresh,
+            forced_refresh_token: None,
             server_handler: None,
             resource_updated: None,
             progress: None,
@@ -2406,6 +2420,12 @@ impl HttpTransport {
         }
     }
 
+    /// True when the token currently in hand is one a forced refresh already
+    /// produced, so its one forced exchange is spent. See [`Self::forced_refresh_token`].
+    fn forced_refresh_spent(&self) -> bool {
+        self.auth.is_some() && self.auth == self.forced_refresh_token
+    }
+
     fn force_refresh_after_auth_error(&mut self, code: u16) -> Result<(), TransportError> {
         let Some(refresh) = self.refresh.as_ref() else {
             return Err(TransportError::Fatal(format!(
@@ -2414,7 +2434,10 @@ impl HttpTransport {
         };
         match refresh(true) {
             Ok(Some(token)) => {
-                self.auth = Some(token);
+                self.auth = Some(token.clone());
+                // Spend the budget for this token, so a later POST on the same
+                // connection does not force a second exchange for it (SOU-474).
+                self.forced_refresh_token = Some(token);
                 Ok(())
             }
             Ok(None) => Err(TransportError::Fatal(format!(
@@ -2430,7 +2453,7 @@ impl HttpTransport {
     fn send_post_no_response(&mut self, body: &Value) -> Result<(), TransportError> {
         let payload = body.to_string();
         self.refresh_before_send();
-        let mut refreshed = false;
+        let mut refreshed = self.forced_refresh_spent();
         let wire_version = self.wire_protocol_version();
         let resp = loop {
             let mut req = self
@@ -2543,7 +2566,10 @@ impl HttpTransport {
         // Token refresh is handled internally (it doesn't sleep, so no lock
         // contention). Only 429 and transport-retry signals bubble up as
         // TransportError::Retry so the Router can sleep *outside* the lock.
-        let mut refreshed = false;
+        // Per-token, not per-call: connect alone posts twice (`initialize`, then
+        // the `server/discover` era probe) and must not spend two forced
+        // exchanges on one expired token (SOU-474).
+        let mut refreshed = self.forced_refresh_spent();
         let wire_version = self.wire_protocol_version();
         let resp = loop {
             let mut req = self
@@ -4470,6 +4496,156 @@ mod tests {
     }
 
     #[test]
+    fn an_rpc_error_is_not_a_health_failure() {
+        // Only unreachability trips the per-server circuit breaker. A server that
+        // answers with a JSON-RPC error is alive and well-behaved, and counting it
+        // as unhealthy would break a server for every client over one bad call.
+        use super::TransportError;
+        assert!(!TransportError::Rpc(json!({ "code": -32601 })).is_health_failure());
+        assert!(!TransportError::Fatal("HTTP 400".into()).is_health_failure());
+        assert!(TransportError::Unavailable("timed out".into()).is_health_failure());
+        assert!(TransportError::Retry { retry_after: None, message: "429".into() }
+            .is_health_failure());
+    }
+
+    #[test]
+    fn notifications_carry_the_connections_protocol_meta() {
+        // The request path stamps protocol `_meta`; `notify` has its own copy of
+        // that logic and had no coverage, so a modern connection could have sent
+        // notifications telling a different story than its requests.
+        //
+        // Driven through the real `HttpTransport::notify` and read back off the
+        // wire, rather than asserting on `merge_protocol_meta` in isolation: the
+        // helper being right is not the claim, the frame on the wire is.
+        use super::{HttpTransport, Transport, MODERN_PROTOCOL_VERSION};
+        use std::sync::{Arc, Mutex};
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let body = Arc::new(Mutex::new(String::new()));
+        let bc = Arc::clone(&body);
+        let handle = std::thread::spawn(move || {
+            if let Ok(mut req) = server.recv() {
+                let mut buf = String::new();
+                let _ = req.as_reader().read_to_string(&mut buf);
+                *bc.lock().unwrap() = buf;
+                let ct =
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .unwrap();
+                let _ = req.respond(tiny_http::Response::from_string("{}").with_header(ct));
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut t = HttpTransport::new(&url);
+        t.set_protocol_meta(Some(super::protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+        t.notify("notifications/cancelled", json!({ "requestId": 1 }))
+            .expect("notify should reach the server");
+        let _ = handle.join();
+
+        let sent: Value = serde_json::from_str(&body.lock().unwrap()).expect("a JSON frame");
+        assert_eq!(sent["method"], "notifications/cancelled");
+        assert_eq!(
+            sent["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            MODERN_PROTOCOL_VERSION,
+            "a modern connection stamps its version on notifications too, got {sent}"
+        );
+        assert_eq!(sent["params"]["requestId"], 1, "the caller's params survive");
+    }
+
+    #[test]
+    fn merge_protocol_meta_preserves_client_keys_and_survives_a_bogus_meta() {
+        use super::{merge_protocol_meta, protocol_meta_for, MODERN_PROTOCOL_VERSION};
+        const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+
+        // A pre-existing `_meta` is merged into, not replaced.
+        let mut params = json!({ "_meta": { "traceparent": "keep" } });
+        merge_protocol_meta(&mut params, &protocol_meta_for(MODERN_PROTOCOL_VERSION));
+        assert_eq!(params["_meta"]["traceparent"], "keep", "client keys survive");
+        assert_eq!(params["_meta"][VERSION_KEY], MODERN_PROTOCOL_VERSION);
+
+        // A non-object `_meta` is rebuilt rather than panicking or being ignored.
+        let mut params = json!({ "_meta": "nonsense" });
+        merge_protocol_meta(&mut params, &protocol_meta_for(MODERN_PROTOCOL_VERSION));
+        assert_eq!(params["_meta"][VERSION_KEY], MODERN_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn the_ladder_retries_discover_on_a_mutually_supported_version() {
+        // The negotiate branch: a modern server that rejects our declared version
+        // but names one we DO speak must be retried on that version and connect
+        // successfully. Only the give-up branch had coverage, so the retry could
+        // have been broken outright without a test noticing.
+        use super::{DownstreamServer, Transport, TransportError, MODERN_PROTOCOL_VERSION};
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        struct Ladder {
+            responses: VecDeque<Result<Value, TransportError>>,
+            /// Every version stamped via `set_protocol_meta`, in order. A real
+            /// transport turns this into the `MCP-Protocol-Version` header and the
+            /// body `_meta`, which MUST agree; the mock records it instead.
+            stamped: Arc<Mutex<Vec<Option<String>>>>,
+        }
+        impl Transport for Ladder {
+            fn request(&mut self, _method: &str, _params: Value) -> Result<Value, TransportError> {
+                self.responses.pop_front().expect("a response per request")
+            }
+            fn notify(&mut self, _m: &str, _p: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn set_protocol_meta(&mut self, meta: Option<Value>) {
+                let version = meta
+                    .as_ref()
+                    .and_then(|m| m.get("io.modelcontextprotocol/protocolVersion"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                self.stamped.lock().unwrap().push(version);
+            }
+        }
+
+        let stamped = Arc::new(Mutex::new(Vec::new()));
+        let transport = Ladder {
+            stamped: Arc::clone(&stamped),
+            responses: VecDeque::from(vec![
+                // initialize: refused, as a modern server must.
+                Err(TransportError::Rpc(json!({ "code": -32601, "message": "no initialize" }))),
+                // First server/discover: "not that version, but I speak ours too".
+                Err(TransportError::Rpc(json!({
+                    "code": super::UNSUPPORTED_PROTOCOL_VERSION,
+                    "message": "Unsupported protocol version",
+                    "data": { "supported": ["2027-05-01", MODERN_PROTOCOL_VERSION] }
+                }))),
+                // Retry on the mutually supported version: accepted.
+                Ok(json!({
+                    "supportedVersions": [MODERN_PROTOCOL_VERSION],
+                    "capabilities": { "tools": {} }
+                })),
+                // tools/list for the rest of the handshake.
+                Ok(json!({ "tools": [] })),
+            ]),
+        };
+
+        let server = DownstreamServer::connect("mock".to_string(), Box::new(transport))
+            .expect("the ladder must recover on a mutually supported version");
+        assert!(server.era().is_modern());
+        assert_eq!(server.era().version(), MODERN_PROTOCOL_VERSION);
+
+        // The retry must RE-stamp before sending, so the header and the body
+        // `_meta` still agree on the newly chosen version. Skipping that would
+        // send the rejected version again and draw the same error forever.
+        let stamped = stamped.lock().unwrap();
+        assert!(
+            stamped.len() >= 2,
+            "expected a stamp before the probe and again before the retry, got {stamped:?}"
+        );
+        assert!(
+            stamped.iter().all(|v| v.as_deref() == Some(MODERN_PROTOCOL_VERSION)),
+            "every stamp must name the version actually being sent, got {stamped:?}"
+        );
+    }
+
+    #[test]
     fn modern_server_offering_another_version_is_not_reported_as_legacy() {
         // The compatibility ladder's pivot. A server that refuses `initialize`
         // AND answers the probe with a recognized modern error IS modern, it just
@@ -4841,6 +5017,149 @@ mod tests {
         assert!(res.is_some(), "got the 200 result after refreshing");
         assert_eq!(hits.load(Ordering::SeqCst), 2, "exactly one 401 then one retry");
         assert_eq!(*retry_auth.lock().unwrap(), "Bearer fresh", "retry used the new token");
+    }
+
+    #[test]
+    fn forced_refresh_is_budgeted_per_token_not_per_post() {
+        // Connect posts twice: `initialize`, then the `server/discover` era probe.
+        // With a per-call budget each POST ran its own 401 -> refresh -> retry
+        // cycle, so one expired token cost two refresh exchanges - and a provider
+        // that rotates the refresh token on use has that chain consumed twice
+        // (SOU-474 #5). The budget belongs to the token, not the call.
+        use super::{HttpTransport, RefreshFn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Always 401: the refreshed token is rejected too, so nothing can succeed
+        // and the only question is how many times we tried to mint a new one.
+        //
+        // Serve until told to stop rather than for a fixed number of requests: a
+        // regression makes MORE requests, and a fixed loop would leave the extra
+        // one unanswered and hang the client instead of failing the assertion.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (pc, sc) = (Arc::clone(&posts), Arc::clone(&stop));
+        let handle = std::thread::spawn(move || {
+            while !sc.load(Ordering::SeqCst) {
+                match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(Some(req)) => {
+                        pc.fetch_add(1, Ordering::SeqCst);
+                        let _ = req.respond(
+                            tiny_http::Response::from_string("nope").with_status_code(401),
+                        );
+                    }
+                    Ok(None) => continue,
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let forced = Arc::new(AtomicUsize::new(0));
+        let fc = Arc::clone(&forced);
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+            if force {
+                // Each forced call is a refresh-token exchange with the provider.
+                let n = fc.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(format!("minted-{n}")))
+            } else {
+                Ok(None)
+            }
+        }));
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut t = HttpTransport::with_auth_refresh(&url, Some("stale".to_string()), refresh);
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" });
+        assert!(t.post(&body, true).is_err(), "an always-401 server cannot succeed");
+        // The second POST is the era probe, on the same transport and the same
+        // (already once-refreshed) token.
+        assert!(t.post(&body, true).is_err(), "still 401");
+        drop(t);
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+
+        assert_eq!(
+            forced.load(Ordering::SeqCst),
+            1,
+            "one expired token must cost exactly one refresh exchange across both POSTs"
+        );
+        // 401, refresh, 401(retry) on the first post; the second post sends once
+        // and gives up without minting anything.
+        assert_eq!(posts.load(Ordering::SeqCst), 3, "no retry on the second POST");
+    }
+
+    #[test]
+    fn proactive_refresh_restores_the_forced_budget() {
+        // The per-token budget must not become a permanent latch: once a proactive
+        // refresh swaps in a *different* token, a later 401 on that new token is a
+        // genuine expiry and must still be recoverable, or a long-lived session
+        // stops self-healing (SOU-474 #5).
+        use super::{HttpTransport, RefreshFn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (hc, sc) = (Arc::clone(&hits), Arc::clone(&stop));
+        let handle = std::thread::spawn(move || {
+            while !sc.load(Ordering::SeqCst) {
+                let req = match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(Some(req)) => req,
+                    Ok(None) => continue,
+                    Err(_) => return,
+                };
+                // 401 every request except the very last one we expect.
+                if hc.fetch_add(1, Ordering::SeqCst) == 3 {
+                    let ct = tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"application/json"[..],
+                    )
+                    .unwrap();
+                    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+                    let _ = req.respond(tiny_http::Response::from_string(body).with_header(ct));
+                } else {
+                    let _ = req
+                        .respond(tiny_http::Response::from_string("nope").with_status_code(401));
+                }
+            }
+        });
+
+        let forced = Arc::new(AtomicUsize::new(0));
+        let fc = Arc::clone(&forced);
+        let proactive = Arc::new(AtomicUsize::new(0));
+        let pc = Arc::clone(&proactive);
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+            if force {
+                let n = fc.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(format!("forced-{n}")))
+            } else if pc.fetch_add(1, Ordering::SeqCst) == 1 {
+                // Before the second POST, hand out a genuinely different token.
+                Ok(Some("proactive".to_string()))
+            } else {
+                Ok(None)
+            }
+        }));
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut t = HttpTransport::with_auth_refresh(&url, Some("stale".to_string()), refresh);
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
+        assert!(t.post(&body, true).is_err(), "first POST exhausts its budget");
+        assert!(
+            t.post(&body, true).is_ok(),
+            "a proactively-refreshed token gets its own forced-refresh budget"
+        );
+        drop(t);
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+
+        assert_eq!(
+            forced.load(Ordering::SeqCst),
+            2,
+            "one forced exchange per distinct token, not one for the whole connection"
+        );
     }
 
     #[test]
