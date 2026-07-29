@@ -4590,13 +4590,20 @@ mod tests {
 
         struct Ladder {
             responses: VecDeque<Result<Value, TransportError>>,
-            /// Every version stamped via `set_protocol_meta`, in order. A real
-            /// transport turns this into the `MCP-Protocol-Version` header and the
-            /// body `_meta`, which MUST agree; the mock records it instead.
-            stamped: Arc<Mutex<Vec<Option<String>>>>,
+            /// Stamps AND requests, interleaved in call order.
+            ///
+            /// Counting stamps alone cannot express the claim. `connect` stamps
+            /// three times on this path (before the probe, for the retry, and
+            /// after `choose_protocol_version`), so a `len() >= 2` floor still
+            /// held with the retry stamp deleted - and since the negotiate branch
+            /// can only ever select `MODERN_PROTOCOL_VERSION`, asserting every
+            /// stamp equals it was a tautology. What matters is ORDER: a stamp
+            /// has to fall between the two `server/discover` sends (#511 review).
+            events: Arc<Mutex<Vec<String>>>,
         }
         impl Transport for Ladder {
-            fn request(&mut self, _method: &str, _params: Value) -> Result<Value, TransportError> {
+            fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+                self.events.lock().unwrap().push(format!("send:{method}"));
                 self.responses.pop_front().expect("a response per request")
             }
             fn notify(&mut self, _m: &str, _p: Value) -> Result<(), TransportError> {
@@ -4607,14 +4614,15 @@ mod tests {
                     .as_ref()
                     .and_then(|m| m.get("io.modelcontextprotocol/protocolVersion"))
                     .and_then(Value::as_str)
-                    .map(str::to_string);
-                self.stamped.lock().unwrap().push(version);
+                    .unwrap_or("<none>")
+                    .to_string();
+                self.events.lock().unwrap().push(format!("stamp:{version}"));
             }
         }
 
-        let stamped = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
         let transport = Ladder {
-            stamped: Arc::clone(&stamped),
+            events: Arc::clone(&events),
             responses: VecDeque::from(vec![
                 // initialize: refused, as a modern server must.
                 Err(TransportError::Rpc(json!({ "code": -32601, "message": "no initialize" }))),
@@ -4642,14 +4650,26 @@ mod tests {
         // The retry must RE-stamp before sending, so the header and the body
         // `_meta` still agree on the newly chosen version. Skipping that would
         // send the rejected version again and draw the same error forever.
-        let stamped = stamped.lock().unwrap();
-        assert!(
-            stamped.len() >= 2,
-            "expected a stamp before the probe and again before the retry, got {stamped:?}"
+        //
+        // Asserted positionally: find the two `server/discover` sends and require
+        // a stamp strictly between them. A count-based assertion cannot see this,
+        // because the stamps either side of the retry are made unconditionally.
+        let events = events.lock().unwrap();
+        let discovers: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.as_str() == "send:server/discover")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            discovers.len(),
+            2,
+            "expected the probe and one negotiated retry, got {events:?}"
         );
+        let expected = format!("stamp:{MODERN_PROTOCOL_VERSION}");
         assert!(
-            stamped.iter().all(|v| v.as_deref() == Some(MODERN_PROTOCOL_VERSION)),
-            "every stamp must name the version actually being sent, got {stamped:?}"
+            events[discovers[0] + 1..discovers[1]].iter().any(|e| *e == expected),
+            "the retry must re-stamp between the two sends, got {events:?}"
         );
     }
 
