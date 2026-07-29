@@ -278,6 +278,30 @@ function App() {
     };
   }, []);
 
+  // An app that was running before an upgrade keeps launching the gateway version
+  // it cached at its own startup, and stopping that process only makes it come
+  // back. Nothing Toolport does fixes it, so say which apps to restart (SOU-435).
+  // Fires once per launch, after the reaper has had its second pass.
+  useEffect(() => {
+    const unlisten = listen<{ client: string; gateway: string }[]>(
+      "gateway-restart-needed",
+      (event) => {
+        const apps = event.payload ?? [];
+        if (apps.length === 0) return;
+        const names = apps.map((a) => a.client).join(", ");
+        toast.warning(
+          `Restart ${names} to finish upgrading. ${
+            apps.length === 1 ? "It is" : "They are"
+          } still launching an older gateway.`,
+          { duration: 10_000 },
+        );
+      },
+    );
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, []);
+
   // A refresh emits one `server-probed` event per server as its probe finishes, so
   // each row resolves the moment its own result is in - a slow npx cold-start no
   // longer holds the whole grid in "checking" until the slowest server returns

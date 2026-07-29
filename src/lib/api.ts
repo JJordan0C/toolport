@@ -370,6 +370,26 @@ export function stopStaleGateways(): Promise<string[]> {
   return invoke<string[]>("stop_stale_gateways");
 }
 
+/** An app that keeps relaunching an obsolete gateway and has to be restarted. */
+export type ClientNeedingRestart = {
+  /** Process image basename of the app, e.g. `claude.exe`. */
+  client: string;
+  /** The obsolete gateway it relaunched, e.g. `toolport-gateway-1.9.4.exe`. */
+  gateway: string;
+};
+
+/**
+ * Apps still launching an obsolete gateway. Stopping those processes cannot fix
+ * this: a client caches the spawn command at its own startup, so it relaunches
+ * the same old binary until the app itself is restarted.
+ *
+ * Call after {@link stopStaleGateways} — anything returned has already survived a
+ * reap, so it is a relaunch rather than a process that was missed.
+ */
+export function clientsNeedingRestart(): Promise<ClientNeedingRestart[]> {
+  return invoke<ClientNeedingRestart[]>("clients_needing_restart");
+}
+
 /**
  * Result of {@link teamConnect} / {@link teamJoinPoll}. `status` is:
  * - `connected` — joined; `registry` is the fresh merged state.

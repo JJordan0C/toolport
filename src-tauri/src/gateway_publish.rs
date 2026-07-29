@@ -467,7 +467,8 @@ pub fn decide_reap(proc: &GatewayProcess, ctx: &ReapContext) -> ReapDecision {
 
 /// An application that keeps relaunching an obsolete gateway and therefore has to
 /// be restarted by hand.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClientNeedingRestart {
     /// Basename of the client application, e.g. `claude.exe`.
     pub client: String,

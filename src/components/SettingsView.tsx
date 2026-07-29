@@ -58,6 +58,8 @@ import {
   startHttpBridge,
   stopHttpBridge,
   stopStaleGateways,
+  clientsNeedingRestart,
+  type ClientNeedingRestart,
   type HttpBridgeStatus,
   type QuarantinedTool,
 } from "@/lib/api";
@@ -570,6 +572,9 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   const [clientBusy, setClientBusy] = useState(false);
   const [reapBusy, setReapBusy] = useState(false);
   const [reapResult, setReapResult] = useState<string | null>(null);
+  // Apps relaunching an obsolete gateway from a cached spawn command. Stopping
+  // the process cannot fix these; only restarting the app does (SOU-435).
+  const [needRestart, setNeedRestart] = useState<ClientNeedingRestart[]>([]);
   const [autostartOn, setAutostartOn] = useState(false);
 
   const httpClients = registry?.httpClients ?? [];
@@ -1270,9 +1275,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             <span className="flex min-w-0 flex-1 flex-col leading-tight">
               <span className="font-medium">Stop old gateways</span>
               <span className="text-xs text-muted-foreground">
-                End leftover gateway processes from earlier installs. Agents that
-                auto-respawn MCP pick up the current binary on the next tool call; no full
-                app restart required for those hosts.
+                End leftover gateway processes from earlier installs. An app that was
+                already running caches the gateway command when it starts, so it
+                relaunches the old one until you restart the app itself. Toolport lists
+                any below.
               </span>
             </span>
             <button
@@ -1281,6 +1287,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               onClick={async () => {
                 setReapBusy(true);
                 setReapResult(null);
+                setNeedRestart([]);
                 try {
                   const stopped = await stopStaleGateways();
                   setReapResult(
@@ -1288,6 +1295,9 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                       ? "No old gateway processes found."
                       : `Stopped ${stopped.length}: ${stopped.join("; ")}`,
                   );
+                  // Only meaningful after the reap: whatever is still on an old
+                  // binary now has been relaunched, not missed.
+                  setNeedRestart(await clientsNeedingRestart());
                 } catch (e) {
                   toastError(`Couldn't stop old gateways: ${e}`);
                 } finally {
@@ -1300,6 +1310,27 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             </button>
           </div>
           {reapResult && <p className="text-xs text-muted-foreground">{reapResult}</p>}
+          {needRestart.length > 0 && (
+            <div className="flex flex-col gap-1 rounded-md border border-amber-500/40 bg-amber-500/5 px-2.5 py-2">
+              <span className="text-xs font-medium">
+                Restart {needRestart.length === 1 ? "this app" : "these apps"} to finish
+                upgrading
+              </span>
+              <span className="text-xs text-muted-foreground">
+                {needRestart.length === 1 ? "It is" : "They are"} still launching an older
+                gateway from a command cached at startup, so stopping the process just
+                brings it back.
+              </span>
+              <ul className="mt-0.5 flex flex-col gap-0.5">
+                {needRestart.map((c) => (
+                  <li key={`${c.client}:${c.gateway}`} className="text-xs">
+                    <span className="font-medium">{c.client}</span>
+                    <span className="text-muted-foreground"> is running {c.gateway}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       </section>
     </div>

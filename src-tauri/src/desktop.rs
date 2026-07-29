@@ -2784,6 +2784,20 @@ fn stop_stale_gateways(bridge: State<HttpBridgeState>) -> Vec<String> {
     reap_stale_and_restore_bridge(bridge.inner())
 }
 
+/// Applications still launching an obsolete gateway, which only restarting them
+/// can fix (SOU-435).
+///
+/// Meant to be called AFTER [`stop_stale_gateways`]: anything reported here has
+/// already survived a reap, so it is a client relaunching from a spawn command it
+/// cached at its own startup, not a process the reaper failed to stop.
+#[tauri::command]
+fn clients_needing_restart() -> Vec<crate::gateway_publish::ClientNeedingRestart> {
+    let extra_keep = clients::resolve_gateway_path()
+        .map(|p| vec![p])
+        .unwrap_or_default();
+    crate::gateway_publish::clients_needing_gateway_restart(&extra_keep)
+}
+
 /// Run the stale reaper, then bring the supervised HTTP bridge back if the reaper
 /// stopped it (SOU-418 / SOU-432).
 ///
@@ -3258,6 +3272,7 @@ pub fn run() {
             http_bridge_status,
             stop_spawned_gateways,
             stop_stale_gateways,
+            clients_needing_restart,
         ])
         // Close-to-tray: the window's X hides it instead of quitting, so the gateway and
         // approval broker keep running (HITL only works while the app is alive). Quit is
