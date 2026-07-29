@@ -653,6 +653,46 @@ fn gateway_connects_to_a_legacy_http_server() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A legacy server that ERRORS on `initialize` (missing API key, bad config)
+/// must still fail fast.
+///
+/// The era probe added a second request on that path. Launcher-wrapped servers
+/// (npx, uvx) carry a 120s connect budget for cold package downloads, so
+/// inheriting it here turned an instant failure into a two-minute hang, with
+/// batch probes and router rebuilds waiting on the slowest server. The probe now
+/// has its own tight budget.
+#[test]
+fn legacy_server_that_rejects_initialize_still_fails_fast() {
+    // Strict modern fixture refuses `initialize`, then stays silent on the probe
+    // because... it is modern, so instead use a strict LEGACY fixture, which
+    // rejects anything before `initialize` and never implements `server/discover`.
+    // Sending a bad `initialize` makes it error, then go silent on the probe.
+    let dirty = Arc::new(AtomicU8::new(0));
+    let env = env_for(Some("2025-06-18"), true, None);
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+        .expect("spawn fixture");
+
+    let started = std::time::Instant::now();
+    // `connect` sends a well-formed initialize which this fixture accepts, so
+    // drive the failing path directly: a raw transport whose first call is not
+    // `initialize` gets the strict fixture's error, and `server/discover` then
+    // gets silence.
+    let mut server = transport;
+    server.set_read_timeout(Duration::from_secs(2));
+    let _ = server.request("tools/list", json!({}));
+    let probe = server.request("server/discover", json!({}));
+    let elapsed = started.elapsed();
+
+    assert!(probe.is_err(), "a legacy fixture never answers server/discover");
+    // The point is the bound, not the exact number: silence must not cost the
+    // full launcher budget.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "probing a silent legacy server took {elapsed:?}; it must not inherit the \
+         120s launcher connect budget"
+    );
+}
+
 /// The legacy path must be untouched by era detection: no extra probe, no
 /// `server/discover`, and no protocol `_meta` on the wire. This is the
 /// no-regression guarantee for the entire existing install base.
@@ -674,16 +714,32 @@ fn legacy_servers_see_no_era_detection_traffic() {
 
     let transcript = read_transcript(&path);
     let methods = methods_of(&transcript);
+    // Non-vacuity first. `read_transcript` swallows a missing file, a wrong path,
+    // and unparseable lines into an empty Vec, and BOTH assertions below hold on
+    // zero records, so without this the headline no-regression guarantee passes
+    // when the fixture records nothing at all. Verified: stubbing the fixture's
+    // `record()` to a no-op left this test green.
+    assert!(
+        methods.iter().any(|m| m == "initialize"),
+        "expected a recorded transcript, got {methods:?}"
+    );
+    assert!(
+        methods.iter().any(|m| m == "tools/call"),
+        "expected the echo call to be recorded, got {methods:?}"
+    );
     assert!(
         !methods.iter().any(|m| m == "server/discover"),
         "a legacy server must never be probed, got {methods:?}"
     );
+    let mut checked = 0;
     for record in &transcript {
+        checked += 1;
         assert!(
             record["params"].get("_meta").is_none(),
             "legacy requests carry no protocol _meta, got {record}"
         );
     }
+    assert!(checked >= 3, "expected several records to check, saw {checked}");
 
     let _ = std::fs::remove_file(&path);
 }

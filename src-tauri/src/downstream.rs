@@ -210,6 +210,16 @@ const STDIO_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// so one hung server should fail in seconds, not stall everything for the full
 /// live-call timeout. Restored to STDIO_READ_TIMEOUT once connected.
 const STDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for the `server/discover` era probe, deliberately far tighter than any
+/// connect timeout.
+///
+/// The probe only runs after a server has already answered `initialize` with an
+/// error, so the process is alive and responsive; a server that implements
+/// `server/discover` answers it locally and immediately. A legacy server that
+/// does not implement it usually stays silent, and that silence is the signal to
+/// fall back. Charging the full connect budget for that silence would make every
+/// legacy misconfiguration take minutes to report.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 /// First-`initialize` budget for download-then-run launchers (npx, uvx, pnpm dlx,
 /// ...). On a cold cache these resolve and download the server package before the
 /// process can answer anything - easily 15-60s, far past the normal handshake
@@ -2733,6 +2743,20 @@ impl DownstreamServer {
                 // has no such method. Confirm with `server/discover`, which every
                 // modern server MUST implement, rather than guessing from an
                 // error code the spec leaves implementation-defined.
+                // Bound the probe tightly, and restore the handshake budget after.
+                //
+                // A launcher-wrapped server (npx, uvx) carries a 120s connect
+                // budget so a cold package download can finish. Inheriting that
+                // here would turn "legacy server rejected initialize" - a missing
+                // API key, a bad config - from an instant failure into a two
+                // minute hang, and a batch probe or router rebuild waits on the
+                // slowest server. A server that implements `server/discover`
+                // answers it locally and immediately, so it needs none of that
+                // budget.
+                // The post-match `set_read_timeout(STDIO_CONNECT_TIMEOUT)` below
+                // restores a normal budget for the rest of the handshake.
+                transport.set_read_timeout(PROBE_TIMEOUT);
+
                 // Stamp the modern metadata BEFORE probing, not after. On HTTP the
                 // transport derives `MCP-Protocol-Version` from it, and that header
                 // MUST match the body's `_meta`; probing first would send a legacy

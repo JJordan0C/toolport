@@ -7985,27 +7985,22 @@ fn handle_mcp_http(
             // Keying on presence alone would let a client that names a legacy
             // version in `_meta` skip the session requirement here while still
             // being served legacy-shaped results there.
-            let is_modern =
-                upstream_declared_version(&req) == Some(MODERN_PROTOCOL_VERSION);
-
-            // Session rules. Modern requests have none; legacy `initialize` may
-            // omit a session id (and gets a new one), and every other legacy
-            // request must present a live one.
+            // Toolport is dual-era on stdio and legacy-only over Streamable HTTP.
             //
-            // Removing the session for modern clients does NOT weaken the
-            // authorization boundary. `resolve_http_caller` already resolves the
-            // bearer token to an identity and an effective server scope on EVERY
-            // request, and that is what `allowed` / `client` are built from here.
-            // The session only ever *bound* a minted id to that same identity so a
-            // stolen id could not be replayed by another caller. With no id to
-            // steal, there is nothing to bind, and re-resolving scope per request
-            // is strictly tighter than a session that caches it (a live re-scope
-            // takes effect immediately instead of on session expiry).
-            let session_id: Option<String> = if is_modern {
-                // Per spec, an inbound Mcp-Session-Id on a modern request is
-                // ignored rather than honoured or echoed.
-                None
-            } else if is_initialize {
+            // A session-less modern path was implemented here and then withdrawn,
+            // because serving modern clients over HTTP needs more than skipping the
+            // session: `Mcp-Method`/`Mcp-Name` on outbound requests, inbound header
+            // validation, `400`/`404` statuses for protocol errors, and above all a
+            // server-to-client channel (`subscriptions/listen`) to replace the one
+            // sessions provided. Without that last piece, a session-less client
+            // collapsed into the shared `RESOURCE_SUB_STDIO` subscription bucket,
+            // where one client could tear down another's subscription.
+            //
+            // Requiring a session for every HTTP request is therefore the honest
+            // state: a dual-era client gets a `400` here with no recognized modern
+            // error, which the spec defines as the signal to fall back to
+            // `initialize`. Tracked for SOU-447/448/450.
+            let session_id: Option<String> = if is_initialize {
                 if let Some(existing) = session_hdr.map(str::trim).filter(|s| !s.is_empty()) {
                     // Client re-sent a session on initialize: accept if still live,
                     // otherwise mint a fresh one (spec: start over without the old id).
@@ -8050,14 +8045,6 @@ fn handle_mcp_http(
                         }
                     }
                 }
-            } else if is_jsonrpc_response(&req) {
-                // Modern clients never answer server-initiated requests: MRTR
-                // replaced them, and the transport forbids a client sending a
-                // JSON-RPC response at all.
-                return HttpOut::json_err(
-                    400,
-                    "JSON-RPC responses are not accepted from a 2026-07-28 client",
-                );
             }
 
             // Notifications / JSON-RPC responses: 202 with empty body.
@@ -12186,129 +12173,6 @@ mod tests {
     }
 
     #[test]
-    fn modern_http_client_needs_no_session() {
-        // The stateless revision's whole point over HTTP: no initialize, no
-        // Mcp-Session-Id, just an authenticated request (SOU-447).
-        let state = http_state(true);
-        let caller = test_caller("client:cursor", None);
-        let out = handle_http(
-            &state,
-            &SearchGuard::default(),
-            &ConfirmGuard::new(),
-            "POST",
-            "/mcp",
-            &modern_http_body(1, "tools/list", json!({})),
-            None,
-            None,
-            None,
-            Some(&caller),
-        );
-        assert_eq!(out.status, 200, "body={}", out.body);
-
-        // No session was minted, and none is echoed: the header does not exist in
-        // 2026-07-28, and echoing one would invite the client to replay it.
-        assert!(
-            !out.extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("Mcp-Session-Id")),
-            "modern response must carry no Mcp-Session-Id, got {:?}",
-            out.extra
-        );
-        assert!(
-            state.mcp_sessions.lock().unwrap().is_empty(),
-            "no session should have been created"
-        );
-
-        let body: Value = serde_json::from_str(&out.body).unwrap();
-        assert_eq!(body["result"]["resultType"], "complete");
-    }
-
-    #[test]
-    fn modern_http_request_still_enforces_client_scope() {
-        // THE security test for SOU-447. Sessions used to bind a minted id to an
-        // identity; removing them must not weaken what a scoped client can reach.
-        // Scope comes from resolve_http_caller on every request, so it still
-        // applies with no session in play.
-        let state = http_state(false);
-        // A real route, so the test discriminates: an in-scope call must SUCCEED
-        // while an out-of-scope one is refused. Without the positive case, a
-        // gateway that refused everything would also pass.
-        *state.router.lock().unwrap() = Arc::new(routed_router("github", "list_repos"));
-        let caller = test_caller("client:scoped", Some(&["github"]));
-        let allowed: std::collections::HashSet<String> =
-            ["github".to_string()].into_iter().collect();
-
-        let call = |name: &str| {
-            handle_http(
-                &state,
-                &SearchGuard::default(),
-                &ConfirmGuard::new(),
-                "POST",
-                "/mcp",
-                &modern_http_body(1, "tools/call", json!({ "name": name, "arguments": {} })),
-                None,
-                None,
-                Some(&allowed),
-                Some(&caller),
-            )
-        };
-
-        // In scope: the call gets PAST the scope guard and is routed downstream.
-        // The mock route does not implement tools/call, so what comes back is its
-        // own error rather than a refusal. The distinguishing property is which
-        // error it is, not whether one occurred.
-        let in_scope = call("github__list_repos");
-        assert_eq!(in_scope.status, 200, "body={}", in_scope.body);
-        let body: Value = serde_json::from_str(&in_scope.body).unwrap();
-        let text = body["result"]["content"][0]["text"].as_str().unwrap_or("");
-        assert!(
-            !text.contains("not available to this client"),
-            "an in-scope call must not be refused by the scope guard, got {body}"
-        );
-        assert!(
-            text.contains("unexpected tools/call"),
-            "expected the call to reach the downstream route, got {body}"
-        );
-
-        let out_of_scope = call("stripe__refund");
-        assert_eq!(out_of_scope.status, 200, "body={}", out_of_scope.body);
-        let body: Value = serde_json::from_str(&out_of_scope.body).unwrap();
-        assert!(
-            body["result"]["isError"].as_bool().unwrap_or(false),
-            "an out-of-scope server must be refused, got {body}"
-        );
-        assert!(
-            body["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap_or("")
-                .contains("not available to this client"),
-            "expected the scope guard to be what refused it, got {body}"
-        );
-    }
-
-    #[test]
-    fn modern_http_request_ignores_an_inbound_session_id() {
-        // Spec: a modern request's Mcp-Session-Id is ignored, not honoured and not
-        // echoed. Honouring it would let a stale legacy id influence a stateless
-        // request; echoing it would resurrect the header.
-        let state = http_state(true);
-        let caller = test_caller("client:cursor", None);
-        let out = handle_http(
-            &state,
-            &SearchGuard::default(),
-            &ConfirmGuard::new(),
-            "POST",
-            "/mcp",
-            &modern_http_body(1, "tools/list", json!({})),
-            // A session id that was never minted: a legacy request would 404 here.
-            Some("00000000000000000000000000000000"),
-            None,
-            None,
-            Some(&caller),
-        );
-        assert_eq!(out.status, 200, "an unknown session id must be ignored, body={}", out.body);
-        assert!(!out.extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("Mcp-Session-Id")));
-    }
-
-    #[test]
     fn legacy_http_client_still_requires_a_session() {
         // The other half of dual-era: nothing about the legacy path changed.
         let state = http_state(true);
@@ -12353,9 +12217,12 @@ mod tests {
     }
 
     #[test]
-    fn modern_http_client_may_not_send_a_jsonrpc_response() {
-        // MRTR replaced server-initiated requests, and the transport forbids a
-        // client sending a JSON-RPC response at all.
+    fn modern_http_client_is_not_served_and_gets_a_fallback_signal() {
+        // Toolport is dual-era on stdio and legacy-only over Streamable HTTP.
+        // Pins that boundary honestly rather than leaving it implicit: a modern
+        // client gets a 400 whose body is NOT a recognized modern error, which
+        // the spec defines as the signal for a dual-era client to fall back to
+        // `initialize`. Serving these properly is SOU-447/448/450.
         let state = http_state(true);
         let caller = test_caller("client:cursor", None);
         let out = handle_http(
@@ -12364,17 +12231,30 @@ mod tests {
             &ConfirmGuard::new(),
             "POST",
             "/mcp",
-            &json!({
-                "jsonrpc": "2.0", "id": 1, "result": {},
-                "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION } }
-            })
-            .to_string(),
+            &modern_http_body(1, "tools/list", json!({})),
             None,
             None,
             None,
             Some(&caller),
         );
         assert_eq!(out.status, 400, "body={}", out.body);
+        // Asserting the body, not just the status: a bare status check would
+        // also pass on an unrelated 400, which is how one of these tests passed
+        // for the wrong reason before.
+        assert!(
+            out.body.contains("Mcp-Session-Id"),
+            "expected the session requirement to be what refused it, got {}",
+            out.body
+        );
+        // Crucially NOT a modern error code: -32020/-32021/-32022 would tell a
+        // dual-era client we are modern and stop it falling back.
+        for code in ["-32020", "-32021", "-32022"] {
+            assert!(
+                !out.body.contains(code),
+                "a legacy-only HTTP endpoint must not answer with {code}, got {}",
+                out.body
+            );
+        }
     }
 
     #[test]
@@ -13370,9 +13250,10 @@ mod tests {
 
     #[test]
     fn upstream_era_does_not_leak_between_requests() {
-        // The era rides a thread-local, so a modern request must not leave the
-        // next (legacy) request decorated. Code mode re-enters dispatch, which is
-        // exactly where a leak would show up.
+        // Sequential case. Weak on its own: `UpstreamEraGuard::enter` replaces the
+        // thread-local unconditionally, so the second dispatch sets it correctly
+        // whether or not Drop ever restores anything. Kept for the plain
+        // regression, with the real check in the nested test below.
         let modern = dispatch(&modern_req(6, "tools/list", json!({})));
         assert_eq!(modern["result"]["resultType"], "complete");
 
@@ -13382,6 +13263,39 @@ mod tests {
         assert!(
             legacy["result"].get("resultType").is_none(),
             "era leaked into the following legacy request"
+        );
+    }
+
+    #[test]
+    fn nested_modern_dispatch_does_not_decorate_the_outer_legacy_response() {
+        // THE test for the RAII guard, and the one that was missing: gutting
+        // `impl Drop for UpstreamEraGuard` left all 190 gateway tests green,
+        // because nothing exercised nesting.
+        //
+        // Code mode re-enters dispatch while an outer request is being served, so
+        // an inner modern request must restore the outer era on the way out
+        // rather than leaving it set.
+        let outer_is_modern = ACTIVE_UPSTREAM_VERSION.with(|cell| cell.borrow().is_some());
+        assert!(!outer_is_modern, "test starts with no era installed");
+
+        // Simulate the outer legacy request holding the thread-local, then a
+        // nested modern dispatch inside it.
+        let _outer = UpstreamEraGuard::enter(None);
+        let inner = dispatch(&modern_req(8, "tools/list", json!({})));
+        assert_eq!(inner["result"]["resultType"], "complete", "inner is modern");
+
+        // Back in the outer request: if Drop failed to restore, this reads as
+        // modern and the outer response would be wrongly decorated.
+        assert!(
+            !serving_modern_client(),
+            "the nested modern dispatch leaked its era into the outer request"
+        );
+        let outer = dispatch(&json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/list", "params": {}
+        }));
+        assert!(
+            outer["result"].get("resultType").is_none(),
+            "outer legacy response was decorated after a nested modern dispatch"
         );
     }
 
