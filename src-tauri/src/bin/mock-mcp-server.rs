@@ -46,6 +46,7 @@ const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 // JSON-RPC error codes. `-32022` is `UnsupportedProtocolVersion` from the
 // 2026-07-28 allocation policy (`-32020`..`-32099` reserved for the spec).
 const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+const HEADER_MISMATCH: i64 = -32020;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_REQUEST: i64 = -32600;
 
@@ -393,8 +394,106 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
     Some(success(id, decorate(cfg, method, result)))
 }
 
+/// Header/body agreement check for a modern Streamable HTTP request.
+///
+/// From 2026-07-28 `MCP-Protocol-Version` **MUST** equal the
+/// `io.modelcontextprotocol/protocolVersion` in the body's `_meta`, and a server
+/// that sees them disagree rejects with `400` and `HeaderMismatch` (-32020).
+/// This is the rule a stdio fixture structurally cannot express, which is how a
+/// hardcoded header shipped past a green stdio suite (SOU-443 follow-up).
+///
+/// Returns the JSON-RPC error to send instead, if the request is invalid.
+fn header_gate(cfg: &Config, header_version: Option<&str>, req: &Value, id: &Value) -> Option<Value> {
+    if !cfg.strict || !cfg.revision.is_modern() {
+        return None;
+    }
+    let body_version = req
+        .get("params")
+        .and_then(|p| p.get("_meta"))
+        .and_then(|m| m.get(META_PROTOCOL_VERSION))
+        .and_then(|v| v.as_str());
+    match (header_version, body_version) {
+        (Some(h), Some(b)) if h == b => None,
+        (None, _) => Some(error(
+            id.clone(),
+            HEADER_MISMATCH,
+            "missing required MCP-Protocol-Version header",
+            None,
+        )),
+        (Some(h), b) => Some(error(
+            id.clone(),
+            HEADER_MISMATCH,
+            &format!(
+                "MCP-Protocol-Version header '{h}' does not match body _meta '{}'",
+                b.unwrap_or("<absent>")
+            ),
+            None,
+        )),
+    }
+}
+
+/// Serve the same era logic over Streamable HTTP instead of stdio.
+///
+/// Prints `MOCK_MCP_URL=<url>` on stdout once bound so a test can discover the
+/// ephemeral port.
+fn serve_http(cfg: &Config) {
+    let server = tiny_http::Server::http("127.0.0.1:0").expect("bind fixture port");
+    let port = server
+        .server_addr()
+        .to_ip()
+        .expect("ip addr")
+        .port();
+    println!("MOCK_MCP_URL=http://127.0.0.1:{port}/mcp");
+    let _ = std::io::stdout().flush();
+
+    let mut state = State { grown: false, initialized: false };
+    for mut request in server.incoming_requests() {
+        let header_version = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("MCP-Protocol-Version"))
+            .map(|h| h.value.as_str().to_string());
+        let mut body = String::new();
+        let _ = request.as_reader().read_to_string(&mut body);
+        let req: Value = match serde_json::from_str(body.trim()) {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = request.respond(
+                    tiny_http::Response::from_string("bad json").with_status_code(400),
+                );
+                continue;
+            }
+        };
+        record(cfg, &req);
+
+        let id = req.get("id").cloned().unwrap_or(Value::Null);
+        let (status, payload) = match header_gate(cfg, header_version.as_deref(), &req, &id) {
+            // A header/body disagreement is a 400, per the transport spec.
+            Some(err) => (400, Some(err)),
+            None => {
+                let mut pre = Vec::new();
+                (200, handle(cfg, &mut state, &req, &mut pre))
+            }
+        };
+        let response = match payload {
+            Some(value) => tiny_http::Response::from_string(value.to_string())
+                .with_status_code(status)
+                .with_header(
+                    tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap(),
+                ),
+            // A notification gets 202 with no body.
+            None => tiny_http::Response::from_string(String::new()).with_status_code(202),
+        };
+        let _ = request.respond(response);
+    }
+}
+
 fn main() {
     let cfg = Config::from_env();
+    if std::env::var("MOCK_MCP_HTTP").as_deref() == Ok("1") {
+        serve_http(&cfg);
+        return;
+    }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();

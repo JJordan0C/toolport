@@ -25,7 +25,9 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use conduit_lib::downstream::{DownstreamServer, StdioTransport, Transport, TransportError};
+use conduit_lib::downstream::{
+    DownstreamServer, HttpTransport, StdioTransport, Transport, TransportError,
+};
 use serde_json::{json, Value};
 
 const MODERN: &str = "2026-07-28";
@@ -62,6 +64,51 @@ fn env_for(revision: Option<&str>, strict: bool, transcript: Option<&str>) -> Ve
         env.push(("MOCK_MCP_TRANSCRIPT".to_string(), path.to_string()));
     }
     env
+}
+
+/// A fixture serving Streamable HTTP, killed when the handle drops.
+struct HttpFixture {
+    child: std::process::Child,
+    url: String,
+}
+
+impl Drop for HttpFixture {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Spawn the fixture in HTTP mode and wait for it to report its ephemeral port.
+///
+/// The stdio fixture cannot express header rules at all, which is exactly how a
+/// hardcoded `MCP-Protocol-Version` shipped past a green stdio suite. Anything
+/// about headers has to be tested here.
+fn spawn_http_fixture(revision: &str, strict: bool, transcript: Option<&str>) -> HttpFixture {
+    use std::io::BufRead;
+
+    let mut cmd = std::process::Command::new(mock_bin());
+    cmd.env("MOCK_MCP_HTTP", "1")
+        .env("MOCK_MCP_REVISION", revision)
+        .stdout(std::process::Stdio::piped());
+    if strict {
+        cmd.env("MOCK_MCP_STRICT", "1");
+    }
+    if let Some(path) = transcript {
+        cmd.env("MOCK_MCP_TRANSCRIPT", path);
+    }
+    let mut child = cmd.spawn().expect("spawn http fixture");
+    let stdout = child.stdout.take().expect("fixture stdout");
+    let mut line = String::new();
+    std::io::BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("fixture should announce its url");
+    let url = line
+        .trim()
+        .strip_prefix("MOCK_MCP_URL=")
+        .expect("fixture should print MOCK_MCP_URL=<url>")
+        .to_string();
+    HttpFixture { child, url }
 }
 
 /// A raw transport to the fixture, bypassing `DownstreamServer::connect` so a
@@ -512,6 +559,97 @@ fn gateway_connects_to_a_modern_server() {
         "expected the tools/list and tools/call records to be checked, saw {checked}"
     );
 
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Proves the HTTP fixture's header gate actually fires. Without this, the
+/// connect test below could pass on a fixture that validates nothing, which is
+/// precisely the blind spot the stdio-only harness had.
+#[test]
+fn http_fixture_enforces_header_body_agreement() {
+    let fixture = spawn_http_fixture(MODERN, true, None);
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+        "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": MODERN } }
+    });
+
+    // Header disagrees with the body: the exact shape of the bug that shipped.
+    let mismatched = ureq::post(&fixture.url)
+        .set("MCP-Protocol-Version", "2025-06-18")
+        .send_json(body.clone());
+    match mismatched {
+        Err(ureq::Error::Status(400, resp)) => {
+            let err: Value = resp.into_json().expect("json error body");
+            assert_eq!(
+                err["error"]["code"], -32020,
+                "a header/body mismatch must be HeaderMismatch, got {err}"
+            );
+        }
+        other => panic!("expected 400 HeaderMismatch, got {other:?}"),
+    }
+
+    // Absent header is equally invalid under this revision.
+    let missing = ureq::post(&fixture.url).send_json(body.clone());
+    assert!(
+        matches!(missing, Err(ureq::Error::Status(400, _))),
+        "a missing MCP-Protocol-Version must be rejected"
+    );
+
+    // ...and the matching header is accepted, so the gate is not simply refusing
+    // everything.
+    let ok = ureq::post(&fixture.url)
+        .set("MCP-Protocol-Version", MODERN)
+        .send_json(body)
+        .expect("agreeing header and body must be accepted");
+    let parsed: Value = ok.into_json().expect("json body");
+    assert!(parsed["result"]["tools"].is_array(), "got {parsed}");
+}
+
+/// The regression test for the bug the stdio harness could not see: Toolport
+/// driving a strict modern server over Streamable HTTP.
+///
+/// Before the fix, `MCP-Protocol-Version` was hardcoded to the legacy version
+/// while the body declared `2026-07-28`, and the `server/discover` probe ran
+/// before the metadata was stamped. Either alone makes this fail.
+#[test]
+fn gateway_connects_to_a_modern_http_server() {
+    let fixture = spawn_http_fixture(MODERN, true, None);
+    let transport = HttpTransport::new(&fixture.url);
+    let mut server = DownstreamServer::connect("mock".to_string(), Box::new(transport))
+        .expect("a dual-era gateway must reach a modern HTTP server");
+
+    assert!(server.era().is_modern(), "era should be detected as modern");
+    assert_eq!(server.era().version(), MODERN);
+
+    // Usable, not merely connected: every request has to carry an agreeing
+    // header and body or the fixture rejects it.
+    let result = server
+        .call("echo", json!({ "text": "hi" }))
+        .expect("a modern HTTP server must be callable");
+    assert_eq!(result["content"][0]["text"], "hi");
+    assert_eq!(result["resultType"], "complete");
+}
+
+/// Legacy servers over HTTP keep working exactly as before: `initialize`
+/// handshake, no probe, no modern metadata.
+#[test]
+fn gateway_connects_to_a_legacy_http_server() {
+    let path = scratch_path("legacy-http");
+    let _ = std::fs::remove_file(&path);
+    let fixture = spawn_http_fixture("2025-06-18", true, Some(&path.to_string_lossy()));
+    let transport = HttpTransport::new(&fixture.url);
+    let mut server = DownstreamServer::connect("mock".to_string(), Box::new(transport))
+        .expect("legacy HTTP must still connect");
+    assert!(!server.era().is_modern());
+    server.call("echo", json!({ "text": "hi" })).expect("call");
+    drop(fixture);
+
+    let methods = methods_of(&read_transcript(&path));
+    assert_eq!(methods.first().map(String::as_str), Some("initialize"));
+    assert!(
+        !methods.iter().any(|m| m == "server/discover"),
+        "a legacy server must never be probed, got {methods:?}"
+    );
     let _ = std::fs::remove_file(&path);
 }
 
