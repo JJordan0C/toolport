@@ -2290,7 +2290,8 @@ pub struct HttpTransport {
     /// `None` or error keeps the current token; a forced refresh must return a new
     /// raw token or the authentication failure is surfaced.
     refresh: Option<RefreshFn>,
-    /// The token a forced refresh last produced, if any.
+    /// The token a forced refresh produced and that has not yet been accepted by
+    /// the server, if any.
     ///
     /// The forced-refresh budget is per *token*, not per call. A 401 answered by
     /// minting a fresh token, where that fresh token then 401s too, is not an
@@ -2299,9 +2300,13 @@ pub struct HttpTransport {
     /// link in the chain. Connect alone posts twice (`initialize`, then the
     /// `server/discover` era probe), so a per-call budget spends two (SOU-474).
     ///
-    /// Cleared implicitly: once a proactive refresh swaps in a different token,
-    /// `auth` no longer matches this and the budget is available again, so a
-    /// long-lived session still self-heals when its token later expires.
+    /// Cleared as soon as any request comes back 2xx, which is what makes this a
+    /// budget rather than a latch. Relying on a proactive refresh to clear it was
+    /// wrong: a provider that omits `expires_in` has no deadline, so
+    /// `refresh_before_send` never fires, and the connection would 401 forever
+    /// with a working refresh token in the vault - the exact case the reactive
+    /// fallback exists to serve. Only a token the server has never accepted keeps
+    /// the budget spent.
     forced_refresh_token: Option<String>,
     server_handler: Option<ServerRequestHandler>,
     /// Fan `notifications/resources/updated` seen mid-SSE to subscribed
@@ -2628,6 +2633,9 @@ impl HttpTransport {
                 Err(e) => return Err(TransportError::Fatal(e.to_string())),
             }
         };
+        // The server accepted this token, so its forced-refresh budget is spent
+        // on nothing and must be returned. See [`Self::forced_refresh_token`].
+        self.forced_refresh_token = None;
 
         if let Some(sid) = resp.header("Mcp-Session-Id") {
             self.session_id = Some(sid.to_string());
@@ -5087,6 +5095,94 @@ mod tests {
         // 401, refresh, 401(retry) on the first post; the second post sends once
         // and gives up without minting anything.
         assert_eq!(posts.load(Ordering::SeqCst), 3, "no retry on the second POST");
+    }
+
+    #[test]
+    fn an_accepted_token_returns_its_forced_refresh_budget() {
+        // The per-token budget must be a budget, not a latch. A provider that
+        // omits `expires_in` has no deadline, so `refresh_before_send` never
+        // fires and `auth` can only ever change via a FORCED refresh. Keying the
+        // budget to the token and clearing it only on a proactive swap therefore
+        // wedged the connection: after one successful reactive refresh, the next
+        // expiry 401s forever with a working refresh token sitting in the vault.
+        //
+        // `Fatal` is not a health failure, so the breaker never trips and nothing
+        // reconnects - every later call to that server fails for the life of the
+        // process. Clearing on 2xx is what makes it recoverable (SOU-474 review).
+        use super::{HttpTransport, RefreshFn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Models a short-lived token: a freshly minted one works exactly once and
+        // is stale by the next request, so two successive expiries occur with no
+        // `expires_in` for the proactive path to act on.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sc = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let mut spent: std::collections::HashSet<String> = std::collections::HashSet::new();
+            while !sc.load(Ordering::SeqCst) {
+                let req = match server.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(Some(req)) => req,
+                    Ok(None) => continue,
+                    Err(_) => return,
+                };
+                let auth = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Authorization"))
+                    .map(|h| h.value.as_str().to_string())
+                    .unwrap_or_default();
+                if auth.starts_with("Bearer minted-") && spent.insert(auth.clone()) {
+                    let ct = tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"application/json"[..],
+                    )
+                    .unwrap();
+                    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+                    let _ = req.respond(tiny_http::Response::from_string(body).with_header(ct));
+                } else {
+                    let _ = req
+                        .respond(tiny_http::Response::from_string("nope").with_status_code(401));
+                }
+            }
+        });
+
+        let forced = Arc::new(AtomicUsize::new(0));
+        let fc = Arc::clone(&forced);
+        // No proactive deadline: the non-forced arm always declines, exactly like
+        // a provider that reported no `expires_in`.
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+            if force {
+                let n = fc.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(format!("minted-{n}")))
+            } else {
+                Ok(None)
+            }
+        }));
+
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut t = HttpTransport::with_auth_refresh(&url, Some("stale".to_string()), refresh);
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
+
+        // First expiry: 401, forced refresh to minted-0, retry accepted.
+        assert!(t.post(&body, true).is_ok(), "first reactive refresh recovers");
+        // The accepted token is now stale at the provider (it is not minted-1),
+        // so this 401s. The budget must be available again to recover.
+        assert!(
+            t.post(&body, true).is_ok(),
+            "a second expiry must still be recoverable; the budget latched shut"
+        );
+        drop(t);
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+
+        assert_eq!(
+            forced.load(Ordering::SeqCst),
+            2,
+            "one forced exchange per expiry, and the second must actually happen"
+        );
     }
 
     #[test]

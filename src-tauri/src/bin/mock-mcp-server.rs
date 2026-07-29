@@ -302,9 +302,11 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
             // enforcement while this arm silently accepted the handshake and
             // even marked the server initialized (SOU-474 #11).
             //
-            // Dying is the enforcement a fixture has: the client sees the stream
-            // close and the test fails, instead of passing against a mock that
-            // quietly tolerated what it claims to reject.
+            // Dying is the enforcement a fixture has: the test fails instead of
+            // passing against a mock that quietly tolerated what it claims to
+            // reject. `handle` is shared with `serve_http`, so this fires in HTTP
+            // mode too - there the client sees a connection error rather than a
+            // closed stdio stream, which is equally loud and equally correct.
             if cfg.strict && cfg.revision.is_modern() && method == "notifications/initialized" {
                 eprintln!(
                     "mock-mcp-server: strict {} server received legacy '{method}'",

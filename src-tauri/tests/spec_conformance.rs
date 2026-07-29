@@ -751,6 +751,13 @@ fn legacy_servers_see_no_era_detection_traffic() {
 /// Toolport's side - a gateway that rebuilds tool objects field-by-field drops
 /// unknown keys - and nothing exercised the aggregation that would do it
 /// (SOU-474, untested paths).
+///
+/// Scope: this covers `Router` aggregation, where the rebuild risk actually lives
+/// (`index_server` clones the tool and overwrites three fields). It stops short of
+/// the gateway's own `tools/list` arm, which serves from `aggregated_tools` and is
+/// not exercised here. Today unknown keys structurally cannot be dropped, so this
+/// is a forward-looking pin rather than a regression test - it earns its place by
+/// failing the moment someone reconstructs the tool object instead of cloning it.
 #[test]
 fn the_gateway_forwards_icons_through_tool_aggregation() {
     use conduit_lib::router::Router;
@@ -809,9 +816,16 @@ fn a_legacy_server_sees_client_meta_relayed_but_never_protocol_meta() {
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
     assert!(!server.era().is_modern(), "this pin is about the legacy hop");
 
+    // Includes a per-hop key on purpose. Sending only client-owned keys made the
+    // "never protocol meta" loop below vacuous: it proved the legacy transport
+    // does not STAMP one, never that PER_HOP_META_KEYS strips one the client sent
+    // (#511 review). Toolport speaks for itself downstream, so a client that
+    // declares a version must not have that claim relayed onward.
     let client_meta = json!({
         "progressToken": "client-tok",
         "traceparent": "00-abc-def-01",
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": { "name": "SomeClient", "version": "9.9" },
     });
     server
         .call_with_cancel("echo", json!({ "text": "hi" }), None, Some(&client_meta))

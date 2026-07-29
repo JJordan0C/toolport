@@ -123,18 +123,19 @@ fn error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-/// Protocol versions Toolport serves to upstream clients, newest first.
+/// Protocol revisions Toolport serves to upstream clients, newest first.
 ///
-/// Every entry below `MODERN_PROTOCOL_VERSION` is a legacy revision: the gateway's
-/// own behaviour does not vary across them (revision differences are additive and
-/// ride through from the downstream server), so serving them costs nothing and
-/// refusing them would strand clients Toolport already answers.
+/// ADVERTISED, not accepted-in-`_meta`: see [`MODERN_UPSTREAM_VERSIONS`] for that.
+/// This is what `server/discover` reports and what an `UnsupportedProtocolVersion`
+/// error names, so a client learns every revision it could reach Toolport on -
+/// including the legacy ones, which it reaches by handshaking with `initialize`
+/// rather than by declaring a version per request.
 ///
-/// This list must stay a superset of what the `initialize` arm accepts. That arm
-/// deliberately echoes whatever the client asks for and validates nothing - legacy
-/// wire behaviour is pinned and must not change - so a revision it would happily
-/// serve while this list omitted it got `-32022` on every request the moment the
-/// client declared it in `_meta` instead (SOU-474 #7).
+/// Every entry below `MODERN_PROTOCOL_VERSION` is legacy. The gateway's own
+/// behaviour does not vary across them (revision differences are additive and ride
+/// through from the downstream server), and the `initialize` arm echoes whatever
+/// the client asks for, so all of them genuinely are served. Listing only two
+/// under-reported that (SOU-474 #7).
 const SUPPORTED_UPSTREAM_VERSIONS: [&str; 5] = [
     MODERN_PROTOCOL_VERSION,
     "2025-11-25",
@@ -142,6 +143,19 @@ const SUPPORTED_UPSTREAM_VERSIONS: [&str; 5] = [
     "2025-03-26",
     "2024-11-05",
 ];
+
+/// Revisions that may be declared in a request's `_meta`, newest first.
+///
+/// Deliberately NOT the same set as [`SUPPORTED_UPSTREAM_VERSIONS`]. The
+/// `io.modelcontextprotocol/protocolVersion` key was introduced BY 2026-07-28, so
+/// a request declaring a revision that predates the key is self-contradictory: no
+/// published legacy revision can produce it. Accepting one and then serving it in
+/// legacy shape produced a malformed answer to `server/discover` - the modern-only
+/// `ttlMs`/`cacheScope` fields present, the required `resultType`/`serverInfo`
+/// absent - in place of a clean, self-correcting `-32022` (#511 review).
+///
+/// Legacy clients are unaffected either way: they never send this key at all.
+const MODERN_UPSTREAM_VERSIONS: [&str; 1] = [MODERN_PROTOCOL_VERSION];
 
 /// The protocol version a modern client declared on this request.
 ///
@@ -599,11 +613,17 @@ fn has_stdio_client() -> bool {
 }
 
 /// Serializes tests that override [`HAS_STDIO_CLIENT`], which is process-global.
+///
+/// Only tests that take this lock are serialized. libtest runs tests on parallel
+/// threads, so a test that reaches `progress_target()` WITHOUT overriding can
+/// still observe another test's value. That is latent rather than live today
+/// (only the override-taking tests touch that path), but a new test on the
+/// progress path needs this guard even when it does not care about the value.
 #[cfg(test)]
 static STDIO_CLIENT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Sets [`HAS_STDIO_CLIENT`] for the duration of a test and restores it on drop,
-/// holding a lock so two tests cannot observe each other's override.
+/// holding the lock above for as long as the override is in effect.
 #[cfg(test)]
 struct StdioClientOverride {
     _guard: std::sync::MutexGuard<'static, ()>,
@@ -3982,7 +4002,7 @@ fn handle_request_with_cancel(
     // concurrently on the same endpoint.
     let declared = upstream_declared_version(req).map(str::to_string);
     if let Some(version) = declared.as_deref() {
-        if !SUPPORTED_UPSTREAM_VERSIONS.contains(&version) {
+        if !MODERN_UPSTREAM_VERSIONS.contains(&version) {
             return Some(unsupported_version_error(id, version));
         }
     }
@@ -7440,7 +7460,7 @@ fn process_request(
         let id = req.get("id").cloned().filter(|id| !id.is_null());
         let declared = upstream_declared_version(req).map(str::to_string);
         if let (Some(id), Some(version)) = (id, declared.as_deref()) {
-            if !SUPPORTED_UPSTREAM_VERSIONS.contains(&version) {
+            if !MODERN_UPSTREAM_VERSIONS.contains(&version) {
                 return Some(unsupported_version_error(id, version));
             }
         }
@@ -13276,29 +13296,57 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_revision_declared_in_meta_is_served_not_rejected() {
-        // `initialize` echoes whatever version the client asks for and validates
-        // nothing, so Toolport does serve 2025-11-25. Declaring that same revision
-        // in `_meta` instead used to draw `-32022` on EVERY request, so a client
-        // that had merely adopted the newer way of naming its version was locked
-        // out of a gateway that would have answered it (SOU-474 #7).
+    fn a_pre_modern_revision_in_meta_is_refused_but_told_what_to_use() {
+        // The `_meta` protocolVersion key was introduced BY 2026-07-28, so naming
+        // an older revision in it is self-contradictory - no published legacy
+        // revision can produce that request. Accepting it and serving in legacy
+        // shape made `server/discover` answer with the modern-only ttlMs and
+        // cacheScope but WITHOUT the required resultType: a malformed hybrid,
+        // where a refusal is both correct and self-correcting (#511 review).
         for version in ["2025-11-25", "2025-03-26", "2024-11-05"] {
-            let req = json!({
-                "jsonrpc": "2.0", "id": 1, "method": "tools/list",
-                "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": version } }
-            });
-            let resp = dispatch(&req);
-            assert!(
-                resp.get("error").is_none(),
-                "{version} is served via initialize, so it must not be refused in _meta: {resp}"
-            );
-            // Served in its own era's shape: legacy results carry no modern
-            // decoration, so the legacy wire format stays byte-identical.
-            assert!(
-                resp["result"].get("resultType").is_none(),
-                "{version} is a legacy revision and must not get modern decoration: {resp}"
-            );
+            for method in ["tools/list", "server/discover"] {
+                let resp = dispatch(&json!({
+                    "jsonrpc": "2.0", "id": 1, "method": method,
+                    "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": version } }
+                }));
+                assert_eq!(
+                    resp["error"]["code"], downstream::UNSUPPORTED_PROTOCOL_VERSION,
+                    "{version} predates the _meta version key, so {method} must refuse it: {resp}"
+                );
+                // The refusal has to be actionable: it names every revision the
+                // client could actually reach Toolport on, including this one via
+                // `initialize`. Refusing without saying that is a dead end.
+                let supported = resp["error"]["data"]["supported"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("the error must name what IS served: {resp}"));
+                assert!(
+                    supported.iter().any(|v| v == version),
+                    "{version} IS served via initialize, so the refusal must say so: {resp}"
+                );
+                assert!(
+                    supported.iter().any(|v| v == MODERN_PROTOCOL_VERSION),
+                    "the refusal must name the revision this key belongs to: {resp}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn a_modern_declaration_is_still_served_and_decorated() {
+        // The other side of the refusal above: the one revision the `_meta` key
+        // belongs to is served, and served as modern.
+        let resp = dispatch(&modern_req(1, "tools/list", json!({})));
+        assert!(resp.get("error").is_none(), "2026-07-28 must be served: {resp}");
+        assert_eq!(resp["result"]["resultType"], "complete");
+        // And a legacy client, which sends no `_meta` at all, is untouched.
+        let legacy = dispatch(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}
+        }));
+        assert!(legacy.get("error").is_none(), "a legacy client is unaffected: {legacy}");
+        assert!(
+            legacy["result"].get("resultType").is_none(),
+            "legacy results carry no modern decoration: {legacy}"
+        );
     }
 
     #[test]
@@ -13323,21 +13371,31 @@ mod tests {
             .clone();
 
         for version in PUBLISHED_MCP_REVISIONS {
-            // Ground truth: `initialize` echoes the version back, which is what
-            // "Toolport serves this revision" means for a legacy client.
-            let init = dispatch(&json!({
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": { "protocolVersion": version }
-            }));
-            assert_eq!(
-                init["result"]["protocolVersion"], version,
-                "initialize should serve {version}"
-            );
             assert!(
                 advertised.as_array().is_some_and(|a| a.iter().any(|v| v == version)),
                 "initialize serves {version} but server/discover does not advertise it: {advertised}"
             );
         }
+
+        // Deliberately NOT asserted per-revision above: `initialize` echoes any
+        // string, so "it echoed what I sent" is a tautology that holds for
+        // "garbage" too and proves nothing about which revisions are real. What
+        // the echo does establish is the shape of the claim - that no published
+        // revision is turned away - so assert it once, against a value that is
+        // NOT a published revision, to show the echo really is unconditional and
+        // this list is therefore a deliberate choice rather than a filter.
+        let nonsense = dispatch(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "protocolVersion": "1999-01-01" }
+        }));
+        assert_eq!(
+            nonsense["result"]["protocolVersion"], "1999-01-01",
+            "initialize validates nothing, so the advertised list is curated, not derived"
+        );
+        assert!(
+            !advertised.as_array().is_some_and(|a| a.iter().any(|v| v == "1999-01-01")),
+            "...and the curated list must not advertise something that isn't a real revision"
+        );
     }
 
     #[test]
@@ -13494,7 +13552,9 @@ mod tests {
         // A modern HTTP client: no session, no stdio. Nothing can carry progress,
         // so the server must not be asked to produce it.
         let _no_stdio = StdioClientOverride::set(false);
-        ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = None);
+        // Thread-local, and libtest may reuse this thread for another test, so
+        // assert the default rather than assuming it and leaving it changed.
+        ACTIVE_MCP_SESSION.with(|cell| assert!(cell.borrow().is_none(), "no session on this thread"));
         assert_eq!(progress_target(), None, "no session and no stdio: nowhere to deliver");
 
         let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
@@ -13516,7 +13576,9 @@ mod tests {
         // The other side of the same decision: a stdio client IS a delivery
         // channel, so the token is registered and rewritten rather than dropped.
         let _stdio = StdioClientOverride::set(true);
-        ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = None);
+        // Thread-local, and libtest may reuse this thread for another test, so
+        // assert the default rather than assuming it and leaving it changed.
+        ACTIVE_MCP_SESSION.with(|cell| assert!(cell.borrow().is_none(), "no session on this thread"));
         assert_eq!(
             progress_target().as_deref(),
             Some(RESOURCE_SUB_STDIO),
