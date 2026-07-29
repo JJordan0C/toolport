@@ -2699,19 +2699,51 @@ impl DownstreamServer {
                 // has no such method. Confirm with `server/discover`, which every
                 // modern server MUST implement, rather than guessing from an
                 // error code the spec leaves implementation-defined.
-                let discovered = transport
-                    .request(
-                        "server/discover",
-                        json!({ "_meta": protocol_meta_for(MODERN_PROTOCOL_VERSION) }),
-                    )
-                    // The era conclusion is "legacy server that rejected our
-                    // handshake", so the initialize error is the actionable one.
-                    // Carry the probe's failure too: if discover timed out rather
-                    // than being refused, reporting only the initialize error
-                    // hides that the connect also paid a full read timeout.
-                    .map_err(|probe_err| {
-                        format!("{init_err} (server/discover probe also failed: {probe_err})")
-                    })?;
+                let probe = transport.request(
+                    "server/discover",
+                    json!({ "_meta": protocol_meta_for(MODERN_PROTOCOL_VERSION) }),
+                );
+                let discovered = match probe {
+                    Ok(discovered) => discovered,
+                    // This is the pivot of the compatibility ladder. A RECOGNIZED
+                    // modern error means the server is modern and simply does not
+                    // speak the version we declared, so the honest outcome is a
+                    // version mismatch, not "legacy server". Reporting the
+                    // `initialize` refusal here would send someone chasing a
+                    // handshake bug on a perfectly reachable modern server.
+                    Err(probe_err) if probe_err.is_modern_protocol_error() => {
+                        let offered = probe_err.supported_versions();
+                        // Retry on a mutually supported version if there is one.
+                        // Today Toolport speaks exactly one modern revision, so
+                        // this is usually a clean incompatibility, but the ladder
+                        // is written to negotiate rather than to assume.
+                        match offered.iter().find(|v| v.as_str() == MODERN_PROTOCOL_VERSION) {
+                            Some(version) => transport
+                                .request(
+                                    "server/discover",
+                                    json!({ "_meta": protocol_meta_for(version) }),
+                                )
+                                .map_err(|e| e.to_string())?,
+                            None => {
+                                return Err(format!(
+                                    "server speaks MCP {offered:?}; Toolport speaks \
+                                     {MODERN_PROTOCOL_VERSION} and cannot negotiate a \
+                                     common version ({probe_err})"
+                                ))
+                            }
+                        }
+                    }
+                    // Anything else (an unrecognized error, or silence) identifies
+                    // a legacy server, so the `initialize` refusal is the
+                    // actionable error. Carry the probe failure too: if discover
+                    // timed out rather than being refused, reporting only the
+                    // initialize error hides that connect paid a read timeout.
+                    Err(probe_err) => {
+                        return Err(format!(
+                            "{init_err} (server/discover probe also failed: {probe_err})"
+                        ))
+                    }
+                };
                 let version = choose_protocol_version(&discovered).ok_or_else(|| {
                     format!(
                         "server supports no protocol version Toolport speaks (offered {:?})",
@@ -4372,6 +4404,50 @@ mod tests {
         );
         assert_eq!(resource_updated_uri(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#), None);
         assert_eq!(resource_updated_uri("not json"), None);
+    }
+
+    #[test]
+    fn forward_line_invokes_progress_sink_when_armed() {
+        // Mirrors the resource-updated sink test. Every other `forward_line` test
+        // passes an empty progress sink, so without this nothing pins that
+        // `notifications/progress` actually reaches a bound sink, and a
+        // regression that silently stopped routing progress would stay green.
+        use super::{forward_line, ProgressSink};
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sink: ProgressSink = Arc::new(move |note| {
+            sink_seen.lock().unwrap().push(note);
+        });
+        let dirty = Some(Arc::new(AtomicU8::new(0)));
+        let armed = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let no_sink = None;
+        let progress = Arc::new(Mutex::new(Some(sink)));
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"tp-1","progress":1,"total":2}}"#;
+
+        // Unarmed (still in the handshake window): forwarded, but not routed.
+        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &no_sink, &progress));
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(rx.recv().unwrap(), line);
+
+        // Armed: the sink receives the whole notification, token included.
+        armed.store(true, Ordering::SeqCst);
+        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &no_sink, &progress));
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["params"]["progressToken"], "tp-1");
+        // Not a list change, so no dirty bit.
+        assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), 0);
+        assert_eq!(rx.recv().unwrap(), line);
+
+        // A progress notification with no token is unroutable and never reaches
+        // the sink, so the gateway is not woken for something it must drop.
+        let untokened = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}"#;
+        assert!(forward_line(untokened.to_string(), &tx, &dirty, &armed, &no_sink, &progress));
+        assert_eq!(seen.lock().unwrap().len(), 1, "still just the one");
     }
 
     #[test]
