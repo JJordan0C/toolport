@@ -204,17 +204,20 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
         })
         .unwrap_or(0);
     // If the preserved envelope alone meets the budget, no head size makes the
-    // shaped result fit and the 256-byte floor below would emit an oversized
-    // result anyway. Leave it unshaped, as with the other cases where shaping
-    // cannot honour its contract. Deliberately gated on the envelope only: the
-    // marker reserve is allowed to exceed a very small budget exactly as it did
-    // before, so tiny-budget shaping keeps working.
+    // shaped result fit. Leave it unshaped, as with the other cases where shaping
+    // cannot honour its contract.
     if preserved_bytes >= budget {
         return false;
     }
     // Reserve room for the marker, then show as much of the body head as fits the
     // BYTE budget (not a char count, or multi-byte text would blow past it).
-    let head_byte_limit = budget.saturating_sub(512 + preserved_bytes).max(256);
+    //
+    // No lower floor here. A `.max(256)` floor is what let a large envelope push
+    // a "shaped" result back over the budget while still returning `true`: the
+    // floor won whenever `budget - reserve - preserved` fell below it. The final
+    // fit-check below is what actually enforces the contract; this is only the
+    // starting estimate.
+    let mut head_byte_limit = budget.saturating_sub(512 + preserved_bytes);
     let head = head_within_bytes(&body, head_byte_limit).to_string();
     let head_chars = head.chars().count();
     let is_error = result
@@ -225,6 +228,67 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
     let cursor = next_cursor();
     let new_entry_size = body.len() + structured.as_ref().map(value_size).unwrap_or(0);
 
+    // Build the shaped result for a given head, then measure it. The marker's own
+    // length varies with the head length it reports, and the preserved envelope is
+    // whatever the server sent, so the only reliable way to honour the budget is
+    // to measure the finished value rather than predict it.
+    let build = |head: &str| -> Value {
+        let head_chars = head.chars().count();
+        let marker = format!(
+            "\n\n[Toolport shaped this result: it was ~{} KB, larger than the {} KB context \
+             budget. Showing the first {} of {} characters. The rest is held temporarily, call \
+             toolport_fetch_result with {{\"cursor\":\"{}\",\"offset\":{}}} to read it. If that \
+             later reports the cursor expired, just re-run this tool call for a fresh result.]",
+            size / 1024,
+            budget / 1024,
+            head_chars,
+            total,
+            cursor,
+            head_chars
+        );
+        // Shaping deliberately rewrites `content` and stashes `structuredContent`
+        // in the cache (both retrievable via the cursor). Every other top-level
+        // field belongs to the downstream server, not to us: `_meta`, and whatever
+        // a future revision or extension adds. Carry them across so shaping stays a
+        // truncation of the body rather than a rewrite of the envelope (SOU-444).
+        let mut shaped = text_result(format!("{head}{marker}"), is_error);
+        if let (Some(src), Some(dst)) = (result.as_object(), shaped.as_object_mut()) {
+            for (key, value) in src {
+                if matches!(key.as_str(), "content" | "structuredContent" | "isError") {
+                    continue;
+                }
+                dst.insert(key.clone(), value.clone());
+            }
+        }
+        shaped
+    };
+
+    let mut head = head;
+    let mut shaped = build(&head);
+    // Shrink until it fits. Each pass subtracts the exact overage, so this
+    // converges immediately in practice; the bound is a guard, not a search.
+    for _ in 0..4 {
+        let shaped_size = serde_json::to_string(&shaped).map(|s| s.len()).unwrap_or(0);
+        if shaped_size <= budget || head.is_empty() {
+            break;
+        }
+        let overage = shaped_size - budget;
+        head_byte_limit = head_byte_limit.saturating_sub(overage.max(1));
+        head = head_within_bytes(&body, head_byte_limit).to_string();
+        shaped = build(&head);
+    }
+
+    // An empty head that still overflows means the marker and envelope alone
+    // exceed the budget, so no truncation can honour the contract. Returning
+    // `true` there would be the same false claim the head floor used to make.
+    // Bail BEFORE caching, so a result we decline to shape leaves no orphaned
+    // cursor entry behind.
+    if serde_json::to_string(&shaped).map(|s| s.len()).unwrap_or(0) > budget {
+        return false;
+    }
+
+    // Only now stash the full body: the cursor in the marker above is live from
+    // here on.
     {
         let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
         sweep(&mut map);
@@ -254,32 +318,7 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
             },
         );
     }
-    let marker = format!(
-        "\n\n[Toolport shaped this result: it was ~{} KB, larger than the {} KB context \
-         budget. Showing the first {} of {} characters. The rest is held temporarily, call \
-         toolport_fetch_result with {{\"cursor\":\"{}\",\"offset\":{}}} to read it. If that \
-         later reports the cursor expired, just re-run this tool call for a fresh result.]",
-        size / 1024,
-        budget / 1024,
-        head_chars,
-        total,
-        cursor,
-        head_chars
-    );
-    // Shaping deliberately rewrites `content` and stashes `structuredContent` in
-    // the cache (both retrievable via the cursor). Every other top-level field
-    // belongs to the downstream server, not to us: `_meta`, and whatever a future
-    // revision or extension adds. Carry them across so shaping stays a truncation
-    // of the body rather than a rewrite of the envelope (SOU-444).
-    let mut shaped = text_result(format!("{head}{marker}"), is_error);
-    if let (Some(src), Some(dst)) = (result.as_object(), shaped.as_object_mut()) {
-        for (key, value) in src {
-            if matches!(key.as_str(), "content" | "structuredContent" | "isError") {
-                continue;
-            }
-            dst.insert(key.clone(), value.clone());
-        }
-    }
+
     *result = shaped;
     true
 }
@@ -574,6 +613,65 @@ mod tests {
         });
         sanitize_forwarded_meta(&mut params);
         assert!(params.get("_meta").is_none());
+    }
+
+    #[test]
+    fn shaped_results_fit_the_budget_across_envelope_sizes() {
+        // A SWEEP, not a single point. The previous version of this test hardcoded
+        // a 2 000-byte envelope, which sat inside the safe zone, while 3 600 B
+        // returned `true` at 4 269 bytes against a 4 096 budget. Any single-point
+        // test can land in a window like that; stepping across the range cannot.
+        // Size of the marker plus JSON skeleton, measured rather than guessed.
+        // Declining is legitimate only once the envelope plus this cannot fit.
+        //
+        // This bound is deliberately TIGHT. A generous one (600) let the test pass
+        // against a head-size floor that gave up at a 3 600-byte envelope and
+        // passed the whole 53 686-byte body through, where shrinking to fit
+        // produces 4 009. Picking the threshold by measuring both implementations
+        // is the only reason this catches it.
+        const MARKER_RESERVE: usize = 450;
+
+        let budget = 4096;
+        for meta_len in [0, 500, 1_000, 2_000, 3_000, 3_400, 3_600, 3_800, 4_000, 4_100] {
+            let mut r = json!({
+                "content": [{ "type": "text", "text": "x".repeat(50_000) }],
+                "isError": false,
+                "_meta": { "com.example/ctx": "m".repeat(meta_len) }
+            });
+            let shaped = shape_result(&mut r, budget, None);
+            let size = serde_json::to_string(&r).map(|s| s.len()).unwrap_or(0);
+
+            if shaped {
+                assert!(
+                    size <= budget,
+                    "`true` must mean it fits: {meta_len}B envelope produced {size} \
+                     bytes against a {budget} budget"
+                );
+                // The envelope has to survive, otherwise "fits" was bought by
+                // silently dropping the server's data.
+                assert_eq!(
+                    r["_meta"]["com.example/ctx"].as_str().map(str::len),
+                    Some(meta_len),
+                    "{meta_len}B envelope was dropped rather than preserved"
+                );
+            } else {
+                // Declining is allowed ONLY when the envelope plus the marker
+                // genuinely cannot fit. Otherwise declining is itself a
+                // regression: the full 50 KB body reaches the model instead of a
+                // shaped head. This is what catches a head-size floor that gives
+                // up early rather than shrinking to fit.
+                assert!(
+                    meta_len + MARKER_RESERVE >= budget,
+                    "{meta_len}B envelope leaves room for a head, so it should have \
+                     been shaped rather than passed through whole"
+                );
+                // ...and an unshaped result must be left completely untouched.
+                assert!(
+                    r["content"][0]["text"].as_str().map(str::len) == Some(50_000),
+                    "an unshaped result must be left alone, {meta_len}B case"
+                );
+            }
+        }
     }
 
     #[test]
