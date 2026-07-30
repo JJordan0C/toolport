@@ -1592,7 +1592,7 @@ fn parse_json_snippet(
         return Ok(vec![json_server_with_values(&name, &value)]);
     }
 
-    Err("JSON parsed but no server definition found (expected mcpServers, servers, context_servers, or a bare server object)".to_string())
+    Err("JSON parsed but no server definition found (expected mcp, mcpServers, servers, context_servers, or a bare server object)".to_string())
 }
 
 /// Parse a TOML snippet with `[mcp_servers.<name>]` tables.

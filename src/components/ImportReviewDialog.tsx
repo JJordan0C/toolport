@@ -225,7 +225,9 @@ function isPrivateIpv4(host: string): boolean {
   return (
     a === 127 || // loopback
     a === 10 || // RFC1918
-    a === 0 || // "this" network / unspecified
+    // 0.0.0.0/8 "this network". Deliberately broader than Rust's is_unspecified(),
+    // which is only 0.0.0.0. Warning on the whole block is the safe direction here.
+    a === 0 ||
     (a === 192 && b === 168) ||
     (a === 172 && b >= 16 && b <= 31) ||
     (a === 169 && b === 254) || // link-local
