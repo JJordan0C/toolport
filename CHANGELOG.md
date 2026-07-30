@@ -8,11 +8,26 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Added
 
-- **Kilo Code** is detected and configured, bringing the client count to 28. It
-  uses the same top-level `mcp` shape as OpenCode, so it reuses that adapter
-  rather than adding a parallel one, and `kilo.jsonc` is treated as whole-app
-  state: an unparseable file errors instead of being replaced, since it holds
-  much more than MCP servers. (#553)
+- **Kilo Code** and **Amp** are detected and configured, taking the client count
+  to 29. Kilo Code uses the same top-level `mcp` shape as OpenCode, so it reuses
+  that adapter rather than adding a parallel one. Amp keeps its servers under the
+  literal dotted key `amp.mcpServers` and honours `AMP_SETTINGS_FILE`. Both files
+  hold far more than MCP servers, so both are treated as whole-app state: an
+  unparseable one errors rather than being replaced with a fresh object.
+  (#553, #538)
+
+### Fixed
+
+- **Removing a server no longer leaves its settings behind.** Tool overrides,
+  pins, the per-server result budget, the injection-block exemption and any
+  fingerprint-bound approvals are now dropped along with the server. Previously a
+  server added later under the same id could inherit a stale security exemption
+  from one you had deleted. (#509)
+- **A share link survives a failed copy.** Creating a link and then failing to
+  copy it reported the whole operation as failed, and where the Clipboard API is
+  unavailable the failure was thrown synchronously, so a link that had been
+  created fine was surfaced as `Couldn't create a link`. The link now stays
+  visible and only the copy is reported as failed. (#560)
 
 ## [1.10.0] - 2026-07-29
 
