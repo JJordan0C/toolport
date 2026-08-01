@@ -1106,8 +1106,15 @@ fn wait_for_code(
                     return Err(format!("authorization server returned an error ({error}){desc}"));
                 }
 
+                let Some(code) = code.filter(|code| !code.trim().is_empty()) else {
+                    write_callback_page(&mut stream, "Authorization failed. You can close this window and return to Toolport.");
+                    return Err(
+                        "authorization server returned an empty authorization code".to_string(),
+                    );
+                };
+
                 write_callback_page(&mut stream, "Authorization complete. You can close this window and return to Toolport.");
-                return Ok(code.cloned().unwrap_or_default());
+                return Ok(code.clone());
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(150));
@@ -1504,6 +1511,28 @@ mod tests {
                 "must compare the issuer exactly: {different}"
             );
         }
+    }
+
+    #[test]
+    fn callback_rejects_an_empty_authorization_code() {
+        use std::io::Write;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream
+                .write_all(
+                    b"GET /callback?code=&state=expected HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let error = wait_for_code(&listener, "expected", "https://auth.example.com", false)
+            .expect_err("an empty authorization code must not reach token exchange");
+        client.join().unwrap();
+        assert!(error.contains("empty authorization code"));
     }
 
     #[test]

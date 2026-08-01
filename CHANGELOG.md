@@ -22,6 +22,11 @@ Entries before the rename below shipped under the project's former name, Conduit
   and gives a challenge's requested scope priority without weakening discovery for
   older servers that do not return a challenge. (SOU-451)
 
+### Fixed
+
+- OAuth loopback callbacks now reject an empty authorization code instead of showing
+  a success page and sending an invalid token-exchange request.
+
 ## [1.11.0] - 2026-08-01
 
 Toolport's Streamable HTTP endpoint now speaks the modern MCP transport while
