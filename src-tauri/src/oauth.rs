@@ -1,7 +1,8 @@
 //! OAuth 2.1 for remote MCP servers: RFC 8414 metadata discovery, RFC 7591
-//! dynamic client registration, RFC 7636 PKCE, and an authorization-code flow
-//! with a loopback redirect. The result is a bearer access token that rides the
-//! same keychain injection path as a manually-pasted token.
+//! dynamic client registration, RFC 7636 PKCE, RFC 9207 issuer validation, and
+//! an authorization-code flow with a loopback redirect. The result is a bearer
+//! access token that rides the same keychain injection path as a manually-pasted
+//! token.
 //!
 //! The browser leg is interactive and can't be unit-tested; the deterministic
 //! pieces (PKCE, URL building, origin parsing) are.
@@ -33,14 +34,18 @@ pub struct AuthResult {
     pub expires_at: Option<u64>,
     pub token_endpoint: String,
     pub client_id: String,
+    /// Validated authorization-server issuer that minted the client credentials.
+    pub issuer: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct Endpoints {
+    pub issuer: String,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub registration_endpoint: Option<String>,
     pub scope: Option<String>,
+    pub authorization_response_iss_parameter_supported: bool,
 }
 
 fn base64url(data: &[u8]) -> String {
@@ -103,10 +108,13 @@ struct ProtectedResource {
 
 #[derive(Deserialize)]
 struct AsMeta {
+    issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
     registration_endpoint: Option<String>,
     scopes_supported: Option<Vec<String>>,
+    #[serde(default)]
+    authorization_response_iss_parameter_supported: bool,
 }
 
 /// A ureq agent with a connect + read timeout for all OAuth HTTP. These endpoints
@@ -215,6 +223,18 @@ fn metadata_candidates(issuer: &str) -> Vec<String> {
             format!("{origin}{path}/.well-known/oauth-authorization-server"),
             format!("{origin}{path}/.well-known/openid-configuration"),
         ]
+    }
+}
+
+/// RFC 8414 and OIDC Discovery bind a metadata document to the issuer used to
+/// locate it. Keep this as an exact string comparison: normalizing case, ports,
+/// slashes, or percent encoding would weaken the value later recorded for RFC
+/// 9207 authorization-response validation.
+fn validate_metadata_issuer(expected: &str, actual: &str) -> Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err("authorization-server metadata issuer mismatch; refusing OAuth discovery".to_string())
     }
 }
 
@@ -415,6 +435,10 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
 
     for url in metadata_candidates(&issuer) {
         if let Ok(meta) = get_json::<AsMeta>(&url, block_private) {
+            if let Err(e) = validate_metadata_issuer(&issuer, &meta.issuer) {
+                debug_log(&format!("metadata rejected at {url}: {e}"));
+                continue;
+            }
             // OAuth 2.1 requires TLS for these endpoints. Without this check a
             // hostile/MITM'd metadata document could point the token endpoint at
             // an attacker (or an internal address), and we'd POST the auth code +
@@ -431,10 +455,13 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
                 guard_endpoint(reg, server_local, "registration endpoint")?;
             }
             return Ok(Endpoints {
+                issuer: meta.issuer,
                 authorization_endpoint: meta.authorization_endpoint,
                 token_endpoint: meta.token_endpoint,
                 registration_endpoint: meta.registration_endpoint,
                 scope: meta.scopes_supported.map(|s| s.join(" ")),
+                authorization_response_iss_parameter_supported: meta
+                    .authorization_response_iss_parameter_supported,
             });
         }
     }
@@ -455,13 +482,7 @@ fn register_client(
     redirect_uri: &str,
     block_private: bool,
 ) -> Result<String, String> {
-    let body = serde_json::json!({
-        "client_name": "Toolport",
-        "redirect_uris": [redirect_uri],
-        "grant_types": ["authorization_code", "refresh_token"],
-        "response_types": ["code"],
-        "token_endpoint_auth_method": "none"
-    });
+    let body = dcr_request_body(redirect_uri);
     let resp: DcrResponse = agent_no_redirect(block_private)
         .post(registration_endpoint)
         .send_json(body)
@@ -469,6 +490,19 @@ fn register_client(
         .into_json()
         .map_err(|e| e.to_string())?;
     Ok(resp.client_id)
+}
+
+fn dcr_request_body(redirect_uri: &str) -> serde_json::Value {
+    serde_json::json!({
+        "client_name": "Toolport",
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        // Toolport uses an RFC 8252 loopback redirect with an OS-assigned port,
+        // so it is a native public client rather than an OIDC web client.
+        "application_type": "native"
+    })
 }
 
 pub fn build_authorize_url(
@@ -613,7 +647,31 @@ fn open_browser(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
-fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String, String> {
+fn validate_authorization_response_issuer(
+    response_issuer: Option<&str>,
+    expected_issuer: &str,
+    issuer_parameter_required: bool,
+) -> Result<(), String> {
+    match response_issuer {
+        Some(actual) if actual == expected_issuer => Ok(()),
+        Some(_) => Err(
+            "authorization response issuer mismatch (possible mix-up attack); try connecting again"
+                .to_string(),
+        ),
+        None if issuer_parameter_required => Err(
+            "authorization server omitted the issuer it advertised; try connecting again"
+                .to_string(),
+        ),
+        None => Ok(()),
+    }
+}
+
+fn wait_for_code(
+    listener: &TcpListener,
+    expected_state: &str,
+    expected_issuer: &str,
+    issuer_parameter_required: bool,
+) -> Result<String, String> {
     let deadline = Instant::now() + Duration::from_secs(180);
 
     loop {
@@ -643,11 +701,12 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String,
                 let code = params.get("code");
                 let error = params.get("error");
                 debug_log(&format!(
-                    "callback request: {} bytes of query, has_code={} has_error={} has_state={}",
+                    "callback request: {} bytes of query, has_code={} has_error={} has_state={} has_iss={}",
                     query.len(),
                     code.is_some(),
                     error.is_some(),
-                    params.contains_key("state")
+                    params.contains_key("state"),
+                    params.contains_key("iss")
                 ));
 
                 // Ignore connections that carry neither an authorization result nor
@@ -660,6 +719,22 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String,
                     continue;
                 }
 
+                // Validate state and issuer before accepting a code OR acting on an
+                // error. RFC 9207 explicitly forbids displaying attacker-supplied
+                // error details when the response issuer does not match.
+                if params.get("state").map(String::as_str) != Some(expected_state) {
+                    write_callback_page(&mut stream, "Authorization could not be verified. You can close this window.");
+                    return Err("state mismatch (possible CSRF); try connecting again".to_string());
+                }
+                if let Err(e) = validate_authorization_response_issuer(
+                    params.get("iss").map(String::as_str),
+                    expected_issuer,
+                    issuer_parameter_required,
+                ) {
+                    write_callback_page(&mut stream, "Authorization could not be verified. You can close this window.");
+                    return Err(e);
+                }
+
                 if let Some(error) = error {
                     let desc = params
                         .get("error_description")
@@ -669,11 +744,6 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String,
                     return Err(format!("authorization server returned an error ({error}){desc}"));
                 }
 
-                // We have a code. Validate state before accepting it.
-                if params.get("state").map(String::as_str) != Some(expected_state) {
-                    write_callback_page(&mut stream, "Authorization could not be verified. You can close this window.");
-                    return Err("state mismatch (possible CSRF); try connecting again".to_string());
-                }
                 write_callback_page(&mut stream, "Authorization complete. You can close this window and return to Toolport.");
                 return Ok(code.cloned().unwrap_or_default());
             }
@@ -804,7 +874,12 @@ pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
         endpoints.authorization_endpoint
     ));
     open_browser(&auth_url);
-    let code = wait_for_code(&listener, &state)?;
+    let code = wait_for_code(
+        &listener,
+        &state,
+        &endpoints.issuer,
+        endpoints.authorization_response_iss_parameter_supported,
+    )?;
     debug_log(&format!("got code (len {})", code.len()));
     let tokens = match exchange_code(
         &endpoints.token_endpoint,
@@ -831,6 +906,7 @@ pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
         expires_at: tokens.expires_at,
         token_endpoint: endpoints.token_endpoint,
         client_id,
+        issuer: endpoints.issuer,
     })
 }
 
@@ -1025,6 +1101,61 @@ mod tests {
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A41789%2Fcallback"));
         assert!(url.contains("scope=mcp"));
+    }
+
+    #[test]
+    fn dcr_identifies_the_loopback_client_as_native() {
+        let body = dcr_request_body("http://127.0.0.1:41789/callback");
+        assert_eq!(body["application_type"], "native");
+        assert_eq!(body["token_endpoint_auth_method"], "none");
+        assert_eq!(
+            body["redirect_uris"],
+            serde_json::json!(["http://127.0.0.1:41789/callback"])
+        );
+    }
+
+    #[test]
+    fn authorization_response_issuer_follows_rfc9207_table() {
+        let expected = "https://auth.example.com";
+        assert!(validate_authorization_response_issuer(Some(expected), expected, true).is_ok());
+        assert!(validate_authorization_response_issuer(Some(expected), expected, false).is_ok());
+        assert!(validate_authorization_response_issuer(None, expected, false).is_ok());
+        assert!(validate_authorization_response_issuer(None, expected, true).is_err());
+        assert!(validate_authorization_response_issuer(
+            Some("https://evil.example.com"),
+            expected,
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn authorization_response_issuer_comparison_is_not_normalized() {
+        let expected = "https://auth.example.com";
+        for different in [
+            "https://AUTH.example.com",
+            "https://auth.example.com/",
+            "https://auth.example.com:443",
+        ] {
+            assert!(
+                validate_authorization_response_issuer(Some(different), expected, false).is_err(),
+                "must compare the issuer exactly: {different}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_issuer_must_match_the_selected_authorization_server() {
+        assert!(validate_metadata_issuer(
+            "https://auth.example.com",
+            "https://auth.example.com"
+        )
+        .is_ok());
+        assert!(validate_metadata_issuer(
+            "https://auth.example.com",
+            "https://other.example.com"
+        )
+        .is_err());
     }
 
     #[test]

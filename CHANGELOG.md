@@ -6,6 +6,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Security
+
+- OAuth authorization responses are now bound to the validated authorization-server
+  issuer before Toolport exchanges a code or displays an authorization error. Stored
+  refresh credentials refuse to cross to a changed issuer, and loopback Dynamic Client
+  Registration identifies Toolport as a native client as required by the current MCP
+  authorization profile. Older vaulted OAuth state remains readable. (SOU-451)
+
 ## [1.11.0] - 2026-08-01
 
 Toolport's Streamable HTTP endpoint now speaks the modern MCP transport while
