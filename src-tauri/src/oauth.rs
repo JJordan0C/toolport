@@ -1760,7 +1760,10 @@ mod tests {
         let address = server.server_addr().to_ip().unwrap();
         let url = format!("http://{address}/mcp");
         let handle = std::thread::spawn(move || {
-            let request = server.recv().expect("challenge probe");
+            let request = server
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .expect("challenge probe");
             request
                 .respond(
                     tiny_http::Response::from_string("method not allowed")
@@ -1784,7 +1787,10 @@ mod tests {
         let expected_origin = origin.clone();
         let handle = std::thread::spawn(move || {
             for _ in 0..3 {
-                let request = server.recv().expect("OAuth discovery request");
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect("OAuth discovery request");
                 let response = match request.url() {
                     "/mcp" => {
                         let challenge = format!(
@@ -1850,7 +1856,10 @@ mod tests {
         let expected_origin = origin.clone();
         let handle = std::thread::spawn(move || {
             for _ in 0..4 {
-                let request = server.recv().expect("OAuth discovery request");
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect("OAuth discovery request");
                 let response = match request.url() {
                     "/mcp" => {
                         let challenge = format!(
@@ -1918,7 +1927,10 @@ mod tests {
         let resource_metadata = format!("{origin}/malformed-resource");
         let handle = std::thread::spawn(move || {
             for _ in 0..2 {
-                let request = server.recv().expect("OAuth discovery request");
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect("OAuth discovery request");
                 let response = match request.url() {
                     "/mcp" => {
                         let challenge =
