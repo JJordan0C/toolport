@@ -16,13 +16,79 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde_json::{json, Value};
 
 use crate::downstream::{
-    backoff_delay, extension_is_transparent, CacheHint, CancelContext, DownstreamServer, MrtrRequest,
-    TransportError, HTTP_MAX_RETRIES, HTTP_RETRY_CAP,
+    backoff_delay, CacheHint, CancelContext, DownstreamServer, MrtrRequest, TransportError,
+    HTTP_MAX_RETRIES, HTTP_RETRY_CAP,
 };
 use crate::registry::ToolOverride;
+
+const TASK_HANDLE_PREFIX: &str = "toolport-task:v1:";
+const TASK_HANDLE_NONCE_LEN: usize = 24;
+
+/// Seal the owner and native task id into one opaque, unguessable handle. The
+/// installation-local key survives restarts; authenticated encryption prevents
+/// a client from changing either component to reach another task (SOU-453).
+fn expose_task_id(server_id: &str, task_id: &str) -> Result<String, String> {
+    let key = crate::secrets::task_handle_key()?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&key).map_err(|e| e.to_string())?;
+    let plain = serde_json::to_vec(&(server_id, task_id)).map_err(|e| e.to_string())?;
+    let mut nonce = [0u8; TASK_HANDLE_NONCE_LEN];
+    getrandom::getrandom(&mut nonce).map_err(|e| e.to_string())?;
+    let ciphertext = cipher
+        .encrypt(XNonce::from_slice(&nonce), plain.as_ref())
+        .map_err(|_| "could not seal Toolport task id".to_string())?;
+    let mut blob = nonce.to_vec();
+    blob.extend_from_slice(&ciphertext);
+    Ok(format!(
+        "{TASK_HANDLE_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(blob)
+    ))
+}
+
+fn decode_task_id(exposed: &str) -> Result<(String, String), String> {
+    let encoded = exposed
+        .strip_prefix(TASK_HANDLE_PREFIX)
+        .ok_or_else(|| "task id was not issued by Toolport".to_string())?;
+    let blob = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| "malformed Toolport task id".to_string())?;
+    if blob.len() <= TASK_HANDLE_NONCE_LEN {
+        return Err("malformed Toolport task id".to_string());
+    }
+    let (nonce, ciphertext) = blob.split_at(TASK_HANDLE_NONCE_LEN);
+    let key = crate::secrets::task_handle_key()?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&key).map_err(|e| e.to_string())?;
+    let plain = cipher
+        .decrypt(XNonce::from_slice(nonce), ciphertext)
+        .map_err(|_| "task id was not issued by Toolport".to_string())?;
+    let (server, task): (String, String) = serde_json::from_slice(&plain)
+        .map_err(|_| "malformed Toolport task id".to_string())?;
+    if server.is_empty() || task.is_empty() {
+        return Err("malformed Toolport task id".to_string());
+    }
+    Ok((server, task))
+}
+
+fn expose_task_result(mut result: Value, server_id: &str) -> Result<Value, String> {
+    let task_id = result
+        .get("taskId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "downstream task result is missing taskId".to_string())?;
+    result["taskId"] = json!(expose_task_id(server_id, task_id)?);
+    Ok(result)
+}
+
+fn client_supports_tasks(meta: Option<&Value>) -> bool {
+    meta.and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"))
+        .and_then(|capabilities| capabilities.get("extensions"))
+        .and_then(|extensions| extensions.get("io.modelcontextprotocol/tasks"))
+        .is_some()
+}
 
 /// The delay before a retry attempt. Prefers a server-advertised `Retry-After`,
 /// else our exponential backoff, but never longer than `HTTP_RETRY_CAP` so a
@@ -774,9 +840,6 @@ impl Router {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (identifier, settings) in server.extensions() {
-                if !extension_is_transparent(identifier) {
-                    continue;
-                }
                 match values.entry(identifier.clone()) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         entry.insert(Some(settings.clone()));
@@ -1131,15 +1194,87 @@ impl Router {
             .get(exposed_name)
             .ok_or_else(|| format!("no route for tool '{exposed_name}'"))?;
         let slot = self.slot_for(server_id)?;
-        self.call_with_retry(&slot, |server| {
-            server.call_with_cancel_and_mrtr(
-                tool,
-                arguments.clone(),
-                cancel.clone(),
-                meta,
-                mrtr,
-            )
-        })
+        let (result, downstream_supports_tasks) = self.call_with_retry(&slot, |server| {
+            let supports_tasks = server
+                .extensions()
+                .contains_key("io.modelcontextprotocol/tasks");
+            server
+                .call_with_cancel_and_mrtr(
+                    tool,
+                    arguments.clone(),
+                    cancel.clone(),
+                    meta,
+                    mrtr,
+                )
+                .map(|result| (result, supports_tasks))
+        })?;
+        if result.get("resultType").and_then(Value::as_str) == Some("task") {
+            if !client_supports_tasks(meta) {
+                return Err(
+                    "downstream returned a task without the required client capability"
+                        .to_string(),
+                );
+            }
+            if !downstream_supports_tasks {
+                return Err(
+                    "downstream returned a task without advertising the Tasks extension"
+                        .to_string(),
+                );
+            }
+            expose_task_result(result, server_id)
+        } else {
+            Ok(result)
+        }
+    }
+
+    /// Owning server encoded into a Toolport task handle. Used for the HTTP
+    /// client's allowed-server check before any downstream request is sent.
+    pub fn task_server(&self, task_id: &str) -> Option<String> {
+        decode_task_id(task_id).ok().map(|(server, _)| server)
+    }
+
+    /// Route one Tasks extension operation to the server that minted the handle,
+    /// translating the opaque client-facing id in both directions.
+    pub fn route_task(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+    ) -> Result<Value, String> {
+        if !matches!(method, "tasks/get" | "tasks/update" | "tasks/cancel") {
+            return Err(format!("unsupported task method '{method}'"));
+        }
+        if !client_supports_tasks(meta) {
+            return Err(format!(
+                "{method} requires the io.modelcontextprotocol/tasks client capability"
+            ));
+        }
+        let exposed = params
+            .get("taskId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{method} requires params.taskId"))?
+            .to_string();
+        let (server_id, native_task_id) = decode_task_id(&exposed)?;
+        let slot = self.slot_for(&server_id)?;
+        let mut forwarded = params;
+        forwarded["taskId"] = json!(native_task_id);
+        let result = self.call_with_retry(&slot, |server| {
+            server.task_request(method, forwarded.clone(), cancel.clone(), meta)
+        })?;
+        let mut result = result;
+        if method == "tasks/get" {
+            if result.get("taskId").and_then(Value::as_str).is_none() {
+                return Err("downstream task result is missing taskId".to_string());
+            }
+            result["taskId"] = json!(exposed);
+        } else if result.get("taskId").is_some() {
+            // update/cancel are empty acknowledgements in the Tasks spec. If a
+            // non-conforming downstream includes its native id, never leak it
+            // across the gateway boundary.
+            result["taskId"] = json!(exposed);
+        }
+        Ok(result)
     }
 
     /// Every downstream resource, uris unchanged.
@@ -1673,13 +1808,205 @@ mod tests {
 
         let all = router.aggregated_extensions(|_| true);
         assert_eq!(all["com.example/passive"], json!({}));
-        assert!(all.get("io.modelcontextprotocol/tasks").is_none());
+        assert_eq!(all["io.modelcontextprotocol/tasks"], json!({}));
         assert_eq!(all["com.example/beta"]["enabled"], true);
         assert!(all.get("com.example/mode").is_none());
 
         let alpha = router.aggregated_extensions(|server_id| server_id == "alpha");
         assert_eq!(alpha["com.example/mode"]["version"], 1);
         assert!(alpha.get("com.example/beta").is_none());
+    }
+
+    struct TaskTransport {
+        seen: Arc<Mutex<Vec<(String, Value)>>>,
+        advertise_tasks: bool,
+    }
+
+    impl Transport for TaskTransport {
+        fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
+            match method {
+                "initialize" => Err(TransportError::Rpc(json!({
+                    "code": -32601,
+                    "message": "method not found"
+                }))),
+                "server/discover" => Ok(json!({
+                    "supportedVersions": [crate::downstream::MODERN_PROTOCOL_VERSION],
+                    "capabilities": {
+                        "extensions": if self.advertise_tasks {
+                            json!({ "io.modelcontextprotocol/tasks": {} })
+                        } else {
+                            json!({})
+                        }
+                    }
+                })),
+                "tools/list" => Ok(json!({ "tools": [{ "name": "job" }] })),
+                "tools/call" => {
+                    self.seen.lock().unwrap().push((method.to_string(), params));
+                    Ok(json!({
+                        "resultType": "task",
+                        "taskId": "same-native-id",
+                        "status": "working",
+                        "createdAt": "2026-08-01T00:00:00Z",
+                        "lastUpdatedAt": "2026-08-01T00:00:00Z",
+                        "ttlMs": null,
+                        "pollIntervalMs": 100
+                    }))
+                }
+                "tasks/get" => {
+                    self.seen.lock().unwrap().push((method.to_string(), params.clone()));
+                    Ok(json!({
+                        "resultType": "complete",
+                        "taskId": params["taskId"],
+                        "status": "completed",
+                        "createdAt": "2026-08-01T00:00:00Z",
+                        "lastUpdatedAt": "2026-08-01T00:00:01Z",
+                        "ttlMs": null,
+                        "result": { "content": [{ "type": "text", "text": "done" }] }
+                    }))
+                }
+                "tasks/update" | "tasks/cancel" => {
+                    self.seen.lock().unwrap().push((method.to_string(), params.clone()));
+                    Ok(json!({ "resultType": "complete", "taskId": params["taskId"] }))
+                }
+                other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
+            }
+        }
+
+        fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    fn task_server(id: &str, seen: Arc<Mutex<Vec<(String, Value)>>>) -> DownstreamServer {
+        DownstreamServer::connect(
+            id.to_string(),
+            Box::new(TaskTransport {
+                seen,
+                advertise_tasks: true,
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn task_handles_bind_owner_and_route_poll_update_and_cancel() {
+        let alpha_seen = Arc::new(Mutex::new(Vec::new()));
+        let beta_seen = Arc::new(Mutex::new(Vec::new()));
+        let mut router = Router::new();
+        router.add(task_server("alpha", Arc::clone(&alpha_seen)));
+        router.add(task_server("beta", Arc::clone(&beta_seen)));
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": crate::downstream::MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": { "io.modelcontextprotocol/tasks": {} }
+            }
+        });
+
+        let alpha = router
+            .route_call_with_cancel("alpha__job", json!({}), None, Some(&meta))
+            .unwrap();
+        let beta = router
+            .route_call_with_cancel("beta__job", json!({}), None, Some(&meta))
+            .unwrap();
+        let alpha_id = alpha["taskId"].as_str().unwrap();
+        let beta_id = beta["taskId"].as_str().unwrap();
+        assert_ne!(alpha_id, beta_id, "same native id on two servers must not collide");
+        assert_eq!(router.task_server(alpha_id).as_deref(), Some("alpha"));
+        assert_eq!(router.task_server(beta_id).as_deref(), Some("beta"));
+        assert_eq!(
+            Router::new().task_server(alpha_id).as_deref(),
+            Some("alpha"),
+            "task ownership must survive a router rebuild"
+        );
+        let mut tampered = alpha_id.to_string();
+        let changed = TASK_HANDLE_PREFIX.len() + 5;
+        let replacement = if &tampered[changed..=changed] == "A" { "B" } else { "A" };
+        tampered.replace_range(changed..=changed, replacement);
+        assert!(
+            router.task_server(&tampered).is_none(),
+            "an edited task handle must fail authentication"
+        );
+
+        let polled = router
+            .route_task(
+                "tasks/get",
+                json!({ "taskId": alpha_id }),
+                None,
+                Some(&meta),
+            )
+            .unwrap();
+        assert_eq!(polled["taskId"], alpha_id);
+        assert_eq!(polled["status"], "completed");
+        let updated = router
+            .route_task(
+                "tasks/update",
+                json!({
+                    "taskId": alpha_id,
+                    "inputResponses": { "answer": { "content": "yes" } }
+                }),
+                None,
+                Some(&meta),
+            )
+            .unwrap();
+        assert_eq!(updated["taskId"], alpha_id);
+        let cancelled = router
+            .route_task(
+                "tasks/cancel",
+                json!({ "taskId": alpha_id }),
+                None,
+                Some(&meta),
+            )
+            .unwrap();
+        assert_eq!(cancelled["taskId"], alpha_id);
+
+        let seen = alpha_seen.lock().unwrap();
+        for (method, params) in seen.iter().filter(|(method, _)| method.starts_with("tasks/")) {
+            assert_eq!(params["taskId"], "same-native-id", "{method} must use native id");
+            assert_eq!(
+                params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    ["io.modelcontextprotocol/tasks"],
+                json!({})
+            );
+        }
+        assert!(router.route_task("tasks/get", json!({ "taskId": "forged" }), None, Some(&meta)).is_err());
+        assert!(router
+            .route_task("tasks/get", json!({ "taskId": alpha_id }), None, None)
+            .unwrap_err()
+            .contains("client capability"));
+    }
+
+    #[test]
+    fn task_results_require_both_sides_to_advertise_the_extension() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut router = Router::new();
+        router.add(task_server("tasks", Arc::clone(&seen)));
+
+        let missing_client_capability = router
+            .route_call_with_cancel("tasks__job", json!({}), None, None)
+            .unwrap_err();
+        assert!(missing_client_capability.contains("required client capability"));
+
+        let mut unadvertised = Router::new();
+        unadvertised.add(
+            DownstreamServer::connect(
+                "plain".to_string(),
+                Box::new(TaskTransport {
+                    seen,
+                    advertise_tasks: false,
+                }),
+            )
+            .unwrap(),
+        );
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": crate::downstream::MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": { "io.modelcontextprotocol/tasks": {} }
+            }
+        });
+        let missing_server_capability = unadvertised
+            .route_call_with_cancel("plain__job", json!({}), None, Some(&meta))
+            .unwrap_err();
+        assert!(missing_server_capability.contains("without advertising"));
     }
 
     struct HintTransport {

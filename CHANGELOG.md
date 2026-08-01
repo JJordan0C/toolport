@@ -11,8 +11,11 @@ Entries before the rename below shipped under the project's former name, Conduit
 - Modern extension negotiation now passes opaque client extension settings to
   downstream servers and aggregates compatible downstream extension declarations
   in `server/discover`. Unknown `_meta` and result fields continue through unchanged;
-  conflicting settings are omitted rather than overstating gateway support. The
-  Tasks extension remains withheld until its handle-routing layer lands. (SOU-453)
+  conflicting settings are omitted rather than overstating gateway support. (SOU-453)
+- The `io.modelcontextprotocol/tasks` extension now keeps task handles bound to
+  the downstream server that created them and proxies `tasks/get`, `tasks/update`,
+  and `tasks/cancel`, including the required Streamable HTTP routing headers.
+  Toolport task ids survive router rebuilds and app restarts. (SOU-453)
 
 ### Security
 

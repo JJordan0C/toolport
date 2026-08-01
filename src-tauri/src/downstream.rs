@@ -113,9 +113,22 @@ fn modern_standard_headers(body: &Value) -> Result<Vec<(String, String)>, Transp
             .get("params")
             .and_then(|params| params.get("uri"))
             .and_then(Value::as_str),
+        "tasks/get" | "tasks/update" | "tasks/cancel" => body
+            .get("params")
+            .and_then(|params| params.get("taskId"))
+            .and_then(Value::as_str),
         _ => None,
     };
-    if matches!(method, "tools/call" | "prompts/get" | "resources/read") && name.is_none() {
+    if matches!(
+        method,
+        "tools/call"
+            | "prompts/get"
+            | "resources/read"
+            | "tasks/get"
+            | "tasks/update"
+            | "tasks/cancel"
+    ) && name.is_none()
+    {
         return Err(TransportError::Fatal(format!(
             "modern HTTP request '{method}' is missing its routing name"
         )));
@@ -435,14 +448,6 @@ pub const PER_HOP_META_KEYS: [&str; 3] = [
     "io.modelcontextprotocol/clientCapabilities",
 ];
 
-/// Extensions that cannot be relayed safely by copying capability and envelope
-/// data alone. Tasks introduces follow-up `tasks/*` methods whose opaque handles
-/// must route back to the server that minted them; advertising it before that
-/// ownership layer exists would strand every returned handle.
-pub fn extension_is_transparent(identifier: &str) -> bool {
-    identifier != "io.modelcontextprotocol/tasks"
-}
-
 /// Keys relayed only once Toolport can honour what they ask for.
 ///
 /// `progressToken` lived here until the gateway learned to route
@@ -518,14 +523,7 @@ fn attach_client_extensions(params: &mut Value, meta: Option<&Value>) {
         .and_then(|capabilities| capabilities.get("extensions"))
         .and_then(Value::as_object)
         .filter(|extensions| !extensions.is_empty())
-        .map(|extensions| {
-            extensions
-                .iter()
-                .filter(|(identifier, _)| extension_is_transparent(identifier))
-                .map(|(identifier, settings)| (identifier.clone(), settings.clone()))
-                .collect::<serde_json::Map<String, Value>>()
-        })
-        .filter(|extensions| !extensions.is_empty())
+        .cloned()
     else {
         return;
     };
@@ -4704,6 +4702,25 @@ impl DownstreamServer {
         &self.caps_extensions
     }
 
+    /// Forward a Tasks extension request on the same modern hop as the call
+    /// that created it. The router has already translated the client-facing
+    /// task id back to the server's native id.
+    pub fn task_request(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        meta: Option<&Value>,
+    ) -> Result<Value, TransportError> {
+        if !self.caps_extensions.contains_key("io.modelcontextprotocol/tasks") {
+            return Err(TransportError::Fatal(format!(
+                "server '{}' did not advertise io.modelcontextprotocol/tasks",
+                self.id
+            )));
+        }
+        self.request_with_mrtr(method, params, cancel, meta, None, &[])
+    }
+
     /// The protocol era and version this connection negotiated (SOU-445).
     pub fn era(&self) -> &Era {
         &self.era
@@ -4852,7 +4869,7 @@ mod tests {
         fetch_paginated_list,
     };
     use serde_json::{json, Value};
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -6895,9 +6912,10 @@ mod tests {
             "text/html"
         );
         assert!(capabilities.get("sampling").is_none());
-        assert!(capabilities["extensions"]
-            .get("io.modelcontextprotocol/tasks")
-            .is_none());
+        assert_eq!(
+            capabilities["extensions"]["io.modelcontextprotocol/tasks"],
+            json!({})
+        );
         assert_eq!(params["_meta"]["com.example/request"]["keep"], true);
     }
 
@@ -6963,6 +6981,26 @@ mod tests {
         assert_eq!(headers.get("mcp-param-region").map(String::as_str), Some("west"));
         assert!(!headers.contains_key("mcp-session-id"));
         assert!(transport.session_id.is_none(), "modern responses cannot restore a legacy session");
+    }
+
+    #[test]
+    fn modern_http_task_requests_route_by_native_task_id() {
+        for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
+            let headers = super::modern_standard_headers(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": { "taskId": "native-task-id" }
+            }))
+            .unwrap()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+            assert_eq!(headers.get("Mcp-Method").map(String::as_str), Some(method));
+            assert_eq!(
+                headers.get("Mcp-Name").map(String::as_str),
+                Some("native-task-id")
+            );
+        }
     }
 
     #[test]

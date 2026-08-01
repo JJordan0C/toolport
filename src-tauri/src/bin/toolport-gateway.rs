@@ -120,6 +120,16 @@ fn modern_client_supports_server_rpc(method: &str) -> bool {
     })
 }
 
+fn modern_client_supports_extension(identifier: &str) -> bool {
+    ACTIVE_UPSTREAM_CAPABILITIES.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|caps| caps.get("extensions"))
+            .and_then(|extensions| extensions.get(identifier))
+            .is_some()
+    })
+}
+
 /// Add the fields a modern client requires to a result.
 ///
 /// No-op for legacy clients, so their responses stay byte-identical to what
@@ -5197,6 +5207,49 @@ fn handle_request_with_cancel(
                 )),
             }
         }
+        method @ ("tasks/get" | "tasks/update" | "tasks/cancel") => {
+            if !serving_modern_client() {
+                return Some(error(
+                    id,
+                    -32601,
+                    "Tasks extension requires MCP 2026-07-28",
+                ));
+            }
+            if !modern_client_supports_extension("io.modelcontextprotocol/tasks") {
+                return Some(missing_modern_client_capability(
+                    id,
+                    "io.modelcontextprotocol/tasks",
+                ));
+            }
+            let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+            let Some(task_id) = params.get("taskId").and_then(Value::as_str) else {
+                return Some(error(
+                    id,
+                    -32602,
+                    &format!("Toolport: {method} requires params.taskId"),
+                ));
+            };
+            let Some(owner) = router.task_server(task_id) else {
+                return Some(error(id, -32602, "Toolport: invalid task id"));
+            };
+            if let Some(set) = allowed {
+                if !server_in_allowed_scope(&owner, set) {
+                    return Some(error(id, -32602, "Toolport: invalid task id"));
+                }
+            }
+            let client_meta = params.get("_meta").cloned();
+            match router.route_task(method, params, cancel.clone(), client_meta.as_ref()) {
+                Ok(result) => Some(success(id, result)),
+                Err(e) => Some(error(
+                    id,
+                    -32602,
+                    &format!(
+                        "Toolport: {}",
+                        integrity::defend_error_text("task", &e)
+                    ),
+                )),
+            }
+        }
         // `ping` was removed in 2026-07-28, so a modern client gets method-not-found
         // rather than a misleading success. Legacy clients keep it (SOU-446).
         "ping" if serving_modern_client() => Some(error(
@@ -9248,11 +9301,20 @@ fn validate_modern_http_headers(
             .get("params")
             .and_then(|params| params.get("uri"))
             .and_then(Value::as_str),
+        "tasks/get" | "tasks/update" | "tasks/cancel" => req
+            .get("params")
+            .and_then(|params| params.get("taskId"))
+            .and_then(Value::as_str),
         _ => None,
     };
     let requires_name = matches!(
         body_method,
-        "tools/call" | "prompts/get" | "resources/read"
+        "tools/call"
+            | "prompts/get"
+            | "resources/read"
+            | "tasks/get"
+            | "tasks/update"
+            | "tasks/cancel"
     );
     let encoded_name = body_name.map(downstream::encode_mcp_header_text);
     if requires_name && (body_name.is_none() || headers.name != encoded_name.as_deref()) {
@@ -14326,6 +14388,26 @@ mod tests {
             downstream::HEADER_MISMATCH
         );
 
+        for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
+            let task_id = "toolport-task:v1:owner:native";
+            let task_body: Value = serde_json::from_str(&modern_http_body(
+                3,
+                method,
+                json!({ "taskId": task_id }),
+            ))
+            .unwrap();
+            assert!(validate_modern_http_headers(
+                &task_body,
+                modern_http_headers(method, Some(task_id), None, None),
+            )
+            .is_ok());
+            assert!(validate_modern_http_headers(
+                &task_body,
+                modern_http_headers(method, None, None, None),
+            )
+            .is_err());
+        }
+
         let unsupported_body = json!({
             "jsonrpc": "2.0",
             "id": 3,
@@ -15836,9 +15918,11 @@ mod tests {
                 ["version"],
             1
         );
-        assert!(response["result"]["capabilities"]["extensions"]
-            .get("io.modelcontextprotocol/tasks")
-            .is_none());
+        assert_eq!(
+            response["result"]["capabilities"]["extensions"]
+                ["io.modelcontextprotocol/tasks"],
+            json!({})
+        );
 
         let allowed = std::collections::HashSet::from(["other".to_string()]);
         let scoped = handle_request(
@@ -15857,6 +15941,42 @@ mod tests {
         assert!(scoped["result"]["capabilities"]
             .get("extensions")
             .is_none());
+    }
+
+    #[test]
+    fn task_methods_require_the_per_request_extension_capability() {
+        let missing = dispatch(&modern_req(
+            1,
+            "tasks/get",
+            json!({ "taskId": "not-a-toolport-task" }),
+        ));
+        assert_eq!(
+            missing["error"]["code"],
+            downstream::MISSING_REQUIRED_CLIENT_CAPABILITY
+        );
+
+        let mut declared = modern_req(
+            2,
+            "tasks/get",
+            json!({ "taskId": "not-a-toolport-task" }),
+        );
+        declared["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({
+            "extensions": { "io.modelcontextprotocol/tasks": {} }
+        });
+        let invalid = dispatch(&declared);
+        assert_eq!(invalid["error"]["code"], -32602);
+        assert_eq!(invalid["error"]["message"], "Toolport: invalid task id");
+
+        let mut malformed = modern_req(3, "tasks/get", json!({}));
+        malformed["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({
+            "extensions": { "io.modelcontextprotocol/tasks": {} }
+        });
+        let malformed = dispatch(&malformed);
+        assert_eq!(malformed["error"]["code"], -32602);
+        assert_eq!(
+            malformed["error"]["message"],
+            "Toolport: tasks/get requires params.taskId"
+        );
     }
 
     #[test]
