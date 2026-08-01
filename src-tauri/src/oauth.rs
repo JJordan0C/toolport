@@ -658,22 +658,31 @@ fn probe_bearer_challenge(mcp_url: &str, block_private: bool) -> Option<BearerCh
         Err(ureq::Error::Status(code, response)) if code == 401 || code == 403 => {
             let values = response.all("www-authenticate");
             let challenge = bearer_challenge(values.iter().copied());
-            // Drain a small amount so the connection can be reused, without
-            // letting a hostile error body allocate unbounded memory.
-            let mut reader = response.into_reader().take(8 * 1024);
-            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+            drain_probe_response(response);
             challenge
         }
         Ok(response) => {
-            let mut reader = response.into_reader().take(8 * 1024);
-            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+            drain_probe_response(response);
             None
         }
-        Err(error) => {
+        Err(ureq::Error::Status(code, response)) => {
+            drain_probe_response(response);
+            debug_log(&format!("OAuth challenge probe returned HTTP {code}"));
+            None
+        }
+        Err(error @ ureq::Error::Transport(_)) => {
             debug_log(&format!("OAuth challenge probe failed: {error}"));
             None
         }
     }
+}
+
+/// Drain a bounded amount from probe responses so ordinary error pages do not
+/// prevent connection reuse, without allowing a hostile body to consume
+/// unbounded memory or time.
+fn drain_probe_response(response: ureq::Response) {
+    let mut reader = response.into_reader().take(8 * 1024);
+    let _ = std::io::copy(&mut reader, &mut std::io::sink());
 }
 
 /// Discover the authorization + token endpoints for an MCP server URL.
@@ -1695,6 +1704,25 @@ mod tests {
         .expect("the first Bearer challenge should be selected");
         assert_eq!(parsed.scope.as_deref(), Some("files:read"));
         assert_eq!(parsed.resource_metadata, None);
+    }
+
+    #[test]
+    fn bearer_challenge_probe_handles_other_http_errors() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let url = format!("http://{address}/mcp");
+        let handle = std::thread::spawn(move || {
+            let request = server.recv().expect("challenge probe");
+            request
+                .respond(
+                    tiny_http::Response::from_string("method not allowed")
+                        .with_status_code(405),
+                )
+                .unwrap();
+        });
+
+        assert_eq!(probe_bearer_challenge(&url, false), None);
+        handle.join().unwrap();
     }
 
     #[test]
