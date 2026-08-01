@@ -185,7 +185,10 @@ fn bearer_challenge<'a>(headers: impl IntoIterator<Item = &'a str>) -> Option<Be
                 _ => (None, part),
             };
             if let Some(scheme) = candidate {
-                if found && !scheme.eq_ignore_ascii_case("bearer") {
+                // Any new auth scheme starts a new challenge, including a
+                // second Bearer challenge. Do not merge its parameters into
+                // the first Bearer challenge selected above.
+                if found {
                     break;
                 }
                 bearer = scheme.eq_ignore_ascii_case("bearer");
@@ -1682,6 +1685,16 @@ mod tests {
         ])
         .expect("Bearer scheme should still be recognized");
         assert_eq!(parsed, BearerChallenge::default());
+    }
+
+    #[test]
+    fn bearer_challenge_does_not_merge_multiple_bearer_challenges() {
+        let parsed = bearer_challenge([
+            "Bearer scope=\"files:read\", Bearer resource_metadata=\"https://wrong.example/meta\"",
+        ])
+        .expect("the first Bearer challenge should be selected");
+        assert_eq!(parsed.scope.as_deref(), Some("files:read"));
+        assert_eq!(parsed.resource_metadata, None);
     }
 
     #[test]
