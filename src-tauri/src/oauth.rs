@@ -726,16 +726,27 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
     if let Some(url) = challenge_metadata.as_ref() {
         require_https(url, "protected-resource metadata")?;
         guard_endpoint(url, server_local, "protected-resource metadata")?;
-        let metadata = get_json::<ProtectedResource>(url, block_private).map_err(|e| {
-            format!("could not fetch protected-resource metadata advertised by the server: {e}")
-        })?;
-        let (issuer, scope) = validated_protected_resource(mcp_url, metadata).map_err(|e| {
-            format!("protected-resource metadata rejected at {url}: {e}")
-        })?;
-        protected_resource_found = true;
-        discovered_issuer = Some(issuer);
-        resource_scope = scope;
-    } else {
+        match get_optional_discovery_json::<ProtectedResource>(url, block_private) {
+            Ok(Some(metadata)) => {
+                let (issuer, scope) =
+                    validated_protected_resource(mcp_url, metadata).map_err(|e| {
+                        format!("protected-resource metadata rejected at {url}: {e}")
+                    })?;
+                protected_resource_found = true;
+                discovered_issuer = Some(issuer);
+                resource_scope = scope;
+            }
+            Ok(None) => debug_log(&format!(
+                "protected-resource metadata advertised at {url} was unavailable; trying well-known discovery"
+            )),
+            Err(e) => {
+                return Err(format!(
+                    "protected-resource metadata rejected at {url}: {e}"
+                ))
+            }
+        }
+    }
+    if discovered_issuer.is_none() {
         for url in protected_resource_metadata_candidates(mcp_url) {
             match get_optional_discovery_json::<ProtectedResource>(&url, block_private) {
                 Ok(Some(metadata)) => match validated_protected_resource(mcp_url, metadata) {
@@ -1826,6 +1837,117 @@ mod tests {
         handle.join().unwrap();
         assert_eq!(endpoints.issuer, origin);
         assert_eq!(endpoints.scope.as_deref(), Some("files:read"));
+    }
+
+    #[test]
+    fn discovery_falls_back_when_challenge_metadata_is_unavailable() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let mcp_url = format!("{origin}/mcp");
+        let resource_metadata = format!("{origin}/unavailable-resource");
+        let expected_resource = mcp_url.clone();
+        let expected_origin = origin.clone();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let request = server.recv().expect("OAuth discovery request");
+                let response = match request.url() {
+                    "/mcp" => {
+                        let challenge = format!(
+                            "Bearer resource_metadata=\"{resource_metadata}\", scope=\"files:read\""
+                        );
+                        tiny_http::Response::from_string("authorization required")
+                            .with_status_code(401)
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    b"WWW-Authenticate",
+                                    challenge.as_bytes(),
+                                )
+                                .unwrap(),
+                            )
+                    }
+                    "/unavailable-resource" => {
+                        tiny_http::Response::from_string("temporarily unavailable")
+                            .with_status_code(503)
+                    }
+                    "/.well-known/oauth-protected-resource/mcp" => {
+                        tiny_http::Response::from_string(
+                            serde_json::json!({
+                                "resource": expected_resource,
+                                "authorization_servers": [expected_origin]
+                            })
+                            .to_string(),
+                        )
+                        .with_header(
+                            tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                                .unwrap(),
+                        )
+                    }
+                    "/.well-known/oauth-authorization-server" => {
+                        tiny_http::Response::from_string(
+                            serde_json::json!({
+                                "issuer": expected_origin,
+                                "authorization_endpoint": format!("{expected_origin}/authorize"),
+                                "token_endpoint": format!("{expected_origin}/token")
+                            })
+                            .to_string(),
+                        )
+                        .with_header(
+                            tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                                .unwrap(),
+                        )
+                    }
+                    path => panic!("unexpected OAuth discovery path: {path}"),
+                };
+                request.respond(response).unwrap();
+            }
+        });
+
+        let endpoints = discover(&mcp_url).expect("well-known fallback should succeed");
+        handle.join().unwrap();
+        assert_eq!(endpoints.issuer, origin);
+        assert_eq!(endpoints.scope.as_deref(), Some("files:read"));
+    }
+
+    #[test]
+    fn discovery_rejects_malformed_challenge_metadata_without_fallback() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let mcp_url = format!("{origin}/mcp");
+        let resource_metadata = format!("{origin}/malformed-resource");
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let request = server.recv().expect("OAuth discovery request");
+                let response = match request.url() {
+                    "/mcp" => {
+                        let challenge =
+                            format!("Bearer resource_metadata=\"{resource_metadata}\"");
+                        tiny_http::Response::from_string("authorization required")
+                            .with_status_code(401)
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    b"WWW-Authenticate",
+                                    challenge.as_bytes(),
+                                )
+                                .unwrap(),
+                            )
+                    }
+                    "/malformed-resource" => tiny_http::Response::from_string("not json")
+                        .with_header(
+                            tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                                .unwrap(),
+                        ),
+                    path => panic!("unexpected OAuth discovery path: {path}"),
+                };
+                request.respond(response).unwrap();
+            }
+        });
+
+        let error = discover(&mcp_url).unwrap_err();
+        handle.join().unwrap();
+        assert!(error.contains("metadata response was not valid JSON"));
+        assert!(error.contains("/malformed-resource"));
     }
 
     #[test]
