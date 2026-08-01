@@ -200,9 +200,10 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 ///
 /// Every entry below `MODERN_PROTOCOL_VERSION` is legacy. The gateway's own
 /// behaviour does not vary across them (revision differences are additive and ride
-/// through from the downstream server), and the `initialize` arm echoes whatever
-/// the client asks for, so all of them genuinely are served. Listing only two
-/// under-reported that (SOU-474 #7).
+/// through from the downstream server). `initialize` echoes listed revisions but
+/// negotiates unknown values down to [`PROTOCOL_VERSION`] rather than claiming to
+/// implement an arbitrary client string (SOU-482). Listing only two under-reported
+/// the revisions Toolport genuinely serves (SOU-474 #7).
 const SUPPORTED_UPSTREAM_VERSIONS: [&str; 5] = [
     MODERN_PROTOCOL_VERSION,
     "2025-11-25",
@@ -4299,11 +4300,16 @@ fn handle_request_with_cancel(
             }),
         )),
         "initialize" => {
-            let proto = req
+            let requested = req
                 .get("params")
                 .and_then(|p| p.get("protocolVersion"))
                 .and_then(|v| v.as_str())
                 .unwrap_or(PROTOCOL_VERSION);
+            let proto = if SUPPORTED_UPSTREAM_VERSIONS.contains(&requested) {
+                requested
+            } else {
+                PROTOCOL_VERSION
+            };
             Some(success(
                 id,
                 json!({
@@ -15599,7 +15605,7 @@ mod tests {
     }
 
     #[test]
-    fn advertised_versions_cover_every_revision_initialize_accepts() {
+    fn initialize_echoes_supported_versions_and_negotiates_unknown_versions() {
         // `server/discover` is how a modern client learns what to ask for. If it
         // under-reports, a client picks a version Toolport serves but did not
         // advertise - or worse, concludes it cannot talk to us at all.
@@ -15624,22 +15630,25 @@ mod tests {
                 advertised.as_array().is_some_and(|a| a.iter().any(|v| v == version)),
                 "initialize serves {version} but server/discover does not advertise it: {advertised}"
             );
+            let initialized = dispatch(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": version }
+            }));
+            assert_eq!(
+                initialized["result"]["protocolVersion"], version,
+                "a supported version must still be negotiated exactly"
+            );
         }
 
-        // Deliberately NOT asserted per-revision above: `initialize` echoes any
-        // string, so "it echoed what I sent" is a tautology that holds for
-        // "garbage" too and proves nothing about which revisions are real. What
-        // the echo does establish is the shape of the claim - that no published
-        // revision is turned away - so assert it once, against a value that is
-        // NOT a published revision, to show the echo really is unconditional and
-        // this list is therefore a deliberate choice rather than a filter.
+        // An unknown revision must receive one Toolport actually implements so
+        // the client can decide whether to continue at that negotiated version.
         let nonsense = dispatch(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": { "protocolVersion": "1999-01-01" }
         }));
         assert_eq!(
-            nonsense["result"]["protocolVersion"], "1999-01-01",
-            "initialize validates nothing, so the advertised list is curated, not derived"
+            nonsense["result"]["protocolVersion"], PROTOCOL_VERSION,
+            "initialize must not claim support for an unknown revision"
         );
         assert!(
             !advertised.as_array().is_some_and(|a| a.iter().any(|v| v == "1999-01-01")),
