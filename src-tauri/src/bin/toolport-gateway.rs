@@ -3382,7 +3382,12 @@ fn execute_call(
 ) -> Value {
     let mut confirmed = opts.confirmed;
     let shape = opts.shape;
-    let resuming_modern_hitl = serving_modern_client()
+    // Direct modern calls can use MRTR even on their first round, before any
+    // requestState exists. Code-mode steps deliberately keep the legacy broker
+    // because they cannot surface an intermediate result to the upstream client;
+    // `confirm` is present only on the direct call path.
+    let modern_direct_call = serving_modern_client() && confirm.is_some();
+    let resuming_modern_hitl = modern_direct_call
         && mrtr
             .and_then(|retry| retry.request_state.as_ref())
             .and_then(Value::as_str)
@@ -3517,7 +3522,7 @@ fn execute_call(
             };
             let mut approval_reason = reason;
             let (decision, held_ms, approved_fp, audit_approval) =
-                if serving_modern_client() && mrtr.is_some() {
+                if modern_direct_call {
                 let incoming = mrtr.cloned().unwrap_or_default();
                 let state = incoming.request_state.as_ref().and_then(Value::as_str);
                 let polled = state.map(|token| {
@@ -11245,6 +11250,59 @@ mod tests {
             response["error"]["code"],
             downstream::MISSING_REQUIRED_CLIENT_CAPABILITY
         );
+    }
+
+    #[test]
+    fn initial_modern_hitl_call_starts_mrtr_without_retry_fields() {
+        modern_hitl_approvals()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let request = json!({
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "elicitation": {}
+                    }
+                }
+            }
+        });
+        let _era = UpstreamEraGuard::enter(Some(MODERN_PROTOCOL_VERSION.to_string()));
+        let _capabilities = UpstreamCapabilitiesGuard::enter(&request);
+        let mut reg = Registry::default();
+        reg.set_human_approval(true);
+        let router = routed_router("s", "delete");
+        let cached = router.aggregated_tools();
+
+        let result = execute_call(
+            &reg,
+            &router,
+            &cached,
+            Some("cursor"),
+            None,
+            None,
+            Some(&ConfirmGuard::new()),
+            "s__delete",
+            json!({ "id": 7 }),
+            None,
+            None,
+            CallOpts {
+                confirmed: false,
+                shape: true,
+            },
+            None,
+        );
+
+        assert_eq!(result["resultType"], "input_required");
+        assert_eq!(
+            result["inputRequests"]["toolport_approval"]["method"],
+            "elicitation/create"
+        );
+        let token = result["requestState"]
+            .as_str()
+            .expect("initial HITL response has requestState");
+        assert!(token.starts_with("toolport-hitl-"));
+        finish_modern_hitl(Some(token));
     }
 
     #[test]
