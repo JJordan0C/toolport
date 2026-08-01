@@ -108,6 +108,112 @@ struct ProtectedResource {
     scopes_supported: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BearerChallenge {
+    resource_metadata: Option<String>,
+    scope: Option<String>,
+}
+
+/// Split an HTTP authentication header on commas that are outside quoted
+/// strings. Authentication parameters commonly contain URLs and descriptions,
+/// so a plain `split(',')` corrupts valid quoted values.
+fn auth_header_parts(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                parts.push(value[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(value[start..].trim());
+    parts
+}
+
+fn auth_param(value: &str) -> Option<(&str, String)> {
+    let (name, value) = value.split_once('=')?;
+    let name = name.trim();
+    let value = value.trim();
+    if name.is_empty() || value.is_empty() {
+        return None;
+    }
+    let decoded = if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+        let mut out = String::new();
+        let mut escaped = false;
+        for ch in value[1..value.len() - 1].chars() {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else {
+                out.push(ch);
+            }
+        }
+        if escaped {
+            return None;
+        }
+        out
+    } else {
+        value.to_string()
+    };
+    Some((name, decoded))
+}
+
+/// Select the first Bearer challenge from one or more `WWW-Authenticate`
+/// fields. A response may advertise another scheme first or place Bearer
+/// parameters in later comma-separated segments.
+fn bearer_challenge<'a>(headers: impl IntoIterator<Item = &'a str>) -> Option<BearerChallenge> {
+    for header in headers {
+        let mut bearer = false;
+        let mut challenge = BearerChallenge::default();
+        let mut found = false;
+        for part in auth_header_parts(header) {
+            let (candidate, param) = match part.split_once(char::is_whitespace) {
+                Some((scheme, rest)) if !scheme.contains('=') => (Some(scheme), rest.trim()),
+                _ => (None, part),
+            };
+            if let Some(scheme) = candidate {
+                if found && !scheme.eq_ignore_ascii_case("bearer") {
+                    break;
+                }
+                bearer = scheme.eq_ignore_ascii_case("bearer");
+                found = bearer;
+            }
+            if !bearer || param.is_empty() {
+                continue;
+            }
+            let Some((name, value)) = auth_param(param) else {
+                continue;
+            };
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                continue;
+            }
+            if name.eq_ignore_ascii_case("resource_metadata") {
+                challenge.resource_metadata.get_or_insert(value);
+            } else if name.eq_ignore_ascii_case("scope") {
+                challenge.scope.get_or_insert(value);
+            }
+        }
+        if found {
+            return Some(challenge);
+        }
+    }
+    None
+}
+
 #[derive(Deserialize)]
 struct AsMeta {
     issuer: String,
@@ -514,6 +620,59 @@ fn guard_endpoint(url: &str, server_local: bool, what: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// Ask the configured endpoint for its Bearer challenge before starting OAuth.
+/// Current MCP servers use this response to point clients at the exact RFC 9728
+/// metadata document and, when authorization is incremental, the scope needed
+/// for the attempted request. Failure to obtain a challenge is not fatal because
+/// pre-RFC 9728 servers still rely on well-known discovery.
+fn probe_bearer_challenge(mcp_url: &str, block_private: bool) -> Option<BearerChallenge> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "server/discover",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": crate::downstream::MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "toolport",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }
+    });
+    let response = agent_no_redirect(block_private)
+        .post(mcp_url)
+        .set("Content-Type", "application/json")
+        .set("Accept", "application/json, text/event-stream")
+        .set(
+            "MCP-Protocol-Version",
+            crate::downstream::MODERN_PROTOCOL_VERSION,
+        )
+        .set("Mcp-Method", "server/discover")
+        .send_json(body);
+    match response {
+        Err(ureq::Error::Status(code, response)) if code == 401 || code == 403 => {
+            let values = response.all("www-authenticate");
+            let challenge = bearer_challenge(values.iter().copied());
+            // Drain a small amount so the connection can be reused, without
+            // letting a hostile error body allocate unbounded memory.
+            let mut reader = response.into_reader().take(8 * 1024);
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+            challenge
+        }
+        Ok(response) => {
+            let mut reader = response.into_reader().take(8 * 1024);
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+            None
+        }
+        Err(error) => {
+            debug_log(&format!("OAuth challenge probe failed: {error}"));
+            None
+        }
+    }
+}
+
 /// Discover the authorization + token endpoints for an MCP server URL.
 pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
     let origin = origin_of(mcp_url);
@@ -528,32 +687,51 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
         .map(|h| host_is_definitely_private(&h))
         .unwrap_or(false);
     let block_private = !server_local;
+    let challenge = probe_bearer_challenge(mcp_url, block_private);
+    let challenge_scope = challenge
+        .as_ref()
+        .and_then(|challenge| challenge.scope.clone());
     let mut protected_resource_found = false;
     let mut resource_scope = None;
     let mut discovered_issuer = None;
-    for url in protected_resource_metadata_candidates(mcp_url) {
-        match get_optional_discovery_json::<ProtectedResource>(&url, block_private) {
-            Ok(Some(metadata)) => match validated_protected_resource(mcp_url, metadata) {
-                Ok((issuer, scope)) => {
-                    protected_resource_found = true;
-                    discovered_issuer = Some(issuer);
-                    resource_scope = scope;
-                    break;
-                }
-                // A document was found and parsed, so rejecting its security
-                // binding must fail closed. Falling back to origin-level AS
-                // discovery here would silently bypass RFC 9728 validation.
+    let challenge_metadata = challenge.and_then(|challenge| challenge.resource_metadata);
+    if let Some(url) = challenge_metadata.as_ref() {
+        require_https(url, "protected-resource metadata")?;
+        guard_endpoint(url, server_local, "protected-resource metadata")?;
+        let metadata = get_json::<ProtectedResource>(url, block_private).map_err(|e| {
+            format!("could not fetch protected-resource metadata advertised by the server: {e}")
+        })?;
+        let (issuer, scope) = validated_protected_resource(mcp_url, metadata).map_err(|e| {
+            format!("protected-resource metadata rejected at {url}: {e}")
+        })?;
+        protected_resource_found = true;
+        discovered_issuer = Some(issuer);
+        resource_scope = scope;
+    } else {
+        for url in protected_resource_metadata_candidates(mcp_url) {
+            match get_optional_discovery_json::<ProtectedResource>(&url, block_private) {
+                Ok(Some(metadata)) => match validated_protected_resource(mcp_url, metadata) {
+                    Ok((issuer, scope)) => {
+                        protected_resource_found = true;
+                        discovered_issuer = Some(issuer);
+                        resource_scope = scope;
+                        break;
+                    }
+                    // A document was found and parsed, so rejecting its security
+                    // binding must fail closed. Falling back to origin-level AS
+                    // discovery here would silently bypass RFC 9728 validation.
+                    Err(e) => {
+                        return Err(format!(
+                            "protected-resource metadata rejected at {url}: {e}"
+                        ))
+                    }
+                },
+                Ok(None) => {}
                 Err(e) => {
                     return Err(format!(
                         "protected-resource metadata rejected at {url}: {e}"
                     ))
                 }
-            },
-            Ok(None) => {}
-            Err(e) => {
-                return Err(format!(
-                    "protected-resource metadata rejected at {url}: {e}"
-                ))
             }
         }
     }
@@ -598,11 +776,13 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
                 // The protected resource defines the scopes needed to access it.
                 // Keep AS metadata as a compatibility fallback for older servers
                 // that did not publish RFC 9728 protected-resource metadata.
-                scope: initial_scope(
-                    protected_resource_found,
-                    resource_scope,
-                    meta.scopes_supported,
-                ),
+                scope: challenge_scope.or_else(|| {
+                    initial_scope(
+                        protected_resource_found,
+                        resource_scope,
+                        meta.scopes_supported,
+                    )
+                }),
                 authorization_response_iss_parameter_supported: meta
                     .authorization_response_iss_parameter_supported,
             });
@@ -1469,6 +1649,108 @@ mod tests {
     }
 
     #[test]
+    fn bearer_challenge_extracts_resource_metadata_and_scope() {
+        let parsed = bearer_challenge([
+            "Basic realm=\"legacy\", Bearer resource_metadata=\"https://mcp.example.com/auth/meta?label=a,b\", scope=\"files:read files:write\", error=\"insufficient_scope\"",
+        ])
+        .expect("Bearer challenge should be selected after another scheme");
+        assert_eq!(
+            parsed.resource_metadata.as_deref(),
+            Some("https://mcp.example.com/auth/meta?label=a,b")
+        );
+        assert_eq!(parsed.scope.as_deref(), Some("files:read files:write"));
+    }
+
+    #[test]
+    fn bearer_challenge_supports_repeated_headers_and_quoted_escapes() {
+        let parsed = bearer_challenge([
+            "Basic realm=\"legacy\"",
+            "Bearer error=\"invalid_token\", resource_metadata=\"https://mcp.example.com/meta?note=a\\\"b\"",
+        ])
+        .expect("Bearer challenge should be found in a later field");
+        assert_eq!(
+            parsed.resource_metadata.as_deref(),
+            Some("https://mcp.example.com/meta?note=a\"b")
+        );
+        assert_eq!(parsed.scope, None);
+    }
+
+    #[test]
+    fn bearer_challenge_ignores_empty_scope_and_stops_at_the_next_scheme() {
+        let parsed = bearer_challenge([
+            "Bearer scope=\"\", Basic realm=\"other\", resource_metadata=\"https://wrong.example/meta\"",
+        ])
+        .expect("Bearer scheme should still be recognized");
+        assert_eq!(parsed, BearerChallenge::default());
+    }
+
+    #[test]
+    fn discovery_uses_the_metadata_url_and_scope_from_the_bearer_challenge() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let mcp_url = format!("{origin}/mcp");
+        let resource_metadata = format!("{origin}/oauth-resource");
+        let expected_resource = mcp_url.clone();
+        let expected_origin = origin.clone();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let request = server.recv().expect("OAuth discovery request");
+                let response = match request.url() {
+                    "/mcp" => {
+                        let challenge = format!(
+                            "Bearer resource_metadata=\"{resource_metadata}\", scope=\"files:read\""
+                        );
+                        tiny_http::Response::from_string("authorization required")
+                            .with_status_code(401)
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    b"WWW-Authenticate",
+                                    challenge.as_bytes(),
+                                )
+                                .unwrap(),
+                            )
+                    }
+                    "/oauth-resource" => tiny_http::Response::from_string(
+                        serde_json::json!({
+                            "resource": expected_resource,
+                            "authorization_servers": [expected_origin]
+                        })
+                        .to_string(),
+                    )
+                    .with_header(
+                        tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                            .unwrap(),
+                    ),
+                    "/.well-known/oauth-authorization-server" => {
+                        tiny_http::Response::from_string(
+                            serde_json::json!({
+                                "issuer": expected_origin,
+                                "authorization_endpoint": format!("{expected_origin}/authorize"),
+                                "token_endpoint": format!("{expected_origin}/token"),
+                                "registration_endpoint": format!("{expected_origin}/register"),
+                                "scopes_supported": ["admin"]
+                            })
+                            .to_string(),
+                        )
+                        .with_header(
+                            tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                                .unwrap(),
+                        )
+                    }
+                    path => panic!("unexpected OAuth discovery path: {path}"),
+                };
+                request.respond(response).unwrap();
+            }
+        });
+
+        let endpoints = discover(&mcp_url).expect("challenge-guided discovery should succeed");
+        handle.join().unwrap();
+        assert_eq!(endpoints.issuer, origin);
+        assert_eq!(endpoints.scope.as_deref(), Some("files:read"));
+    }
+
+    #[test]
     fn discover_fails_closed_on_invalid_protected_resource_metadata() {
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
@@ -1500,7 +1782,7 @@ mod tests {
         assert!(error.contains("no resource identifier"));
         assert_eq!(
             requested_paths.lock().unwrap().as_slice(),
-            ["/.well-known/oauth-protected-resource"]
+            ["/", "/.well-known/oauth-protected-resource"]
         );
     }
 
@@ -1512,21 +1794,21 @@ mod tests {
         let address = server.server_addr().to_ip().unwrap();
         let resource = format!("http://{address}");
         let handle = std::thread::spawn(move || {
-            let request = server
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap()
-                .expect("protected-resource metadata request");
-            request
-                .respond(
-                    tiny_http::Response::from_string("not json").with_header(
-                        tiny_http::Header::from_bytes(
-                            b"Content-Type",
-                            b"application/json",
-                        )
-                        .unwrap(),
-                    ),
-                )
-                .unwrap();
+            for body in ["", "not json"] {
+                let request = server
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .expect("OAuth discovery request");
+                let response = if body.is_empty() {
+                    tiny_http::Response::from_string(body)
+                } else {
+                    tiny_http::Response::from_string(body).with_header(
+                        tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                            .unwrap(),
+                    )
+                };
+                request.respond(response).unwrap();
+            }
         });
 
         let error = discover(&resource).unwrap_err();
@@ -1544,21 +1826,28 @@ mod tests {
         let resource = format!("http://{address}");
         let document_resource = resource.clone();
         let handle = std::thread::spawn(move || {
-            let request = server
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap()
-                .expect("protected-resource metadata request");
-            let response = tiny_http::Response::from_string(
+            for body in [
+                String::new(),
                 serde_json::json!({
                     "resource": document_resource,
                     "authorization_servers": ["http://8.8.8.8"]
                 })
                 .to_string(),
-            )
-            .with_header(
-                tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap(),
-            );
-            request.respond(response).unwrap();
+            ] {
+                let request = server
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .expect("OAuth discovery request");
+                let response = if body.is_empty() {
+                    tiny_http::Response::from_string(body)
+                } else {
+                    tiny_http::Response::from_string(body).with_header(
+                        tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                            .unwrap(),
+                    )
+                };
+                request.respond(response).unwrap();
+            }
         });
 
         let error = discover(&resource).unwrap_err();

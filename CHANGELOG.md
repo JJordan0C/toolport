@@ -17,6 +17,10 @@ Entries before the rename below shipped under the project's former name, Conduit
   metadata before the origin fallback, rejects metadata for a different resource,
   and requests the resource's advertised scopes. OAuth and OIDC authorization-server
   metadata candidates follow the current MCP priority order. (SOU-451)
+- OAuth discovery now honors Bearer `WWW-Authenticate` challenges, validates the
+  advertised protected-resource metadata URL with the existing TLS and SSRF guards,
+  and gives a challenge's requested scope priority without weakening discovery for
+  older servers that do not return a challenge. (SOU-451)
 
 ## [1.11.0] - 2026-08-01
 
