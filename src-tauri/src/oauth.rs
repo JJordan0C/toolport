@@ -193,6 +193,24 @@ fn get_json<T: serde::de::DeserializeOwned>(url: &str, block_private: bool) -> R
         .map_err(|e| e.to_string())
 }
 
+/// Fetch optional discovery metadata while distinguishing an absent/unreachable
+/// endpoint from a reachable endpoint that returned malformed JSON. Older MCP
+/// servers may not implement the protected-resource well-known URI, but a 2xx
+/// response must not bypass validation merely by being unparseable.
+fn get_optional_discovery_json<T: serde::de::DeserializeOwned>(
+    url: &str,
+    block_private: bool,
+) -> Result<Option<T>, String> {
+    let response = match agent(block_private).get(url).call() {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
+    };
+    response
+        .into_json::<T>()
+        .map(Some)
+        .map_err(|e| format!("metadata response was not valid JSON: {e}"))
+}
+
 fn split_origin_path(url: &str) -> (String, String) {
     if let Some(scheme_end) = url.find("://") {
         let after = &url[scheme_end + 3..];
@@ -289,18 +307,18 @@ fn validated_protected_resource(
             "protected-resource metadata has no authorization server; refusing OAuth discovery"
                 .to_string()
         })?;
-    let scope = metadata
-        .scopes_supported
-        .map(|scopes| {
-            scopes
-                .into_iter()
-                .map(|scope| scope.trim().to_string())
-                .filter(|scope| !scope.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .filter(|scope| !scope.is_empty());
+    let scope = metadata.scopes_supported.and_then(normalized_scope);
     Ok((issuer, scope))
+}
+
+fn normalized_scope(scopes: Vec<String>) -> Option<String> {
+    let scope = scopes
+        .into_iter()
+        .map(|scope| scope.trim().to_string())
+        .filter(|scope| !scope.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!scope.is_empty()).then_some(scope)
 }
 
 fn initial_scope(
@@ -314,7 +332,7 @@ fn initial_scope(
         protected_resource_scope
     } else {
         // Compatibility for older MCP servers that predate RFC 9728 metadata.
-        authorization_server_scopes.map(|scopes| scopes.join(" "))
+        authorization_server_scopes.and_then(normalized_scope)
     }
 }
 
@@ -514,8 +532,8 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
     let mut resource_scope = None;
     let mut discovered_issuer = None;
     for url in protected_resource_metadata_candidates(mcp_url) {
-        if let Ok(metadata) = get_json::<ProtectedResource>(&url, block_private) {
-            match validated_protected_resource(mcp_url, metadata) {
+        match get_optional_discovery_json::<ProtectedResource>(&url, block_private) {
+            Ok(Some(metadata)) => match validated_protected_resource(mcp_url, metadata) {
                 Ok((issuer, scope)) => {
                     protected_resource_found = true;
                     discovered_issuer = Some(issuer);
@@ -530,6 +548,12 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
                         "protected-resource metadata rejected at {url}: {e}"
                     ))
                 }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                return Err(format!(
+                    "protected-resource metadata rejected at {url}: {e}"
+                ))
             }
         }
     }
@@ -1402,7 +1426,11 @@ mod tests {
             None
         );
         assert_eq!(
-            initial_scope(false, None, Some(vec!["legacy:mcp".into()])),
+            initial_scope(
+                false,
+                None,
+                Some(vec![" ".into(), " legacy:mcp ".into(), "".into()])
+            ),
             Some("legacy:mcp".into())
         );
     }
@@ -1474,6 +1502,37 @@ mod tests {
             requested_paths.lock().unwrap().as_slice(),
             ["/.well-known/oauth-protected-resource"]
         );
+    }
+
+    #[test]
+    fn discover_fails_closed_on_malformed_protected_resource_metadata() {
+        use std::time::Duration;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let resource = format!("http://{address}");
+        let handle = std::thread::spawn(move || {
+            let request = server
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .expect("protected-resource metadata request");
+            request
+                .respond(
+                    tiny_http::Response::from_string("not json").with_header(
+                        tiny_http::Header::from_bytes(
+                            b"Content-Type",
+                            b"application/json",
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .unwrap();
+        });
+
+        let error = discover(&resource).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(error.contains("metadata response was not valid JSON"));
     }
 
     #[test]
