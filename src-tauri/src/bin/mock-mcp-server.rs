@@ -425,7 +425,14 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
 /// hardcoded header shipped past a green stdio suite (SOU-443 follow-up).
 ///
 /// Returns the JSON-RPC error to send instead, if the request is invalid.
-fn header_gate(cfg: &Config, header_version: Option<&str>, req: &Value, id: &Value) -> Option<Value> {
+fn header_gate(
+    cfg: &Config,
+    header_version: Option<&str>,
+    header_method: Option<&str>,
+    header_name: Option<&str>,
+    req: &Value,
+    id: &Value,
+) -> Option<Value> {
     if !cfg.strict || !cfg.revision.is_modern() {
         return None;
     }
@@ -435,14 +442,14 @@ fn header_gate(cfg: &Config, header_version: Option<&str>, req: &Value, id: &Val
         .and_then(|m| m.get(META_PROTOCOL_VERSION))
         .and_then(|v| v.as_str());
     match (header_version, body_version) {
-        (Some(h), Some(b)) if h == b => None,
-        (None, _) => Some(error(
+        (Some(h), Some(b)) if h == b => {}
+        (None, _) => return Some(error(
             id.clone(),
             HEADER_MISMATCH,
             "missing required MCP-Protocol-Version header",
             None,
         )),
-        (Some(h), b) => Some(error(
+        (Some(h), b) => return Some(error(
             id.clone(),
             HEADER_MISMATCH,
             &format!(
@@ -452,6 +459,43 @@ fn header_gate(cfg: &Config, header_version: Option<&str>, req: &Value, id: &Val
             None,
         )),
     }
+    let body_method = req.get("method").and_then(Value::as_str);
+    if header_method != body_method {
+        return Some(error(
+            id.clone(),
+            HEADER_MISMATCH,
+            &format!(
+                "Mcp-Method header '{}' does not match body method '{}'",
+                header_method.unwrap_or("<absent>"),
+                body_method.unwrap_or("<absent>")
+            ),
+            None,
+        ));
+    }
+    let body_name = match body_method {
+        Some("tools/call") | Some("prompts/get") => req
+            .get("params")
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str),
+        Some("resources/read") => req
+            .get("params")
+            .and_then(|params| params.get("uri"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    if body_name.is_some() && header_name != body_name {
+        return Some(error(
+            id.clone(),
+            HEADER_MISMATCH,
+            &format!(
+                "Mcp-Name header '{}' does not match body name '{}'",
+                header_name.unwrap_or("<absent>"),
+                body_name.unwrap_or("<absent>")
+            ),
+            None,
+        ));
+    }
+    None
 }
 
 /// Serve the same era logic over Streamable HTTP instead of stdio.
@@ -475,6 +519,16 @@ fn serve_http(cfg: &Config) {
             .iter()
             .find(|h| h.field.equiv("MCP-Protocol-Version"))
             .map(|h| h.value.as_str().to_string());
+        let header_method = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Mcp-Method"))
+            .map(|h| h.value.as_str().to_string());
+        let header_name = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Mcp-Name"))
+            .map(|h| h.value.as_str().to_string());
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
         let req: Value = match serde_json::from_str(body.trim()) {
@@ -489,7 +543,14 @@ fn serve_http(cfg: &Config) {
         record(cfg, &req);
 
         let id = req.get("id").cloned().unwrap_or(Value::Null);
-        let (status, payload) = match header_gate(cfg, header_version.as_deref(), &req, &id) {
+        let (status, payload) = match header_gate(
+            cfg,
+            header_version.as_deref(),
+            header_method.as_deref(),
+            header_name.as_deref(),
+            &req,
+            &id,
+        ) {
             // A header/body disagreement is a 400, per the transport spec.
             Some(err) => (400, Some(err)),
             None => {

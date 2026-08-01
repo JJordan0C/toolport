@@ -576,6 +576,7 @@ fn http_fixture_enforces_header_body_agreement() {
     // Header disagrees with the body: the exact shape of the bug that shipped.
     let mismatched = ureq::post(&fixture.url)
         .set("MCP-Protocol-Version", "2025-06-18")
+        .set("Mcp-Method", "tools/list")
         .send_json(body.clone());
     match mismatched {
         Err(ureq::Error::Status(400, resp)) => {
@@ -599,10 +600,41 @@ fn http_fixture_enforces_header_body_agreement() {
     // everything.
     let ok = ureq::post(&fixture.url)
         .set("MCP-Protocol-Version", MODERN)
+        .set("Mcp-Method", "tools/list")
         .send_json(body)
         .expect("agreeing header and body must be accepted");
     let parsed: Value = ok.into_json().expect("json body");
     assert!(parsed["result"]["tools"].is_array(), "got {parsed}");
+
+    let missing_method_body = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+        "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": MODERN } }
+    });
+    let missing_method = ureq::post(&fixture.url)
+        .set("MCP-Protocol-Version", MODERN)
+        .send_json(missing_method_body);
+    assert!(
+        matches!(missing_method, Err(ureq::Error::Status(400, _))),
+        "a missing Mcp-Method must be rejected"
+    );
+
+    let wrong_name_body = json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {
+            "name": "echo",
+            "arguments": { "text": "hi" },
+            "_meta": { "io.modelcontextprotocol/protocolVersion": MODERN }
+        }
+    });
+    let wrong_name = ureq::post(&fixture.url)
+        .set("MCP-Protocol-Version", MODERN)
+        .set("Mcp-Method", "tools/call")
+        .set("Mcp-Name", "other")
+        .send_json(wrong_name_body);
+    assert!(
+        matches!(wrong_name, Err(ureq::Error::Status(400, _))),
+        "a mismatched Mcp-Name must be rejected"
+    );
 }
 
 /// The regression test for the bug the stdio harness could not see: Toolport

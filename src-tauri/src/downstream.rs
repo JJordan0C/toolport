@@ -15,6 +15,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+
 /// Called from a downstream stdout drain when an armed server emits
 /// `notifications/resources/updated` (SOU-394). The gateway fans the URI out to
 /// subscribed upstream clients only.
@@ -57,6 +59,212 @@ impl SubscriptionFilter {
 }
 
 use serde_json::{json, Value};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeaderParamSpec {
+    header_name: String,
+    path: Vec<String>,
+}
+
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-'
+                        | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+                )
+        })
+}
+
+fn encode_mcp_header_text(value: &str) -> String {
+    let safe_ascii = value
+        .bytes()
+        .all(|byte| matches!(byte, 0x20..=0x7e))
+        && value.trim() == value
+        && !(value.starts_with("=?base64?") && value.ends_with("?="));
+    if safe_ascii {
+        value.to_string()
+    } else {
+        format!(
+            "=?base64?{}?=",
+            base64::engine::general_purpose::STANDARD.encode(value.as_bytes())
+        )
+    }
+}
+
+fn modern_standard_headers(body: &Value) -> Result<Vec<(String, String)>, TransportError> {
+    let Some(method) = body.get("method").and_then(Value::as_str) else {
+        return Ok(Vec::new());
+    };
+    let mut headers = vec![(
+        "Mcp-Method".to_string(),
+        encode_mcp_header_text(method),
+    )];
+    let name = match method {
+        "tools/call" | "prompts/get" => body
+            .get("params")
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str),
+        "resources/read" => body
+            .get("params")
+            .and_then(|params| params.get("uri"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    if matches!(method, "tools/call" | "prompts/get" | "resources/read") && name.is_none() {
+        return Err(TransportError::Fatal(format!(
+            "modern HTTP request '{method}' is missing its routing name"
+        )));
+    }
+    if let Some(name) = name {
+        headers.push(("Mcp-Name".to_string(), encode_mcp_header_text(name)));
+    }
+    Ok(headers)
+}
+
+fn contains_x_mcp_header(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.contains_key("x-mcp-header") || object.values().any(contains_x_mcp_header)
+        }
+        Value::Array(values) => values.iter().any(contains_x_mcp_header),
+        _ => false,
+    }
+}
+
+fn collect_header_param_specs(
+    schema: &Value,
+    path: &mut Vec<String>,
+    names: &mut HashSet<String>,
+    specs: &mut Vec<HeaderParamSpec>,
+) -> Result<(), String> {
+    let Some(object) = schema.as_object() else {
+        return Ok(());
+    };
+    if let Some(annotation) = object.get("x-mcp-header") {
+        let name = annotation
+            .as_str()
+            .ok_or_else(|| "x-mcp-header must be a string".to_string())?;
+        if path.is_empty() {
+            return Err("x-mcp-header must annotate an input property".to_string());
+        }
+        if !is_http_token(name) {
+            return Err(format!("x-mcp-header '{name}' is not a valid HTTP token"));
+        }
+        let property_type = object.get("type").and_then(Value::as_str).unwrap_or("");
+        if !matches!(property_type, "string" | "integer" | "boolean") {
+            return Err(format!(
+                "x-mcp-header '{name}' must annotate string, integer, or boolean"
+            ));
+        }
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err(format!("x-mcp-header '{name}' is not case-insensitively unique"));
+        }
+        specs.push(HeaderParamSpec {
+            header_name: format!("Mcp-Param-{name}"),
+            path: path.clone(),
+        });
+    }
+
+    for (key, value) in object {
+        if key != "properties" && key != "x-mcp-header" && contains_x_mcp_header(value) {
+            return Err(format!(
+                "x-mcp-header is not statically reachable through properties (found under '{key}')"
+            ));
+        }
+    }
+    if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+        for (property, child) in properties {
+            path.push(property.clone());
+            collect_header_param_specs(child, path, names, specs)?;
+            path.pop();
+        }
+    }
+    Ok(())
+}
+
+fn header_param_specs(tool: &Value) -> Result<Vec<HeaderParamSpec>, String> {
+    let Some(schema) = tool.get("inputSchema") else {
+        return Ok(Vec::new());
+    };
+    let mut specs = Vec::new();
+    collect_header_param_specs(
+        schema,
+        &mut Vec::new(),
+        &mut HashSet::new(),
+        &mut specs,
+    )?;
+    Ok(specs)
+}
+
+fn filter_modern_http_tools(server_id: &str, tools: Vec<Value>) -> Vec<Value> {
+    tools
+        .into_iter()
+        .filter(|tool| match header_param_specs(tool) {
+            Ok(_) => true,
+            Err(reason) => {
+                let name = tool.get("name").and_then(Value::as_str).unwrap_or("<unnamed>");
+                eprintln!(
+                    "toolport: excluding tool '{server_id}__{name}' from a modern HTTP catalog: {reason}"
+                );
+                false
+            }
+        })
+        .collect()
+}
+
+fn value_at_path<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
+    path.iter().try_fold(value, |current, part| current.get(part))
+}
+
+fn encode_header_param(value: &Value) -> Result<Option<String>, TransportError> {
+    const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+    match value {
+        Value::Null => Ok(None),
+        Value::String(value) => Ok(Some(encode_mcp_header_text(value))),
+        Value::Bool(value) => Ok(Some(value.to_string())),
+        Value::Number(value) => {
+            let integer = value.as_i64().ok_or_else(|| {
+                TransportError::Fatal("x-mcp-header value must be an integer".to_string())
+            })?;
+            if !(-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&integer) {
+                return Err(TransportError::Fatal(
+                    "x-mcp-header integer exceeds the JavaScript safe range".to_string(),
+                ));
+            }
+            Ok(Some(integer.to_string()))
+        }
+        _ => Err(TransportError::Fatal(
+            "x-mcp-header value must be string, integer, boolean, or null".to_string(),
+        )),
+    }
+}
+
+fn tool_request_headers(
+    tools: &[Value],
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<Vec<(String, String)>, TransportError> {
+    let Some(tool) = tools
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+    else {
+        return Ok(Vec::new());
+    };
+    let specs = header_param_specs(tool).map_err(TransportError::Fatal)?;
+    let mut headers = Vec::new();
+    for spec in specs {
+        if let Some(value) = value_at_path(arguments, &spec.path) {
+            if let Some(encoded) = encode_header_param(value)? {
+                headers.push((spec.header_name, encoded));
+            }
+        }
+    }
+    headers.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(headers)
+}
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -876,6 +1084,21 @@ pub trait Transport: Send {
             ));
         }
         self.request(method, params)
+    }
+    /// Send a request with transport-level routing headers. Only modern
+    /// Streamable HTTP consumes these; stdio and legacy transports deliberately
+    /// ignore them.
+    fn request_with_cancel_and_headers(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        _headers: &[(String, String)],
+    ) -> Result<Value, TransportError> {
+        self.request_with_cancel(method, params, cancel)
+    }
+    fn supports_request_headers(&self) -> bool {
+        false
     }
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError>;
     /// Bound how long a single `request` waits for its response. Used to fail the
@@ -2491,6 +2714,32 @@ impl HttpTransport {
             .to_string()
     }
 
+    fn is_modern(&self) -> bool {
+        self.protocol_meta.is_some()
+    }
+
+    fn request_inner(
+        &mut self,
+        method: &str,
+        params: Value,
+        headers: &[(String, String)],
+    ) -> Result<Value, TransportError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut params = params;
+        if let Some(protocol) = &self.protocol_meta {
+            merge_protocol_meta(&mut params, protocol);
+        }
+        let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        let resp = self
+            .post_with_headers(&body, true, headers)?
+            .ok_or_else(|| TransportError::Fatal("empty response".to_string()))?;
+        if let Some(err) = resp.get("error") {
+            return Err(TransportError::Rpc(err.clone()));
+        }
+        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+    }
+
     /// Answer a server-initiated JSON-RPC request inline (SSE mid-stream or
     /// standalone). Returns true when the message was handled.
     fn handle_inline_server_request(&mut self, v: &Value) -> Result<bool, TransportError> {
@@ -2575,8 +2824,15 @@ impl HttpTransport {
                 .set("Content-Type", "application/json")
                 .set("Accept", "application/json, text/event-stream")
                 .set("MCP-Protocol-Version", &wire_version);
-            if let Some(sid) = &self.session_id {
-                req = req.set("Mcp-Session-Id", sid);
+            if !self.is_modern() {
+                if let Some(sid) = &self.session_id {
+                    req = req.set("Mcp-Session-Id", sid);
+                }
+            }
+            if self.is_modern() {
+                for (name, value) in modern_standard_headers(body)? {
+                    req = req.set(&name, &value);
+                }
             }
             let auth = self
                 .auth
@@ -2600,8 +2856,10 @@ impl HttpTransport {
                 Err(e) => return Err(TransportError::Fatal(e.to_string())),
             }
         };
-        if let Some(sid) = resp.header("Mcp-Session-Id") {
-            self.session_id = Some(sid.to_string());
+        if !self.is_modern() {
+            if let Some(sid) = resp.header("Mcp-Session-Id") {
+                self.session_id = Some(sid.to_string());
+            }
         }
         // Drain so the connection returns to the pool without leaving bytes unread.
         let _ = read_capped(resp, 64 * 1024);
@@ -2674,6 +2932,15 @@ impl HttpTransport {
     }
 
     fn post(&mut self, body: &Value, expect_response: bool) -> Result<Option<Value>, TransportError> {
+        self.post_with_headers(body, expect_response, &[])
+    }
+
+    fn post_with_headers(
+        &mut self,
+        body: &Value,
+        expect_response: bool,
+        extra_headers: &[(String, String)],
+    ) -> Result<Option<Value>, TransportError> {
         let payload = body.to_string();
 
         // Refresh shortly before the known expiry, including before initialize.
@@ -2696,8 +2963,18 @@ impl HttpTransport {
                 .set("Content-Type", "application/json")
                 .set("Accept", "application/json, text/event-stream")
                 .set("MCP-Protocol-Version", &wire_version);
-            if let Some(sid) = &self.session_id {
-                req = req.set("Mcp-Session-Id", sid);
+            if !self.is_modern() {
+                if let Some(sid) = &self.session_id {
+                    req = req.set("Mcp-Session-Id", sid);
+                }
+            }
+            if self.is_modern() {
+                for (name, value) in modern_standard_headers(body)? {
+                    req = req.set(&name, &value);
+                }
+                for (name, value) in extra_headers {
+                    req = req.set(name, value);
+                }
             }
             let auth = self
                 .auth
@@ -2732,7 +3009,18 @@ impl HttpTransport {
                     continue;
                 }
                 Err(ureq::Error::Status(code, r)) => {
-                    let detail: String = read_capped(r, 64 * 1024).chars().take(200).collect();
+                    let detail = read_capped(r, 64 * 1024);
+                    if code == 400 && self.is_modern() && expect_response {
+                        if let Ok(response) = serde_json::from_str::<Value>(&detail) {
+                            let request_id = body.get("id");
+                            if ids_match(response.get("id"), request_id) {
+                                if let Some(error) = response.get("error") {
+                                    return Err(TransportError::Rpc(error.clone()));
+                                }
+                            }
+                        }
+                    }
+                    let detail: String = detail.chars().take(200).collect();
                     let hint = if code == 401 || code == 403 {
                         " (needs authentication)"
                     } else {
@@ -2755,8 +3043,10 @@ impl HttpTransport {
         // on nothing and must be returned. See [`Self::forced_refresh_token`].
         self.forced_refresh_token = None;
 
-        if let Some(sid) = resp.header("Mcp-Session-Id") {
-            self.session_id = Some(sid.to_string());
+        if !self.is_modern() {
+            if let Some(sid) = resp.header("Mcp-Session-Id") {
+                self.session_id = Some(sid.to_string());
+            }
         }
         if !expect_response {
             return Ok(None);
@@ -2781,18 +3071,26 @@ impl HttpTransport {
 
 impl Transport for HttpTransport {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let mut params = params;
-        if let Some(protocol) = &self.protocol_meta {
-            merge_protocol_meta(&mut params, protocol);
+        self.request_inner(method, params, &[])
+    }
+
+    fn request_with_cancel_and_headers(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+        headers: &[(String, String)],
+    ) -> Result<Value, TransportError> {
+        if cancel.is_some() {
+            downstream_trace(&format!(
+                "cancellation closes the modern HTTP response stream for method {method}"
+            ));
         }
-        let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        let resp = self.post(&body, true)?.ok_or_else(|| TransportError::Fatal("empty response".to_string()))?;
-        if let Some(err) = resp.get("error") {
-            return Err(TransportError::Rpc(err.clone()));
-        }
-        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+        self.request_inner(method, params, headers)
+    }
+
+    fn supports_request_headers(&self) -> bool {
+        true
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
@@ -2815,6 +3113,9 @@ impl Transport for HttpTransport {
 
     fn set_protocol_meta(&mut self, meta: Option<Value>) {
         self.protocol_meta = meta;
+        if self.protocol_meta.is_some() {
+            self.session_id = None;
+        }
     }
 
     fn set_subscription_listener(
@@ -2863,7 +3164,8 @@ impl Transport for HttpTransport {
                         .post(&url)
                         .set("Content-Type", "application/json")
                         .set("Accept", "text/event-stream")
-                        .set("MCP-Protocol-Version", &wire_version);
+                        .set("MCP-Protocol-Version", &wire_version)
+                        .set("Mcp-Method", "subscriptions/listen");
                     let token = auth
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3028,6 +3330,9 @@ pub struct DownstreamServer {
     caps_completions: bool,
     /// The protocol era this connection settled on at handshake (SOU-445).
     era: Era,
+    /// Modern Streamable HTTP can mirror schema-annotated tool arguments into
+    /// routing headers. Modern stdio deliberately ignores those annotations.
+    modern_http: bool,
     /// Desired per-resource notification set carried by the modern listener.
     /// Legacy servers keep using resources/subscribe and resources/unsubscribe.
     modern_resource_subscriptions: HashSet<String>,
@@ -3178,7 +3483,12 @@ impl DownstreamServer {
         if let Some(warning) = &listed.warning {
             eprintln!("toolport: server '{id}' returned a partial tool catalog: {warning}");
         }
-        let tools = listed.items;
+        let modern_http = matches!(era, Era::Modern { .. }) && transport.supports_request_headers();
+        let tools = if modern_http {
+            filter_modern_http_tools(&id, listed.items)
+        } else {
+            listed.items
+        };
 
         // Restore the longer timeout: actual tool calls can legitimately be slow.
         transport.set_read_timeout(STDIO_READ_TIMEOUT);
@@ -3207,6 +3517,7 @@ impl DownstreamServer {
             caps_prompts,
             caps_completions,
             era,
+            modern_http,
             modern_resource_subscriptions: std::collections::HashSet::new(),
         })
     }
@@ -3217,7 +3528,13 @@ impl DownstreamServer {
     pub fn refresh_tools(&mut self) {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         match fetch_paginated_list(&mut *self.transport, "tools/list", "tools") {
-            Ok(listed) if listed.warning.is_none() => self.tools = listed.items,
+            Ok(listed) if listed.warning.is_none() => {
+                self.tools = if self.modern_http {
+                    filter_modern_http_tools(&self.id, listed.items)
+                } else {
+                    listed.items
+                };
+            }
             Ok(listed) => eprintln!(
                 "toolport: keeping server '{}' previous tool catalog after an incomplete refresh: {}",
                 self.id,
@@ -3362,10 +3679,16 @@ impl DownstreamServer {
         cancel: Option<CancelContext>,
         meta: Option<&Value>,
     ) -> Result<Value, TransportError> {
-        self.transport.request_with_cancel(
+        let headers = if self.modern_http {
+            tool_request_headers(&self.tools, tool, &arguments)?
+        } else {
+            Vec::new()
+        };
+        self.transport.request_with_cancel_and_headers(
             "tools/call",
             with_meta(json!({ "name": tool, "arguments": arguments }), meta),
             cancel,
+            &headers,
         )
     }
 
@@ -3698,6 +4021,7 @@ mod tests {
             caps_prompts: false,
             caps_completions: false,
             era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
+            modern_http: false,
             modern_resource_subscriptions: std::collections::HashSet::new(),
         };
         server.refresh_tools();
@@ -3724,6 +4048,7 @@ mod tests {
             caps_prompts: false,
             caps_completions: false,
             era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
+            modern_http: false,
             modern_resource_subscriptions: std::collections::HashSet::new(),
         };
         server.refresh_resources();
@@ -5084,6 +5409,163 @@ mod tests {
         let mut params = json!({ "_meta": "nonsense" });
         merge_protocol_meta(&mut params, &protocol_meta_for(MODERN_PROTOCOL_VERSION));
         assert_eq!(params["_meta"][VERSION_KEY], MODERN_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn modern_http_sends_routing_and_custom_headers_without_a_session() {
+        use super::{HttpTransport, Transport, MODERN_PROTOCOL_VERSION};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let captured = Arc::new(Mutex::new(HashMap::<String, String>::new()));
+        let target = Arc::clone(&captured);
+        let handle = std::thread::spawn(move || {
+            let mut request = server.recv().unwrap();
+            for header in request.headers() {
+                target.lock().unwrap().insert(
+                    header.field.as_str().to_ascii_lowercase().to_string(),
+                    header.value.as_str().to_string(),
+                );
+            }
+            let mut request_body = String::new();
+            request.as_reader().read_to_string(&mut request_body).unwrap();
+            let request_body: Value = serde_json::from_str(&request_body).unwrap();
+            assert_eq!(request_body["params"]["name"], "downstream_tool");
+            let content_type = tiny_http::Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"application/json"[..],
+            )
+            .unwrap();
+            let legacy_session = tiny_http::Header::from_bytes(
+                &b"Mcp-Session-Id"[..],
+                &b"must-be-ignored"[..],
+            )
+            .unwrap();
+            request
+                .respond(
+                    tiny_http::Response::from_string(
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#,
+                    )
+                    .with_header(content_type)
+                    .with_header(legacy_session),
+                )
+                .unwrap();
+        });
+
+        let mut transport = HttpTransport::new(&format!("http://127.0.0.1:{port}/"));
+        transport.session_id = Some("legacy-session".to_string());
+        transport.set_protocol_meta(Some(super::protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+        transport
+            .request_with_cancel_and_headers(
+                "tools/call",
+                json!({ "name": "downstream_tool", "arguments": { "region": "west" } }),
+                None,
+                &[("Mcp-Param-Region".to_string(), "west".to_string())],
+            )
+            .unwrap();
+        handle.join().unwrap();
+
+        let headers = captured.lock().unwrap();
+        assert_eq!(headers.get("mcp-method").map(String::as_str), Some("tools/call"));
+        assert_eq!(headers.get("mcp-name").map(String::as_str), Some("downstream_tool"));
+        assert_eq!(headers.get("mcp-param-region").map(String::as_str), Some("west"));
+        assert!(!headers.contains_key("mcp-session-id"));
+        assert!(transport.session_id.is_none(), "modern responses cannot restore a legacy session");
+    }
+
+    #[test]
+    fn modern_http_400_rpc_error_reaches_the_protocol_ladder() {
+        use super::{HttpTransport, Transport, TransportError, MODERN_PROTOCOL_VERSION};
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let request = server.recv().unwrap();
+            let content_type = tiny_http::Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"application/json"[..],
+            )
+            .unwrap();
+            request
+                .respond(
+                    tiny_http::Response::from_string(
+                        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32020,"message":"HeaderMismatch"}}"#,
+                    )
+                    .with_status_code(400)
+                    .with_header(content_type),
+                )
+                .unwrap();
+        });
+
+        let mut transport = HttpTransport::new(&format!("http://127.0.0.1:{port}/"));
+        transport.set_protocol_meta(Some(super::protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+        let error = transport.request("server/discover", json!({})).unwrap_err();
+        handle.join().unwrap();
+        assert!(matches!(error, TransportError::Rpc(_)));
+        assert!(error.is_modern_protocol_error());
+    }
+
+    #[test]
+    fn x_mcp_header_filters_only_the_malformed_tool_and_encodes_values() {
+        use super::{filter_modern_http_tools, tool_request_headers};
+
+        let valid = json!({
+            "name": "query",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "routing": {
+                        "type": "object",
+                        "properties": {
+                            "region": { "type": "string", "x-mcp-header": "Region" },
+                            "priority": { "type": "integer", "x-mcp-header": "Priority" },
+                            "dryRun": { "type": "boolean", "x-mcp-header": "Dry-Run" }
+                        }
+                    }
+                }
+            }
+        });
+        let duplicate = json!({
+            "name": "bad_duplicate",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "a": { "type": "string", "x-mcp-header": "Region" },
+                    "b": { "type": "string", "x-mcp-header": "REGION" }
+                }
+            }
+        });
+        let hidden = json!({
+            "name": "bad_ref",
+            "inputSchema": {
+                "type": "object",
+                "$defs": { "route": { "type": "string", "x-mcp-header": "Route" } }
+            }
+        });
+        let tools = filter_modern_http_tools(
+            "fixture",
+            vec![valid.clone(), duplicate, hidden],
+        );
+        assert_eq!(tools, vec![valid]);
+
+        let headers = tool_request_headers(
+            &tools,
+            "query",
+            &json!({
+                "routing": { "region": " 日本 ", "priority": 7, "dryRun": true }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            headers,
+            vec![
+                ("Mcp-Param-Dry-Run".to_string(), "true".to_string()),
+                ("Mcp-Param-Priority".to_string(), "7".to_string()),
+                ("Mcp-Param-Region".to_string(), "=?base64?IOaXpeacrCA=?=".to_string()),
+            ]
+        );
     }
 
     #[test]
