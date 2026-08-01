@@ -7813,6 +7813,16 @@ fn modern_hitl_reason(token: &str) -> Option<approval::ApprovalReason> {
         .map(|pending| pending.reason)
 }
 
+fn downstream_input_responses(input_responses: Option<Value>) -> Option<Value> {
+    match input_responses {
+        Some(Value::Object(mut responses)) => {
+            responses.remove("toolport_approval");
+            (!responses.is_empty()).then_some(Value::Object(responses))
+        }
+        other => other,
+    }
+}
+
 fn start_modern_hitl(
     name: &str,
     args_hash: String,
@@ -7922,7 +7932,7 @@ fn poll_modern_hitl(
         }
         pending.status = ModernHitlStatus::Approved;
     }
-    pending.downstream.input_responses = input_responses;
+    pending.downstream.input_responses = downstream_input_responses(input_responses);
     ModernHitlPoll::Approved {
         approved_fingerprint: pending.approved_fingerprint.clone(),
         reason: pending.reason,
@@ -11342,13 +11352,19 @@ mod tests {
                 }
             })),
         );
-        assert!(matches!(
-            first,
-            ModernHitlPoll::Approved {
-                newly_approved: true,
-                ..
-            }
-        ));
+        let ModernHitlPoll::Approved {
+            downstream,
+            newly_approved,
+            ..
+        } = first
+        else {
+            panic!("accepted approval should resume")
+        };
+        assert!(newly_approved);
+        assert!(
+            downstream.input_responses.is_none(),
+            "Toolport's local approval response must not leak downstream"
+        );
 
         let mut incomplete = json!({
             "resultType": "input_required",
