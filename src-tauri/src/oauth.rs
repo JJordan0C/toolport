@@ -181,7 +181,11 @@ fn bearer_challenge<'a>(headers: impl IntoIterator<Item = &'a str>) -> Option<Be
         let mut found = false;
         for part in auth_header_parts(header) {
             let (candidate, param) = match part.split_once(char::is_whitespace) {
-                Some((scheme, rest)) if !scheme.contains('=') => (Some(scheme), rest.trim()),
+                Some((scheme, rest))
+                    if !scheme.contains('=') && !rest.trim_start().starts_with('=') =>
+                {
+                    (Some(scheme), rest.trim())
+                }
                 None if !part.contains('=') => (Some(part), ""),
                 _ => (None, part),
             };
@@ -1724,6 +1728,19 @@ mod tests {
             bearer_challenge(["Bearer, Basic realm=\"legacy\""]),
             Some(BearerChallenge::default())
         );
+    }
+
+    #[test]
+    fn bearer_challenge_accepts_whitespace_around_parameter_equals() {
+        let parsed = bearer_challenge([
+            "Bearer resource_metadata = \"https://mcp.example.com/meta\", scope = \"files:read\"",
+        ])
+        .expect("Bearer challenge with optional whitespace should parse");
+        assert_eq!(
+            parsed.resource_metadata.as_deref(),
+            Some("https://mcp.example.com/meta")
+        );
+        assert_eq!(parsed.scope.as_deref(), Some("files:read"));
     }
 
     #[test]
