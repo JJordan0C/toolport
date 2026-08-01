@@ -21,6 +21,10 @@ Entries before the rename below shipped under the project's former name, Conduit
   advertised protected-resource metadata URL with the existing TLS and SSRF guards,
   and gives a challenge's requested scope priority without weakening discovery for
   older servers that do not return a challenge. (SOU-451)
+- Runtime OAuth `insufficient_scope` challenges now preserve previously requested
+  scopes, open a user-consent step-up flow, and retry the blocked MCP operation once
+  with the new token. Step-up attempts are bounded per operation and never consume
+  refresh tokens that cannot grant additional permissions. (SOU-451)
 
 ### Fixed
 

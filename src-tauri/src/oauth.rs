@@ -36,6 +36,9 @@ pub struct AuthResult {
     pub client_id: String,
     /// Validated authorization-server issuer that minted the client credentials.
     pub issuer: String,
+    /// Scope set requested for this authorization. Persisted so a later runtime
+    /// challenge can add to it without dropping previously granted access.
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,9 +112,10 @@ struct ProtectedResource {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct BearerChallenge {
-    resource_metadata: Option<String>,
-    scope: Option<String>,
+pub(crate) struct BearerChallenge {
+    pub(crate) resource_metadata: Option<String>,
+    pub(crate) scope: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 /// Split an HTTP authentication header on commas that are outside quoted
@@ -174,7 +178,9 @@ fn auth_param(value: &str) -> Option<(&str, String)> {
 /// Select the first Bearer challenge from one or more `WWW-Authenticate`
 /// fields. A response may advertise another scheme first or place Bearer
 /// parameters in later comma-separated segments.
-fn bearer_challenge<'a>(headers: impl IntoIterator<Item = &'a str>) -> Option<BearerChallenge> {
+pub(crate) fn bearer_challenge<'a>(
+    headers: impl IntoIterator<Item = &'a str>,
+) -> Option<BearerChallenge> {
     for header in headers {
         let mut bearer = false;
         let mut challenge = BearerChallenge::default();
@@ -213,6 +219,8 @@ fn bearer_challenge<'a>(headers: impl IntoIterator<Item = &'a str>) -> Option<Be
                 challenge.resource_metadata.get_or_insert(value);
             } else if name.eq_ignore_ascii_case("scope") {
                 challenge.scope.get_or_insert(value);
+            } else if name.eq_ignore_ascii_case("error") {
+                challenge.error.get_or_insert(value);
             }
         }
         if found {
@@ -459,6 +467,24 @@ fn initial_scope(
         // Compatibility for older MCP servers that predate RFC 9728 metadata.
         authorization_server_scopes.and_then(normalized_scope)
     }
+}
+
+/// Preserve the order supplied by the authorization server while removing
+/// duplicates. In a step-up flow `existing` is the scope set Toolport requested
+/// previously and `additional` is the current operation's authoritative
+/// challenge, as required by the MCP scope-union rule.
+pub(crate) fn scope_union(existing: Option<&str>, additional: Option<&str>) -> Option<String> {
+    let mut scopes: Vec<&str> = Vec::new();
+    for scope in existing
+        .into_iter()
+        .chain(additional)
+        .flat_map(str::split_whitespace)
+    {
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+    (!scopes.is_empty()).then(|| scopes.join(" "))
 }
 
 /// RFC 8414 and OIDC Discovery bind a metadata document to the issuer used to
@@ -1179,6 +1205,16 @@ fn write_callback_page(stream: &mut std::net::TcpStream, message: &str) {
 
 /// Run the full interactive flow and return tokens plus what's needed to refresh.
 pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
+    authenticate_with_scope(mcp_url, None)
+}
+
+/// Run interactive authorization while retaining a previously requested scope
+/// set and adding a runtime challenge. Discovery's initial scope is included too,
+/// but never replaces either side of the step-up union.
+pub fn authenticate_with_scope(
+    mcp_url: &str,
+    requested_scope_set: Option<&str>,
+) -> Result<AuthResult, String> {
     debug_log(&format!("=== oauth start: {mcp_url} ==="));
     // Same provenance rule as discover(): a public configured server must not have
     // its DCR / token POST reach a private/loopback host, even via a DNS rebind. Use the
@@ -1187,12 +1223,13 @@ pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
         .map(|h| host_is_definitely_private(&h))
         .unwrap_or(false);
     let endpoints = discover(mcp_url)?;
+    let scope = scope_union(requested_scope_set, endpoints.scope.as_deref());
     debug_log(&format!(
         "endpoints: authz={} token={} reg={:?} scope={:?}",
         endpoints.authorization_endpoint,
         endpoints.token_endpoint,
         endpoints.registration_endpoint,
-        endpoints.scope
+        scope
     ));
     // Bind the callback listener BEFORE registering/opening the browser, so a
     // fast redirect can't arrive before we're listening AND we know the real port.
@@ -1228,7 +1265,7 @@ pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
     // offline_access (the refresh-token scope) when the server supports it;
     // forcing offline_access otherwise gets the authorization rejected with
     // invalid_scope (e.g. Stripe).
-    let scope = requested_scope(endpoints.scope.clone());
+    let scope = requested_scope(scope);
     let auth_url = build_authorize_url(
         &endpoints.authorization_endpoint,
         &client_id,
@@ -1276,6 +1313,7 @@ pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
         token_endpoint: endpoints.token_endpoint,
         client_id,
         issuer: endpoints.issuer,
+        scope,
     })
 }
 
@@ -1727,6 +1765,7 @@ mod tests {
             Some("https://mcp.example.com/auth/meta?label=a,b")
         );
         assert_eq!(parsed.scope.as_deref(), Some("files:read files:write"));
+        assert_eq!(parsed.error.as_deref(), Some("insufficient_scope"));
     }
 
     #[test]
@@ -2095,5 +2134,19 @@ mod tests {
         handle.join().unwrap();
 
         assert!(error.contains("authorization server must use https"));
+    }
+
+    #[test]
+    fn step_up_scope_union_preserves_prior_access_and_deduplicates() {
+        assert_eq!(
+            scope_union(
+                Some("files:read profile"),
+                Some("files:write files:read")
+            )
+            .as_deref(),
+            Some("files:read profile files:write")
+        );
+        assert_eq!(scope_union(None, Some("  files:read  ")).as_deref(), Some("files:read"));
+        assert_eq!(scope_union(Some(""), None), None);
     }
 }

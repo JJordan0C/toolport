@@ -2335,6 +2335,7 @@ async fn authenticate_oauth(
         &res.client_id,
         res.refresh_token,
         Some(resource),
+        res.scope,
         res.issued_at,
         res.expires_at,
     )?;

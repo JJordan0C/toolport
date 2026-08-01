@@ -2825,6 +2825,48 @@ fn ids_match(got: Option<&Value>, wanted: Option<&Value>) -> bool {
 /// a forced error is surfaced as a per-server authentication failure.
 pub type RefreshFn = Box<dyn Fn(bool) -> Result<Option<String>, String> + Send + Sync>;
 
+/// Interactive OAuth step-up callback. Unlike a refresh-token exchange, this
+/// obtains user consent for the challenged scope and returns a new access token.
+pub type ScopeReauthorizeFn = Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+
+fn insufficient_scope_challenge(response: &ureq::Response) -> Option<crate::oauth::BearerChallenge> {
+    let values = response.all("www-authenticate");
+    let challenge = crate::oauth::bearer_challenge(values.iter().copied())?;
+    challenge
+        .error
+        .as_deref()
+        .is_some_and(|error| error.eq_ignore_ascii_case("insufficient_scope"))
+        .then_some(challenge)
+}
+
+fn authorization_operation(body: &Value) -> String {
+    let method = body
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("MCP request");
+    let discriminator = match method {
+        "tools/call" | "prompts/get" => body
+            .get("params")
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str),
+        "resources/read" => body
+            .get("params")
+            .and_then(|params| params.get("uri"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    discriminator
+        .map(|value| format!("{method}:{value}"))
+        .unwrap_or_else(|| method.to_string())
+}
+
+fn canonical_scope_set(scope: &str) -> String {
+    let mut scopes: Vec<&str> = scope.split_whitespace().collect();
+    scopes.sort_unstable();
+    scopes.dedup();
+    scopes.join(" ")
+}
+
 /// Screen resolved socket addresses against the SSRF policy, fail-closed: returns
 /// `Err` if ANY address is link-local / cloud-metadata, or - when `block_private` -
 /// private / loopback / CGNAT. Refusing the whole set (not just filtering the bad
@@ -2901,6 +2943,12 @@ pub struct HttpTransport {
     /// `None` or error keeps the current token; a forced refresh must return a new
     /// raw token or the authentication failure is surfaced.
     refresh: Option<Arc<Mutex<RefreshFn>>>,
+    /// Separate from token refresh: `insufficient_scope` requires interactive
+    /// consent and a new authorization, not another token from the old grant.
+    scope_reauthorize: Option<Arc<Mutex<ScopeReauthorizeFn>>>,
+    /// Bound repeated browser prompts and retries per operation+scope on this
+    /// connection, as required by the MCP step-up guidance.
+    scope_upgrade_attempts: Arc<Mutex<HashSet<(String, String)>>>,
     /// The token a forced refresh produced and that has not yet been accepted by
     /// the server, if any.
     ///
@@ -2986,6 +3034,8 @@ impl HttpTransport {
             next_id: 1,
             auth: Arc::new(Mutex::new(auth)),
             refresh: refresh.map(|refresh| Arc::new(Mutex::new(refresh))),
+            scope_reauthorize: None,
+            scope_upgrade_attempts: Arc::new(Mutex::new(HashSet::new())),
             forced_refresh_token: None,
             server_handler: None,
             pending_mrtr: None,
@@ -2996,6 +3046,10 @@ impl HttpTransport {
             listener_generation: Arc::new(AtomicU64::new(0)),
             subscription_listener_id: None,
         }
+    }
+
+    pub fn set_scope_reauthorize(&mut self, callback: Option<ScopeReauthorizeFn>) {
+        self.scope_reauthorize = callback.map(|callback| Arc::new(Mutex::new(callback)));
     }
 
     /// Wire the gateway sink for `notifications/resources/updated` seen on SSE
@@ -3150,6 +3204,56 @@ impl HttpTransport {
         }
     }
 
+    fn reauthorize_after_scope_challenge(
+        &mut self,
+        code: u16,
+        operation: &str,
+        challenge: crate::oauth::BearerChallenge,
+    ) -> Result<(), TransportError> {
+        let required_scope = challenge
+            .scope
+            .map(|scope| canonical_scope_set(&scope))
+            .filter(|scope| !scope.is_empty())
+            .ok_or_else(|| {
+                TransportError::Fatal(format!(
+                    "HTTP {code} (needs authentication): OAuth reported insufficient_scope without the required scope"
+                ))
+            })?;
+        let attempt_key = (operation.to_string(), required_scope.clone());
+        let first_attempt = self
+            .scope_upgrade_attempts
+            .lock()
+            .map_err(|_| TransportError::Fatal("OAuth scope-attempt lock poisoned".into()))?
+            .insert(attempt_key);
+        if !first_attempt {
+            return Err(TransportError::Fatal(format!(
+                "HTTP {code} (needs authentication): OAuth scope '{required_scope}' was already requested for {operation} and remains insufficient"
+            )));
+        }
+        let callback = self.scope_reauthorize.as_ref().ok_or_else(|| {
+            TransportError::Fatal(format!(
+                "HTTP {code} (needs authentication): OAuth scope '{required_scope}' requires interactive authorization"
+            ))
+        })?;
+        let token = callback
+            .lock()
+            .map_err(|_| TransportError::Fatal("OAuth scope callback lock poisoned".into()))?
+            (&required_scope)
+            .map_err(|e| {
+                TransportError::Fatal(format!(
+                    "HTTP {code} (needs authentication): OAuth scope authorization failed for '{required_scope}': {e}"
+                ))
+            })?;
+        *self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token.clone());
+        // Do not follow a freshly-authorized token's rejection with an automatic
+        // refresh-token exchange: it cannot add a scope the user did not grant.
+        self.forced_refresh_token = Some(token);
+        Ok(())
+    }
+
     /// POST JSON-RPC without waiting for a response body (inline replies mid-SSE).
     fn send_post_no_response(&mut self, body: &Value) -> Result<(), TransportError> {
         let payload = body.to_string();
@@ -3183,6 +3287,17 @@ impl HttpTransport {
             }
             match req.send_string(&payload) {
                 Ok(resp) => break resp,
+                Err(ureq::Error::Status(code, resp))
+                    if (code == 401 || code == 403)
+                        && insufficient_scope_challenge(&resp).is_some() =>
+                {
+                    let challenge = insufficient_scope_challenge(&resp)
+                        .expect("match guard established an insufficient-scope challenge");
+                    let _ = read_capped(resp, 8 * 1024);
+                    let operation = authorization_operation(body);
+                    self.reauthorize_after_scope_challenge(code, &operation, challenge)?;
+                    refreshed = true;
+                }
                 Err(ureq::Error::Status(code, resp))
                     if (code == 401 || code == 403)
                         && !refreshed
@@ -3372,6 +3487,18 @@ impl HttpTransport {
                         message: "HTTP 429: rate limited".to_string(),
                     });
                 }
+                Err(ureq::Error::Status(code, r))
+                    if (code == 401 || code == 403)
+                        && insufficient_scope_challenge(&r).is_some() =>
+                {
+                    let challenge = insufficient_scope_challenge(&r)
+                        .expect("match guard established an insufficient-scope challenge");
+                    let _ = read_capped(r, 8 * 1024);
+                    let operation = authorization_operation(body);
+                    self.reauthorize_after_scope_challenge(code, &operation, challenge)?;
+                    refreshed = true;
+                    continue;
+                }
                 // The access token likely expired: refresh it once and retry with
                 // the new token, so a long-running session self-heals instead of
                 // 401ing until the server is manually reconnected.
@@ -3514,6 +3641,8 @@ impl Transport for HttpTransport {
         let url = self.url.clone();
         let auth = Arc::clone(&self.auth);
         let refresh = self.refresh.clone();
+        let scope_reauthorize = self.scope_reauthorize.clone();
+        let scope_upgrade_attempts = Arc::clone(&self.scope_upgrade_attempts);
         let wire_version = self.wire_protocol_version();
         let dirty = self.change_dirty.clone();
         let resource_updated = self.resource_updated.clone();
@@ -3548,6 +3677,56 @@ impl Transport for HttpTransport {
                     }
                     match request.send_string(&payload) {
                         Ok(response) => break Some(response),
+                        Err(ureq::Error::Status(code, response))
+                            if (code == 401 || code == 403)
+                                && insufficient_scope_challenge(&response).is_some() =>
+                        {
+                            let challenge = insufficient_scope_challenge(&response)
+                                .expect("match guard established an insufficient-scope challenge");
+                            let _ = read_capped(response, 8 * 1024);
+                            let Some(scope) = challenge
+                                .scope
+                                .map(|scope| canonical_scope_set(&scope))
+                                .filter(|scope| !scope.is_empty())
+                            else {
+                                downstream_trace(
+                                    "subscriptions/listen insufficient_scope challenge omitted scope",
+                                );
+                                break None;
+                            };
+                            let attempt_key =
+                                ("subscriptions/listen".to_string(), scope.clone());
+                            let first_attempt = scope_upgrade_attempts
+                                .lock()
+                                .map(|mut attempts| attempts.insert(attempt_key))
+                                .unwrap_or(false);
+                            let upgraded = if first_attempt {
+                                scope_reauthorize.as_ref().and_then(|callback| {
+                                    callback
+                                        .lock()
+                                        .ok()
+                                        .and_then(|callback| callback(&scope).ok())
+                                })
+                            } else {
+                                None
+                            };
+                            match upgraded {
+                                Some(token) => {
+                                    *auth
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Some(token);
+                                    forced_refresh = true;
+                                    continue;
+                                }
+                                None => {
+                                    downstream_trace(&format!(
+                                        "subscriptions/listen needs interactive OAuth scope '{scope}'"
+                                    ));
+                                    break None;
+                                }
+                            }
+                        }
                         Err(ureq::Error::Status(code, response))
                             if (code == 401 || code == 403)
                                 && !forced_refresh
@@ -6369,6 +6548,91 @@ mod tests {
     }
 
     #[test]
+    fn modern_http_listener_steps_up_scope_and_retries() {
+        use super::{
+            HttpTransport, ScopeReauthorizeFn, SubscriptionFilter, Transport,
+            MODERN_PROTOCOL_VERSION,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let seen_auth = Arc::new(Mutex::new(Vec::new()));
+        let captured_auth = Arc::clone(&seen_auth);
+        let handle = std::thread::spawn(move || {
+            for hit in 0..2 {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect("subscription listen request");
+                captured_auth.lock().unwrap().push(
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("Authorization"))
+                        .map(|header| header.value.as_str().to_string())
+                        .unwrap_or_default(),
+                );
+                let response = if hit == 0 {
+                    tiny_http::Response::from_string("more access required")
+                        .with_status_code(403)
+                        .with_header(
+                            tiny_http::Header::from_bytes(
+                                b"WWW-Authenticate",
+                                b"Bearer error=\"insufficient_scope\", scope=\" files:write files:read files:write \"",
+                            )
+                            .unwrap(),
+                        )
+                } else {
+                    tiny_http::Response::from_string(format!(
+                        "data: {}\n\n",
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/subscriptions/acknowledged",
+                            "params": {
+                                "_meta": { "io.modelcontextprotocol/subscriptionId": 1 }
+                            }
+                        })
+                    ))
+                    .with_header(
+                        tiny_http::Header::from_bytes(b"Content-Type", b"text/event-stream")
+                            .unwrap(),
+                    )
+                };
+                request.respond(response).unwrap();
+            }
+        });
+
+        let challenged_scope = Arc::new(Mutex::new(String::new()));
+        let captured_scope = Arc::clone(&challenged_scope);
+        let reauthorize: Option<ScopeReauthorizeFn> = Some(Box::new(move |scope| {
+            *captured_scope.lock().unwrap() = scope.to_string();
+            Ok("step-up-token".to_string())
+        }));
+        let mut transport = HttpTransport::with_auth_refresh(
+            &format!("http://127.0.0.1:{port}/"),
+            Some("old-token".to_string()),
+            None,
+        );
+        transport.set_protocol_meta(Some(super::protocol_meta_for(MODERN_PROTOCOL_VERSION)));
+        transport.set_scope_reauthorize(reauthorize);
+        transport
+            .set_subscription_listener(SubscriptionFilter::default())
+            .unwrap();
+        handle.join().unwrap();
+        drop(transport);
+
+        assert_eq!(
+            seen_auth.lock().unwrap().as_slice(),
+            &["Bearer old-token".to_string(), "Bearer step-up-token".to_string()]
+        );
+        assert_eq!(
+            challenged_scope.lock().unwrap().as_str(),
+            "files:read files:write"
+        );
+    }
+
+    #[test]
     fn modern_resource_subscriptions_replace_the_listener_filter() {
         use super::{DownstreamServer, SubscriptionFilter, Transport, TransportError};
         use std::sync::{Arc, Mutex};
@@ -6963,6 +7227,236 @@ mod tests {
             error.to_string(),
             "HTTP 401 (needs authentication): no refresh callback configured"
         );
+    }
+
+    #[test]
+    fn insufficient_scope_reauthorizes_and_retries_without_refreshing() {
+        use super::{HttpTransport, RefreshFn, ScopeReauthorizeFn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let seen_auth = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen_auth);
+        let handle = std::thread::spawn(move || {
+            for hit in 0..2 {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect("step-up request");
+                captured.lock().unwrap().push(
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("Authorization"))
+                        .map(|header| header.value.as_str().to_string())
+                        .unwrap_or_default(),
+                );
+                if hit == 0 {
+                    let challenge = tiny_http::Header::from_bytes(
+                        b"WWW-Authenticate",
+                        b"Bearer error=\"insufficient_scope\", scope=\"files:write\"",
+                    )
+                    .unwrap();
+                    request
+                        .respond(
+                            tiny_http::Response::from_string("more access required")
+                                .with_status_code(403)
+                                .with_header(challenge),
+                        )
+                        .unwrap();
+                } else {
+                    let content_type =
+                        tiny_http::Header::from_bytes(b"Content-Type", b"application/json")
+                            .unwrap();
+                    request
+                        .respond(
+                            tiny_http::Response::from_string(
+                                r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#,
+                            )
+                            .with_header(content_type),
+                        )
+                        .unwrap();
+                }
+            }
+        });
+
+        let forced_refreshes = Arc::new(AtomicUsize::new(0));
+        let forced = Arc::clone(&forced_refreshes);
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+            if force {
+                forced.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(None)
+        }));
+        let challenged_scope = Arc::new(Mutex::new(String::new()));
+        let captured_scope = Arc::clone(&challenged_scope);
+        let reauthorize: Option<ScopeReauthorizeFn> = Some(Box::new(move |scope| {
+            *captured_scope.lock().unwrap() = scope.to_string();
+            Ok("step-up-token".to_string())
+        }));
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut transport =
+            HttpTransport::with_auth_refresh(&url, Some("old-token".to_string()), refresh);
+        transport.set_scope_reauthorize(reauthorize);
+
+        let result = transport
+            .post(
+                &serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "files_write", "arguments": {} }
+                }),
+                true,
+            )
+            .expect("step-up token should retry the original request");
+        handle.join().unwrap();
+
+        assert!(result.is_some());
+        assert_eq!(*challenged_scope.lock().unwrap(), "files:write");
+        assert_eq!(forced_refreshes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            seen_auth.lock().unwrap().as_slice(),
+            &["Bearer old-token".to_string(), "Bearer step-up-token".to_string()]
+        );
+    }
+
+    #[test]
+    fn scope_attempts_use_a_canonical_set_key() {
+        assert_eq!(
+            super::canonical_scope_set(" files:write files:read files:write "),
+            "files:read files:write"
+        );
+    }
+
+    #[test]
+    fn repeated_insufficient_scope_is_bounded_and_never_uses_refresh() {
+        use super::{HttpTransport, RefreshFn, ScopeReauthorizeFn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for hit in 0..2 {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect("step-up request");
+                let scope = if hit == 0 {
+                    "files:write files:read"
+                } else {
+                    "files:read files:write files:write"
+                };
+                let challenge = tiny_http::Header::from_bytes(
+                    b"WWW-Authenticate",
+                    format!("Bearer error=\"insufficient_scope\", scope=\"{scope}\"")
+                        .as_bytes(),
+                )
+                .unwrap();
+                request
+                    .respond(
+                        tiny_http::Response::from_string("still insufficient")
+                            .with_status_code(403)
+                            .with_header(challenge),
+                    )
+                    .unwrap();
+            }
+        });
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_count = Arc::clone(&refresh_calls);
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+            if force {
+                refresh_count.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(None)
+        }));
+        let reauth_calls = Arc::new(AtomicUsize::new(0));
+        let reauth_count = Arc::clone(&reauth_calls);
+        let reauthorize: Option<ScopeReauthorizeFn> = Some(Box::new(move |_| {
+            reauth_count.fetch_add(1, Ordering::SeqCst);
+            Ok("step-up-token".to_string())
+        }));
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut transport =
+            HttpTransport::with_auth_refresh(&url, Some("old-token".to_string()), refresh);
+        transport.set_scope_reauthorize(reauthorize);
+
+        let error = transport
+            .post(
+                &serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "files_write", "arguments": {} }
+                }),
+                true,
+            )
+            .expect_err("the same rejected scope must not loop");
+        handle.join().unwrap();
+
+        assert!(error.to_string().contains("already requested"));
+        assert_eq!(reauth_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn rejected_step_up_token_does_not_consume_a_refresh_exchange() {
+        use super::{HttpTransport, RefreshFn, ScopeReauthorizeFn};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for hit in 0..2 {
+                let request = server
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .expect("step-up request");
+                let response = if hit == 0 {
+                    tiny_http::Response::from_string("more access required")
+                        .with_status_code(403)
+                        .with_header(
+                            tiny_http::Header::from_bytes(
+                                b"WWW-Authenticate",
+                                b"Bearer error=\"insufficient_scope\", scope=\"files:write\"",
+                            )
+                            .unwrap(),
+                        )
+                } else {
+                    tiny_http::Response::from_string("new token rejected").with_status_code(401)
+                };
+                request.respond(response).unwrap();
+            }
+        });
+
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let refresh_count = Arc::clone(&refresh_calls);
+        let refresh: Option<RefreshFn> = Some(Box::new(move |force| {
+            if force {
+                refresh_count.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(Some("refreshed-token".to_string()))
+        }));
+        let reauthorize: Option<ScopeReauthorizeFn> =
+            Some(Box::new(move |_| Ok("step-up-token".to_string())));
+        let url = format!("http://127.0.0.1:{port}/");
+        let mut transport =
+            HttpTransport::with_auth_refresh(&url, Some("old-token".to_string()), refresh);
+        transport.set_scope_reauthorize(reauthorize);
+
+        let error = transport
+            .post(
+                &serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "files_write", "arguments": {} }
+                }),
+                true,
+            )
+            .expect_err("a rejected step-up token must surface without refreshing");
+        handle.join().unwrap();
+
+        assert!(error.to_string().contains("HTTP 401"));
+        assert_eq!(refresh_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
