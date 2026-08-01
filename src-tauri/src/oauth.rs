@@ -103,7 +103,9 @@ fn origin_of(url: &str) -> String {
 
 #[derive(Deserialize)]
 struct ProtectedResource {
+    resource: Option<String>,
     authorization_servers: Option<Vec<String>>,
+    scopes_supported: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -220,9 +222,83 @@ fn metadata_candidates(issuer: &str) -> Vec<String> {
         vec![
             format!("{origin}/.well-known/oauth-authorization-server{path}"),
             format!("{origin}/.well-known/openid-configuration{path}"),
-            format!("{origin}{path}/.well-known/oauth-authorization-server"),
             format!("{origin}{path}/.well-known/openid-configuration"),
+            // Compatibility fallback used by some pre-spec servers. The three
+            // required MCP candidates above retain their normative priority.
+            format!("{origin}{path}/.well-known/oauth-authorization-server"),
         ]
+    }
+}
+
+/// RFC 9728 inserts the protected-resource well-known suffix between the origin
+/// and the resource path. MCP additionally requires clients to fall back to the
+/// origin-level document after trying the path-specific form.
+fn protected_resource_metadata_candidates(resource: &str) -> Vec<String> {
+    let Ok(parsed) = url::Url::parse(resource) else {
+        return vec![format!(
+            "{}/.well-known/oauth-protected-resource",
+            origin_of(resource).trim_end_matches('/')
+        )];
+    };
+    let mut origin_url = parsed.clone();
+    origin_url.set_path("");
+    origin_url.set_query(None);
+    origin_url.set_fragment(None);
+    let origin = origin_url.as_str().trim_end_matches('/');
+    let root = format!("{origin}/.well-known/oauth-protected-resource");
+    let path = parsed.path().trim_start_matches('/');
+    let mut specific = root.clone();
+    if !path.is_empty() {
+        specific.push('/');
+        specific.push_str(path);
+    }
+    if let Some(query) = parsed.query() {
+        specific.push('?');
+        specific.push_str(query);
+    }
+    if specific == root {
+        vec![root]
+    } else {
+        vec![specific, root]
+    }
+}
+
+fn validated_protected_resource(
+    expected_resource: &str,
+    metadata: ProtectedResource,
+) -> Result<(String, Option<String>), String> {
+    if metadata.resource.as_deref() != Some(expected_resource) {
+        return Err(
+            "protected-resource metadata describes a different resource; refusing OAuth discovery"
+                .to_string(),
+        );
+    }
+    let issuer = metadata
+        .authorization_servers
+        .and_then(|servers| servers.into_iter().find(|issuer| !issuer.trim().is_empty()))
+        .ok_or_else(|| {
+            "protected-resource metadata has no authorization server; refusing OAuth discovery"
+                .to_string()
+        })?;
+    let scope = metadata
+        .scopes_supported
+        .filter(|scopes| !scopes.is_empty())
+        .map(|scopes| scopes.join(" "));
+    Ok((issuer, scope))
+}
+
+fn initial_scope(
+    protected_resource_found: bool,
+    protected_resource_scope: Option<String>,
+    authorization_server_scopes: Option<Vec<String>>,
+) -> Option<String> {
+    if protected_resource_found {
+        // Absence is meaningful: current MCP says to omit `scope` when the
+        // resource did not advertise one, not to request every AS-wide scope.
+        protected_resource_scope
+    } else {
+        // Compatibility for older MCP servers that predate RFC 9728 metadata.
+        authorization_server_scopes.map(|scopes| scopes.join(" "))
     }
 }
 
@@ -418,16 +494,26 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
         .map(|h| host_is_definitely_private(&h))
         .unwrap_or(false);
     let block_private = !server_local;
-    let issuer = match get_json::<ProtectedResource>(
-        &format!("{origin}/.well-known/oauth-protected-resource"),
-        block_private,
-    ) {
-        Ok(pr) => pr
-            .authorization_servers
-            .and_then(|v| v.into_iter().next())
-            .unwrap_or_else(|| origin.clone()),
-        Err(_) => origin.clone(),
-    };
+    let mut protected_resource_found = false;
+    let mut resource_scope = None;
+    let mut discovered_issuer = None;
+    for url in protected_resource_metadata_candidates(mcp_url) {
+        if let Ok(metadata) = get_json::<ProtectedResource>(&url, block_private) {
+            match validated_protected_resource(mcp_url, metadata) {
+                Ok((issuer, scope)) => {
+                    protected_resource_found = true;
+                    discovered_issuer = Some(issuer);
+                    resource_scope = scope;
+                    break;
+                }
+                Err(e) => debug_log(&format!("protected-resource metadata rejected at {url}: {e}")),
+            }
+        }
+    }
+    // Preserve compatibility with pre-RFC 9728 servers that publish only
+    // authorization-server metadata at the MCP origin. Current MCP servers are
+    // expected to take the validated protected-resource path above.
+    let issuer = discovered_issuer.unwrap_or_else(|| origin.clone());
 
     // The issuer can come from the protected-resource document, so guard the
     // metadata fetch too, not just the final endpoints.
@@ -459,7 +545,14 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
                 authorization_endpoint: meta.authorization_endpoint,
                 token_endpoint: meta.token_endpoint,
                 registration_endpoint: meta.registration_endpoint,
-                scope: meta.scopes_supported.map(|s| s.join(" ")),
+                // The protected resource defines the scopes needed to access it.
+                // Keep AS metadata as a compatibility fallback for older servers
+                // that did not publish RFC 9728 protected-resource metadata.
+                scope: initial_scope(
+                    protected_resource_found,
+                    resource_scope,
+                    meta.scopes_supported,
+                ),
                 authorization_response_iss_parameter_supported: meta
                     .authorization_response_iss_parameter_supported,
             });
@@ -1213,5 +1306,81 @@ mod tests {
             c2[0],
             "https://as.example.com/.well-known/oauth-authorization-server"
         );
+        assert_eq!(
+            c[2],
+            "https://access.stripe.com/mcp/.well-known/openid-configuration"
+        );
+    }
+
+    #[test]
+    fn protected_resource_candidates_try_the_endpoint_path_then_origin() {
+        assert_eq!(
+            protected_resource_metadata_candidates("https://mcp.example.com/public/mcp"),
+            vec![
+                "https://mcp.example.com/.well-known/oauth-protected-resource/public/mcp",
+                "https://mcp.example.com/.well-known/oauth-protected-resource",
+            ]
+        );
+        assert_eq!(
+            protected_resource_metadata_candidates("https://mcp.example.com"),
+            vec!["https://mcp.example.com/.well-known/oauth-protected-resource"]
+        );
+        assert_eq!(
+            protected_resource_metadata_candidates("https://mcp.example.com/mcp?tenant=acme"),
+            vec![
+                "https://mcp.example.com/.well-known/oauth-protected-resource/mcp?tenant=acme",
+                "https://mcp.example.com/.well-known/oauth-protected-resource",
+            ]
+        );
+    }
+
+    #[test]
+    fn protected_resource_metadata_is_bound_and_supplies_scopes() {
+        let metadata = ProtectedResource {
+            resource: Some("https://mcp.example.com/mcp".into()),
+            authorization_servers: Some(vec!["https://auth.example.com".into()]),
+            scopes_supported: Some(vec!["files:read".into(), "files:write".into()]),
+        };
+        let (issuer, scope) =
+            validated_protected_resource("https://mcp.example.com/mcp", metadata).unwrap();
+        assert_eq!(issuer, "https://auth.example.com");
+        assert_eq!(scope.as_deref(), Some("files:read files:write"));
+    }
+
+    #[test]
+    fn protected_resource_scope_absence_does_not_expand_to_all_as_scopes() {
+        assert_eq!(
+            initial_scope(
+                true,
+                None,
+                Some(vec!["openid".into(), "admin".into()])
+            ),
+            None
+        );
+        assert_eq!(
+            initial_scope(false, None, Some(vec!["legacy:mcp".into()])),
+            Some("legacy:mcp".into())
+        );
+    }
+
+    #[test]
+    fn protected_resource_metadata_rejects_impersonation_and_empty_issuers() {
+        let wrong_resource = ProtectedResource {
+            resource: Some("https://other.example.com/mcp".into()),
+            authorization_servers: Some(vec!["https://auth.example.com".into()]),
+            scopes_supported: None,
+        };
+        assert!(validated_protected_resource(
+            "https://mcp.example.com/mcp",
+            wrong_resource
+        )
+        .is_err());
+
+        let no_issuer = ProtectedResource {
+            resource: Some("https://mcp.example.com/mcp".into()),
+            authorization_servers: Some(vec!["".into()]),
+            scopes_supported: None,
+        };
+        assert!(validated_protected_resource("https://mcp.example.com/mcp", no_issuer).is_err());
     }
 }

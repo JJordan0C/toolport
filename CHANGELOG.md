@@ -13,6 +13,10 @@ Entries before the rename below shipped under the project's former name, Conduit
   refresh credentials refuse to cross to a changed issuer, and loopback Dynamic Client
   Registration identifies Toolport as a native client as required by the current MCP
   authorization profile. Older vaulted OAuth state remains readable. (SOU-451)
+- OAuth discovery now checks the MCP endpoint's path-specific protected-resource
+  metadata before the origin fallback, rejects metadata for a different resource,
+  and requests the resource's advertised scopes. OAuth and OIDC authorization-server
+  metadata candidates follow the current MCP priority order. (SOU-451)
 
 ## [1.11.0] - 2026-08-01
 
