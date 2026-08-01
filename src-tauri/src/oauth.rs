@@ -15,6 +15,11 @@ use base64::Engine;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+/// Stable HTTPS client identifier whose metadata is published by toolport.app.
+/// Authorization servers that advertise CIMD support fetch this document rather
+/// than accepting an unauthenticated dynamic-registration write.
+const CLIENT_ID_METADATA_URL: &str = "https://toolport.app/.well-known/oauth-client/toolport.json";
+
 pub struct Tokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -49,6 +54,7 @@ pub struct Endpoints {
     pub registration_endpoint: Option<String>,
     pub scope: Option<String>,
     pub authorization_response_iss_parameter_supported: bool,
+    pub client_id_metadata_document_supported: bool,
 }
 
 fn base64url(data: &[u8]) -> String {
@@ -239,6 +245,26 @@ struct AsMeta {
     scopes_supported: Option<Vec<String>>,
     #[serde(default)]
     authorization_response_iss_parameter_supported: bool,
+    #[serde(default)]
+    client_id_metadata_document_supported: bool,
+}
+
+enum ClientRegistration<'a> {
+    MetadataDocument,
+    Dynamic(&'a str),
+}
+
+fn select_client_registration(endpoints: &Endpoints) -> Result<ClientRegistration<'_>, String> {
+    if endpoints.client_id_metadata_document_supported {
+        Ok(ClientRegistration::MetadataDocument)
+    } else if let Some(endpoint) = endpoints.registration_endpoint.as_deref() {
+        Ok(ClientRegistration::Dynamic(endpoint))
+    } else {
+        Err(
+            "this server supports neither Client ID Metadata Documents nor dynamic registration; OAuth needs a pre-registered client"
+                .to_string(),
+        )
+    }
 }
 
 /// A ureq agent with a connect + read timeout for all OAuth HTTP. These endpoints
@@ -850,6 +876,8 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
                 }),
                 authorization_response_iss_parameter_supported: meta
                     .authorization_response_iss_parameter_supported,
+                client_id_metadata_document_supported: meta
+                    .client_id_metadata_document_supported,
             });
         }
     }
@@ -1225,10 +1253,11 @@ pub fn authenticate_with_scope(
     let endpoints = discover(mcp_url)?;
     let scope = scope_union(requested_scope_set, endpoints.scope.as_deref());
     debug_log(&format!(
-        "endpoints: authz={} token={} reg={:?} scope={:?}",
+        "endpoints: authz={} token={} reg={:?} cimd={} scope={:?}",
         endpoints.authorization_endpoint,
         endpoints.token_endpoint,
         endpoints.registration_endpoint,
+        endpoints.client_id_metadata_document_supported,
         scope
     ));
     // Bind the callback listener BEFORE registering/opening the browser, so a
@@ -1245,13 +1274,10 @@ pub fn authenticate_with_scope(
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     debug_log(&format!("callback listening on {redirect_uri}"));
 
-    let client_id = match &endpoints.registration_endpoint {
-        Some(reg) => register_client(reg, &redirect_uri, block_private)?,
-        None => {
-            return Err(
-                "this server has no dynamic-registration endpoint; OAuth needs a pre-registered client"
-                    .to_string(),
-            )
+    let client_id = match select_client_registration(&endpoints)? {
+        ClientRegistration::MetadataDocument => CLIENT_ID_METADATA_URL.to_string(),
+        ClientRegistration::Dynamic(registration_endpoint) => {
+            register_client(registration_endpoint, &redirect_uri, block_private)?
         }
     };
     debug_log(&format!("client_id='{client_id}' (len {})", client_id.len()));
@@ -2148,5 +2174,54 @@ mod tests {
         );
         assert_eq!(scope_union(None, Some("  files:read  ")).as_deref(), Some("files:read"));
         assert_eq!(scope_union(Some(""), None), None);
+    }
+
+    #[test]
+    fn cimd_is_preferred_over_dynamic_registration_when_advertised() {
+        let endpoints = |cimd, registration_endpoint| Endpoints {
+            issuer: "https://auth.example.com".into(),
+            authorization_endpoint: "https://auth.example.com/authorize".into(),
+            token_endpoint: "https://auth.example.com/token".into(),
+            registration_endpoint,
+            scope: None,
+            authorization_response_iss_parameter_supported: false,
+            client_id_metadata_document_supported: cimd,
+        };
+
+        assert!(matches!(
+            select_client_registration(&endpoints(
+                true,
+                Some("https://auth.example.com/register".into())
+            )),
+            Ok(ClientRegistration::MetadataDocument)
+        ));
+        assert!(matches!(
+            select_client_registration(&endpoints(
+                false,
+                Some("https://auth.example.com/register".into())
+            )),
+            Ok(ClientRegistration::Dynamic("https://auth.example.com/register"))
+        ));
+        assert!(select_client_registration(&endpoints(false, None)).is_err());
+    }
+
+    #[test]
+    fn cimd_client_id_is_a_stable_https_url_with_a_path() {
+        let client_id = url::Url::parse(CLIENT_ID_METADATA_URL).unwrap();
+        assert_eq!(client_id.scheme(), "https");
+        assert_ne!(client_id.path(), "/");
+        assert_eq!(client_id.as_str(), CLIENT_ID_METADATA_URL);
+    }
+
+    #[test]
+    fn authorization_server_metadata_reads_cimd_capability() {
+        let metadata: AsMeta = serde_json::from_value(serde_json::json!({
+            "issuer": "https://auth.example.com",
+            "authorization_endpoint": "https://auth.example.com/authorize",
+            "token_endpoint": "https://auth.example.com/token",
+            "client_id_metadata_document_supported": true
+        }))
+        .unwrap();
+        assert!(metadata.client_id_metadata_document_supported);
     }
 }

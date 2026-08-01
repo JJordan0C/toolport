@@ -25,6 +25,9 @@ Entries before the rename below shipped under the project's former name, Conduit
   scopes, open a user-consent step-up flow, and retry the blocked MCP operation once
   with the new token. Step-up attempts are bounded per operation and never consume
   refresh tokens that cannot grant additional permissions. (SOU-451)
+- OAuth authorization servers that advertise Client ID Metadata Document support
+  now use Toolport's stable HTTPS client identity instead of Dynamic Client
+  Registration. DCR remains the compatibility fallback for older servers. (SOU-451)
 
 ### Fixed
 
