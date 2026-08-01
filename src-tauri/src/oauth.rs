@@ -182,6 +182,7 @@ fn bearer_challenge<'a>(headers: impl IntoIterator<Item = &'a str>) -> Option<Be
         for part in auth_header_parts(header) {
             let (candidate, param) = match part.split_once(char::is_whitespace) {
                 Some((scheme, rest)) if !scheme.contains('=') => (Some(scheme), rest.trim()),
+                None if !part.contains('=') => (Some(part), ""),
                 _ => (None, part),
             };
             if let Some(scheme) = candidate {
@@ -1704,6 +1705,14 @@ mod tests {
         .expect("the first Bearer challenge should be selected");
         assert_eq!(parsed.scope.as_deref(), Some("files:read"));
         assert_eq!(parsed.resource_metadata, None);
+    }
+
+    #[test]
+    fn bearer_challenge_recognizes_a_bare_scheme() {
+        assert_eq!(
+            bearer_challenge(["Bearer, Basic realm=\"legacy\""]),
+            Some(BearerChallenge::default())
+        );
     }
 
     #[test]
