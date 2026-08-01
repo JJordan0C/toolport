@@ -279,7 +279,12 @@ fn validated_protected_resource(
     }
     let issuer = metadata
         .authorization_servers
-        .and_then(|servers| servers.into_iter().find(|issuer| !issuer.trim().is_empty()))
+        .and_then(|servers| {
+            servers
+                .into_iter()
+                .map(|issuer| issuer.trim().to_string())
+                .find(|issuer| !issuer.is_empty())
+        })
         .ok_or_else(|| {
             "protected-resource metadata has no authorization server; refusing OAuth discovery"
                 .to_string()
@@ -534,7 +539,10 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
     let issuer = discovered_issuer.unwrap_or_else(|| origin.clone());
 
     // The issuer can come from the protected-resource document, so guard the
-    // metadata fetch too, not just the final endpoints.
+    // metadata fetch too, not just the final endpoints. Requiring TLS here
+    // prevents an attacker from substituting the metadata before its endpoint
+    // URLs receive their own HTTPS and SSRF checks.
+    require_https(&issuer, "authorization server")?;
     guard_endpoint(&issuer, server_local, "authorization server")?;
 
     for url in metadata_candidates(&issuer) {
@@ -1369,7 +1377,7 @@ mod tests {
     fn protected_resource_metadata_normalizes_advertised_scopes() {
         let metadata = ProtectedResource {
             resource: Some("https://mcp.example.com/mcp".into()),
-            authorization_servers: Some(vec!["https://auth.example.com".into()]),
+            authorization_servers: Some(vec!["  https://auth.example.com  ".into()]),
             scopes_supported: Some(vec![
                 " files:read ".into(),
                 "".into(),
@@ -1377,8 +1385,9 @@ mod tests {
                 "files:write".into(),
             ]),
         };
-        let (_, scope) =
+        let (issuer, scope) =
             validated_protected_resource("https://mcp.example.com/mcp", metadata).unwrap();
+        assert_eq!(issuer, "https://auth.example.com");
         assert_eq!(scope.as_deref(), Some("files:read files:write"));
     }
 
@@ -1465,5 +1474,37 @@ mod tests {
             requested_paths.lock().unwrap().as_slice(),
             ["/.well-known/oauth-protected-resource"]
         );
+    }
+
+    #[test]
+    fn discover_refuses_cleartext_authorization_server_metadata() {
+        use std::time::Duration;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let resource = format!("http://{address}");
+        let document_resource = resource.clone();
+        let handle = std::thread::spawn(move || {
+            let request = server
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .expect("protected-resource metadata request");
+            let response = tiny_http::Response::from_string(
+                serde_json::json!({
+                    "resource": document_resource,
+                    "authorization_servers": ["http://8.8.8.8"]
+                })
+                .to_string(),
+            )
+            .with_header(
+                tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap(),
+            );
+            request.respond(response).unwrap();
+        });
+
+        let error = discover(&resource).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(error.contains("authorization server must use https"));
     }
 }
