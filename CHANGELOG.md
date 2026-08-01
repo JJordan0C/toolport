@@ -6,6 +6,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Added
+
+- Modern extension negotiation now passes opaque client extension settings to
+  downstream servers and aggregates compatible downstream extension declarations
+  in `server/discover`. Unknown `_meta` and result fields continue through unchanged;
+  conflicting settings are omitted rather than overstating gateway support. The
+  Tasks extension remains withheld until its handle-routing layer lands. (SOU-453)
+
 ### Security
 
 - OAuth authorization responses are now bound to the validated authorization-server

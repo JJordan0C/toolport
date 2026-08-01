@@ -435,6 +435,14 @@ pub const PER_HOP_META_KEYS: [&str; 3] = [
     "io.modelcontextprotocol/clientCapabilities",
 ];
 
+/// Extensions that cannot be relayed safely by copying capability and envelope
+/// data alone. Tasks introduces follow-up `tasks/*` methods whose opaque handles
+/// must route back to the server that minted them; advertising it before that
+/// ownership layer exists would strand every returned handle.
+pub fn extension_is_transparent(identifier: &str) -> bool {
+    identifier != "io.modelcontextprotocol/tasks"
+}
+
 /// Keys relayed only once Toolport can honour what they ask for.
 ///
 /// `progressToken` lived here until the gateway learned to route
@@ -494,6 +502,45 @@ fn with_meta(mut params: Value, meta: Option<&Value>) -> Value {
         params["_meta"] = relayed;
     }
     params
+}
+
+/// Copy only extension declarations from the upstream client's per-request
+/// capabilities onto a modern downstream hop.
+///
+/// Core client capabilities remain per-hop: Toolport may only advertise roots,
+/// sampling, or elicitation when it can service those callbacks itself. Unknown
+/// extension declarations are different. Their negotiation and payloads are
+/// intentionally opaque to a transparent gateway, so preserving the settings
+/// object is the only future-compatible behavior (SOU-453).
+fn attach_client_extensions(params: &mut Value, meta: Option<&Value>) {
+    let Some(extensions) = meta
+        .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"))
+        .and_then(|capabilities| capabilities.get("extensions"))
+        .and_then(Value::as_object)
+        .filter(|extensions| !extensions.is_empty())
+        .map(|extensions| {
+            extensions
+                .iter()
+                .filter(|(identifier, _)| extension_is_transparent(identifier))
+                .map(|(identifier, settings)| (identifier.clone(), settings.clone()))
+                .collect::<serde_json::Map<String, Value>>()
+        })
+        .filter(|extensions| !extensions.is_empty())
+    else {
+        return;
+    };
+    let Some(params) = params.as_object_mut() else {
+        return;
+    };
+    let meta = params
+        .entry("_meta")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !meta.is_object() {
+        *meta = Value::Object(serde_json::Map::new());
+    }
+    meta["io.modelcontextprotocol/clientCapabilities"] = json!({
+        "extensions": Value::Object(extensions)
+    });
 }
 
 /// Wire-only fields used when a 2026-07-28 client retries an incomplete request.
@@ -573,7 +620,23 @@ fn merge_protocol_meta(params: &mut Value, protocol: &Value) {
     }
     if let Some(meta) = slot.as_object_mut() {
         for (key, value) in protocol {
-            meta.insert(key.clone(), value.clone());
+            // `clientCapabilities` is still owned by this hop, but extension
+            // negotiation is the one intentionally transparent part. The
+            // request builder copied only the upstream extension map here; keep
+            // it while replacing every core capability with Toolport's own.
+            let mut value = value.clone();
+            if key == "io.modelcontextprotocol/clientCapabilities" {
+                if let Some(extensions) = meta
+                    .get(key)
+                    .and_then(|capabilities| capabilities.get("extensions"))
+                    .and_then(Value::as_object)
+                    .filter(|extensions| !extensions.is_empty())
+                    .cloned()
+                {
+                    value["extensions"] = Value::Object(extensions);
+                }
+            }
+            meta.insert(key.clone(), value);
         }
     }
 }
@@ -3884,6 +3947,10 @@ pub struct DownstreamServer {
     caps_prompts: bool,
     /// Whether the server's `initialize` advertised the completions utility.
     caps_completions: bool,
+    /// Opaque extension settings advertised by a modern server. These are
+    /// aggregated verbatim for modern upstream discovery; legacy extension
+    /// negotiation is initialize-scoped and cannot safely be bridged here.
+    caps_extensions: serde_json::Map<String, Value>,
     /// The protocol era this connection settled on at handshake (SOU-445).
     era: Era,
     /// Modern Streamable HTTP can mirror schema-annotated tool arguments into
@@ -4039,6 +4106,14 @@ impl DownstreamServer {
         let caps_resources = caps.and_then(|c| c.get("resources")).is_some();
         let caps_prompts = caps.and_then(|c| c.get("prompts")).is_some();
         let caps_completions = caps.and_then(|c| c.get("completions")).is_some();
+        let caps_extensions = if matches!(era, Era::Modern { .. }) {
+            caps.and_then(|c| c.get("extensions"))
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            serde_json::Map::new()
+        };
 
         // `initialize` answered, so any launcher download is done: the rest of the
         // handshake goes back to the tight budget - a server that comes up but then
@@ -4086,6 +4161,7 @@ impl DownstreamServer {
             caps_resources,
             caps_prompts,
             caps_completions,
+            caps_extensions,
             era,
             modern_http,
             modern_resource_subscriptions: std::collections::HashSet::new(),
@@ -4207,9 +4283,13 @@ impl DownstreamServer {
         headers: &[(String, String)],
     ) -> Result<Value, TransportError> {
         let modern_upstream = upstream_is_modern(meta);
+        let modern_downstream = matches!(self.era, Era::Modern { .. });
         let mut retry = mrtr.cloned().unwrap_or_default();
         for round in 0..=MRTR_LEGACY_MAX_ROUNDS {
-            let params = with_meta_and_mrtr(params.clone(), meta, Some(&retry));
+            let mut params = with_meta_and_mrtr(params.clone(), meta, Some(&retry));
+            if modern_downstream {
+                attach_client_extensions(&mut params, meta);
+            }
             let result = self.transport.request_with_cancel_and_headers(
                 method,
                 params,
@@ -4619,6 +4699,11 @@ impl DownstreamServer {
         self.caps_prompts.then_some(self.prompt_cache_hint)
     }
 
+    /// Extension capability settings from a modern `server/discover` response.
+    pub fn extensions(&self) -> &serde_json::Map<String, Value> {
+        &self.caps_extensions
+    }
+
     /// The protocol era and version this connection negotiated (SOU-445).
     pub fn era(&self) -> &Era {
         &self.era
@@ -4632,9 +4717,14 @@ impl DownstreamServer {
 
     pub fn complete_with_cancel(
         &mut self,
-        params: Value,
+        mut params: Value,
         cancel: Option<CancelContext>,
     ) -> Result<Value, TransportError> {
+        let original_meta = params.get("_meta").cloned();
+        sanitize_forwarded_meta(&mut params);
+        if matches!(self.era, Era::Modern { .. }) {
+            attach_client_extensions(&mut params, original_meta.as_ref());
+        }
         self.transport
             .request_with_cancel("completion/complete", params, cancel)
     }
@@ -5005,6 +5095,7 @@ mod tests {
             caps_resources: false,
             caps_prompts: false,
             caps_completions: false,
+            caps_extensions: serde_json::Map::new(),
             era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
             modern_http: false,
             modern_resource_subscriptions: std::collections::HashSet::new(),
@@ -5037,6 +5128,7 @@ mod tests {
             caps_resources: true,
             caps_prompts: false,
             caps_completions: false,
+            caps_extensions: serde_json::Map::new(),
             era: super::Era::Legacy { version: super::PROTOCOL_VERSION.to_string() },
             modern_http: false,
             modern_resource_subscriptions: std::collections::HashSet::new(),
@@ -6707,15 +6799,106 @@ mod tests {
         const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 
         // A pre-existing `_meta` is merged into, not replaced.
-        let mut params = json!({ "_meta": { "traceparent": "keep" } });
+        let mut params = json!({
+            "_meta": {
+                "traceparent": "keep",
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "sampling": {},
+                    "extensions": { "com.example/opaque": { "mode": "strict" } }
+                }
+            }
+        });
         merge_protocol_meta(&mut params, &protocol_meta_for(MODERN_PROTOCOL_VERSION));
         assert_eq!(params["_meta"]["traceparent"], "keep", "client keys survive");
         assert_eq!(params["_meta"][VERSION_KEY], MODERN_PROTOCOL_VERSION);
+        assert_eq!(
+            params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                ["com.example/opaque"]["mode"],
+            "strict"
+        );
+        assert!(params["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+            .get("sampling")
+            .is_none());
 
         // A non-object `_meta` is rebuilt rather than panicking or being ignored.
         let mut params = json!({ "_meta": "nonsense" });
         merge_protocol_meta(&mut params, &protocol_meta_for(MODERN_PROTOCOL_VERSION));
         assert_eq!(params["_meta"][VERSION_KEY], MODERN_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn modern_requests_forward_only_client_extension_capabilities() {
+        use super::{DownstreamServer, Transport, TransportError, MODERN_PROTOCOL_VERSION};
+        use std::sync::{Arc, Mutex};
+
+        struct ExtensionProbe {
+            calls: Arc<Mutex<Vec<Value>>>,
+        }
+
+        impl Transport for ExtensionProbe {
+            fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
+                match method {
+                    "initialize" => Err(TransportError::Rpc(json!({
+                        "code": -32601,
+                        "message": "method not found"
+                    }))),
+                    "server/discover" => Ok(json!({
+                        "supportedVersions": [MODERN_PROTOCOL_VERSION],
+                        "capabilities": {
+                            "extensions": {
+                                "com.example/opaque": { "mode": "strict" }
+                            }
+                        }
+                    })),
+                    "tools/list" => Ok(json!({ "tools": [{ "name": "work" }] })),
+                    "tools/call" => {
+                        self.calls.lock().unwrap().push(params);
+                        Ok(json!({ "content": [], "isError": false }))
+                    }
+                    other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
+                }
+            }
+
+            fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut server = DownstreamServer::connect(
+            "modern".to_string(),
+            Box::new(ExtensionProbe { calls: Arc::clone(&calls) }),
+        )
+        .unwrap();
+        assert_eq!(server.extensions()["com.example/opaque"]["mode"], "strict");
+
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {
+                "sampling": {},
+                "extensions": {
+                    "com.example/opaque": { "mimeTypes": ["text/html"] },
+                    "io.modelcontextprotocol/tasks": {}
+                }
+            },
+            "com.example/request": { "keep": true }
+        });
+        server
+            .call_with_cancel("work", json!({}), None, Some(&meta))
+            .unwrap();
+
+        let calls = calls.lock().unwrap();
+        let params = &calls[0];
+        let capabilities = &params["_meta"]["io.modelcontextprotocol/clientCapabilities"];
+        assert_eq!(
+            capabilities["extensions"]["com.example/opaque"]["mimeTypes"][0],
+            "text/html"
+        );
+        assert!(capabilities.get("sampling").is_none());
+        assert!(capabilities["extensions"]
+            .get("io.modelcontextprotocol/tasks")
+            .is_none());
+        assert_eq!(params["_meta"]["com.example/request"]["keep"], true);
     }
 
     #[test]

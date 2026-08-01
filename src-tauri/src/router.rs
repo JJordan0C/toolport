@@ -12,15 +12,15 @@
 //! (and anything else out of charset) to `_` on the way out, and keep a reverse
 //! map so `tools/call` still forwards the server's real, hyphenated tool name.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use crate::downstream::{
-    backoff_delay, CacheHint, CancelContext, DownstreamServer, MrtrRequest, TransportError,
-    HTTP_MAX_RETRIES, HTTP_RETRY_CAP,
+    backoff_delay, extension_is_transparent, CacheHint, CancelContext, DownstreamServer, MrtrRequest,
+    TransportError, HTTP_MAX_RETRIES, HTTP_RETRY_CAP,
 };
 use crate::registry::ToolOverride;
 
@@ -755,6 +755,46 @@ impl Router {
         self.aggregate_cache_hints(DownstreamServer::prompt_cache_hint)
     }
 
+    /// Aggregate opaque extension settings from the selected modern downstream
+    /// servers. Identical declarations are preserved byte-for-byte. If two
+    /// servers use the same identifier with different settings, omit that
+    /// identifier: there is no single capability value Toolport can truthfully
+    /// advertise for the aggregate (SOU-453).
+    pub fn aggregated_extensions(
+        &self,
+        include_server: impl Fn(&str) -> bool,
+    ) -> serde_json::Map<String, Value> {
+        let mut values: BTreeMap<String, Option<Value>> = BTreeMap::new();
+        for slot in &self.servers {
+            if !include_server(&slot.id) {
+                continue;
+            }
+            let server = slot
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (identifier, settings) in server.extensions() {
+                if !extension_is_transparent(identifier) {
+                    continue;
+                }
+                match values.entry(identifier.clone()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(Some(settings.clone()));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if entry.get().as_ref() != Some(settings) {
+                            entry.insert(None);
+                        }
+                    }
+                }
+            }
+        }
+        values
+            .into_iter()
+            .filter_map(|(identifier, settings)| settings.map(|settings| (identifier, settings)))
+            .collect()
+    }
+
     /// Positive downstream TTLs schedule a refresh at their expiry. Zero/missing
     /// hints do not create a one-second polling loop; notifications still invalidate
     /// them immediately through the existing dirty-bit path.
@@ -1339,10 +1379,7 @@ impl Router {
         params: Value,
         cancel: Option<CancelContext>,
     ) -> Result<Value, String> {
-        let (server_id, mut forwarded) = self.resolve_completion(&params)?;
-        // This path forwards the client's params wholesale, so it needs the same
-        // per-hop `_meta` stripping the rebuilt paths get (SOU-444).
-        crate::downstream::sanitize_forwarded_meta(&mut forwarded);
+        let (server_id, forwarded) = self.resolve_completion(&params)?;
         let slot = self.slot_for(&server_id)?;
         self.call_with_retry(&slot, |server| {
             server.complete_with_cancel(forwarded.clone(), cancel.clone())
@@ -1578,6 +1615,71 @@ mod tests {
         // Mirror the gateway: load resources/prompts after connect.
         ds.load_resources_prompts();
         ds
+    }
+
+    struct ExtensionTransport {
+        extensions: Value,
+    }
+
+    impl Transport for ExtensionTransport {
+        fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+            match method {
+                "initialize" => Err(TransportError::Rpc(json!({
+                    "code": -32601,
+                    "message": "method not found"
+                }))),
+                "server/discover" => Ok(json!({
+                    "supportedVersions": [crate::downstream::MODERN_PROTOCOL_VERSION],
+                    "capabilities": { "extensions": self.extensions.clone() }
+                })),
+                "tools/list" => Ok(json!({ "tools": [] })),
+                other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
+            }
+        }
+
+        fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    fn extension_server(id: &str, extensions: Value) -> DownstreamServer {
+        DownstreamServer::connect(
+            id.to_string(),
+            Box::new(ExtensionTransport { extensions }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn extension_aggregation_is_scoped_and_omits_conflicting_settings() {
+        let mut router = Router::new();
+        router.add(extension_server(
+            "alpha",
+            json!({
+                "io.modelcontextprotocol/tasks": {},
+                "com.example/passive": {},
+                "com.example/mode": { "version": 1 }
+            }),
+        ));
+        router.add(extension_server(
+            "beta",
+            json!({
+                "io.modelcontextprotocol/tasks": {},
+                "com.example/passive": {},
+                "com.example/mode": { "version": 2 },
+                "com.example/beta": { "enabled": true }
+            }),
+        ));
+
+        let all = router.aggregated_extensions(|_| true);
+        assert_eq!(all["com.example/passive"], json!({}));
+        assert!(all.get("io.modelcontextprotocol/tasks").is_none());
+        assert_eq!(all["com.example/beta"]["enabled"], true);
+        assert!(all.get("com.example/mode").is_none());
+
+        let alpha = router.aggregated_extensions(|server_id| server_id == "alpha");
+        assert_eq!(alpha["com.example/mode"]["version"], 1);
+        assert!(alpha.get("com.example/beta").is_none());
     }
 
     struct HintTransport {

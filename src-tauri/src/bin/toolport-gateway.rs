@@ -253,19 +253,31 @@ fn unsupported_version_error(id: Value, requested: &str) -> Value {
 /// What Toolport advertises to upstream clients. The catalog capabilities stay
 /// aligned across eras, while the removed legacy `resources.subscribe` flag is
 /// omitted from modern discovery in favor of `subscriptions/listen`.
-fn gateway_capabilities() -> Value {
+fn gateway_capabilities(
+    router: &Router,
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> Value {
     let resources = if serving_modern_client() {
         json!({ "listChanged": true })
     } else {
         // Always-on legacy proxy: advertise subscribe, fail closed when no owner can.
         json!({ "listChanged": true, "subscribe": true })
     };
-    json!({
+    let mut capabilities = json!({
         "tools": { "listChanged": true },
         "resources": resources,
         "prompts": { "listChanged": true },
         "completions": {}
-    })
+    });
+    if serving_modern_client() {
+        let extensions = router.aggregated_extensions(|server_id| {
+            allowed.is_none_or(|allowed| server_in_allowed_scope(server_id, allowed))
+        });
+        if !extensions.is_empty() {
+            capabilities["extensions"] = Value::Object(extensions);
+        }
+    }
+    capabilities
 }
 
 const MAX_SEARCH_QUERY_CHARS: usize = 512;
@@ -4285,7 +4297,7 @@ fn handle_request_with_cancel(
             id,
             json!({
                 "supportedVersions": SUPPORTED_UPSTREAM_VERSIONS,
-                "capabilities": gateway_capabilities(),
+                "capabilities": gateway_capabilities(router, allowed),
                 "instructions": "Toolport aggregates every configured MCP server behind one \
                                  endpoint. In lazy discovery mode the catalog is reached through \
                                  the toolport_search_tools / toolport_call_tool meta-tools rather \
@@ -4314,7 +4326,7 @@ fn handle_request_with_cancel(
                 id,
                 json!({
                     "protocolVersion": proto,
-                    "capabilities": gateway_capabilities(),
+                    "capabilities": gateway_capabilities(router, allowed),
                     "serverInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") }
                 }),
             ))
@@ -15758,6 +15770,93 @@ mod tests {
         // Scope- and profile-dependent, so a shared intermediary must not reuse
         // one client's answer for another.
         assert_eq!(result["cacheScope"], "private");
+    }
+
+    #[test]
+    fn server_discover_aggregates_only_relayable_extensions_in_scope() {
+        struct ExtensionServer;
+
+        impl Transport for ExtensionServer {
+            fn request(
+                &mut self,
+                method: &str,
+                _params: Value,
+            ) -> Result<Value, downstream::TransportError> {
+                match method {
+                    "initialize" => Err(downstream::TransportError::Rpc(json!({
+                        "code": -32601,
+                        "message": "method not found"
+                    }))),
+                    "server/discover" => Ok(json!({
+                        "supportedVersions": [MODERN_PROTOCOL_VERSION],
+                        "capabilities": {
+                            "extensions": {
+                                "com.example/passive": { "version": 1 },
+                                "io.modelcontextprotocol/tasks": {}
+                            }
+                        }
+                    })),
+                    "tools/list" => Ok(json!({ "tools": [] })),
+                    other => Err(downstream::TransportError::Fatal(format!(
+                        "unexpected method {other}"
+                    ))),
+                }
+            }
+
+            fn notify(
+                &mut self,
+                _method: &str,
+                _params: Value,
+            ) -> Result<(), downstream::TransportError> {
+                Ok(())
+            }
+        }
+
+        let reg = Registry::default();
+        let mut router = Router::new();
+        router.add(
+            DownstreamServer::connect("ext-server".into(), Box::new(ExtensionServer)).unwrap(),
+        );
+        let request = modern_req(11, "server/discover", json!({}));
+        let response = handle_request(
+            &request,
+            &reg,
+            &router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            response["result"]["capabilities"]["extensions"]["com.example/passive"]
+                ["version"],
+            1
+        );
+        assert!(response["result"]["capabilities"]["extensions"]
+            .get("io.modelcontextprotocol/tasks")
+            .is_none());
+
+        let allowed = std::collections::HashSet::from(["other".to_string()]);
+        let scoped = handle_request(
+            &request,
+            &reg,
+            &router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            Some(&allowed),
+            None,
+        )
+        .unwrap();
+        assert!(scoped["result"]["capabilities"]
+            .get("extensions")
+            .is_none());
     }
 
     #[test]
