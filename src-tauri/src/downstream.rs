@@ -416,8 +416,14 @@ pub struct MrtrRequest {
 impl MrtrRequest {
     pub fn from_params(params: Option<&Value>) -> Self {
         Self {
-            input_responses: params.and_then(|p| p.get("inputResponses")).cloned(),
-            request_state: params.and_then(|p| p.get("requestState")).cloned(),
+            input_responses: params
+                .and_then(|p| p.get("inputResponses"))
+                .filter(|value| !value.is_null())
+                .cloned(),
+            request_state: params
+                .and_then(|p| p.get("requestState"))
+                .filter(|value| !value.is_null())
+                .cloned(),
         }
     }
 
@@ -5120,6 +5126,20 @@ mod tests {
             calls[1]["inputResponses"]["workspace"]["roots"][0]["uri"],
             "file:///workspace"
         );
+    }
+
+    #[test]
+    fn mrtr_null_retry_fields_are_treated_as_absent() {
+        let retry = MrtrRequest::from_params(Some(&json!({
+            "inputResponses": null,
+            "requestState": null
+        })));
+
+        assert!(retry.is_empty());
+        let mut params = json!({ "name": "echo", "arguments": {} });
+        retry.apply(&mut params);
+        assert!(params.get("inputResponses").is_none());
+        assert!(params.get("requestState").is_none());
     }
 
     #[test]
