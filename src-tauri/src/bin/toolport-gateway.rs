@@ -154,9 +154,9 @@ fn decorate_for_upstream(mut result: Value) -> Value {
     result
 }
 
-/// Toolport-owned cacheable results stay fresh for five minutes unless a
-/// contributing downstream server advertises a shorter window. Registry and
-/// list-changed notifications still invalidate them immediately.
+/// Toolport-owned cacheable results stay fresh for at most five minutes. A
+/// shorter downstream TTL wins, while a missing/zero TTL disables caching for
+/// the aggregate. Registry and list-changed notifications still invalidate it.
 const LOCAL_CACHE_TTL_MS: u64 = 300_000;
 
 fn cacheable_for_upstream(mut result: Value, hint: CacheHint, scoped: bool) -> Value {

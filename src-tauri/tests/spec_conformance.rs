@@ -523,7 +523,7 @@ fn gateway_connects_to_a_modern_server() {
         server.resource_template_cache_hint(),
         server.prompt_cache_hint(),
     ] {
-        let hint = hint.expect("fixture advertised this cacheable capability");
+        let hint = hint.expect("fixture advertised the resources/prompts capability");
         assert!(hint.is_public());
         assert!(hint.remaining_ttl_ms() > 0);
     }

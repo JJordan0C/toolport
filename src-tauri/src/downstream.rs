@@ -348,7 +348,9 @@ impl CacheHint {
     pub fn from_result(result: &Value) -> Self {
         let ttl_ms = result.get("ttlMs").and_then(Value::as_u64).unwrap_or(0);
         let now = Instant::now();
-        let expires_at = (ttl_ms > 0).then(|| now + Duration::from_millis(ttl_ms));
+        let expires_at = (ttl_ms > 0)
+            .then(|| Duration::from_millis(ttl_ms))
+            .and_then(|ttl| now.checked_add(ttl));
         Self {
             expires_at,
             refresh_after: expires_at,
@@ -359,7 +361,9 @@ impl CacheHint {
 
     pub fn local(ttl_ms: u64) -> Self {
         let now = Instant::now();
-        let expires_at = (ttl_ms > 0).then(|| now + Duration::from_millis(ttl_ms));
+        let expires_at = (ttl_ms > 0)
+            .then(|| Duration::from_millis(ttl_ms))
+            .and_then(|ttl| now.checked_add(ttl));
         Self {
             expires_at,
             refresh_after: expires_at,
@@ -4711,6 +4715,16 @@ mod tests {
         assert!(!listed.cache_hint.is_public());
         let ttl = listed.cache_hint.remaining_ttl_ms();
         assert!(ttl > 0 && ttl <= 30_000, "minimum page TTL should win: {ttl}");
+    }
+
+    #[test]
+    fn oversized_cache_ttl_is_handled_without_panicking() {
+        let downstream = CacheHint::from_result(&json!({
+            "ttlMs": u64::MAX,
+            "cacheScope": "public"
+        }));
+        let _ = downstream.remaining_ttl_ms();
+        let _ = CacheHint::local(u64::MAX).remaining_ttl_ms();
     }
 
     #[test]
