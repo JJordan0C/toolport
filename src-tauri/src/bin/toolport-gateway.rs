@@ -235,6 +235,10 @@ const SUPPORTED_UPSTREAM_VERSIONS: [&str; 5] = [
 /// Legacy clients are unaffected either way: they never send this key at all.
 const MODERN_UPSTREAM_VERSIONS: [&str; 1] = [MODERN_PROTOCOL_VERSION];
 
+/// Toolport's third-party MCP extension identifier. `toolport.app` is a domain
+/// we own, so its required reverse-domain vendor prefix is `app.toolport`.
+const TOOLPORT_GATEWAY_EXTENSION: &str = "app.toolport/gateway";
+
 /// The protocol version a modern client declared on this request.
 ///
 /// Presence of this key is what distinguishes a modern request from a legacy
@@ -266,6 +270,8 @@ fn unsupported_version_error(id: Value, requested: &str) -> Value {
 fn gateway_capabilities(
     router: &Router,
     allowed: Option<&std::collections::HashSet<String>>,
+    reg: &Registry,
+    lazy: bool,
 ) -> Value {
     let resources = if serving_modern_client() {
         json!({ "listChanged": true })
@@ -280,12 +286,35 @@ fn gateway_capabilities(
         "completions": {}
     });
     if serving_modern_client() {
-        let extensions = router.aggregated_extensions(|server_id| {
+        let mut extensions = router.aggregated_extensions(|server_id| {
             allowed.is_none_or(|allowed| server_in_allowed_scope(server_id, allowed))
         });
-        if !extensions.is_empty() {
-            capabilities["extensions"] = Value::Object(extensions);
-        }
+        // A downstream server cannot speak for Toolport's owned vendor prefix
+        // on the upstream hop. Remove the whole namespace, not only the one
+        // extension known to this build, before adding Toolport's declaration.
+        extensions.retain(|identifier, _| !identifier.starts_with("app.toolport/"));
+        let discovery_mode = if lazy {
+            DiscoveryMode::Lazy
+        } else if grouped_discovery() {
+            DiscoveryMode::Grouped
+        } else {
+            DiscoveryMode::Full
+        };
+        // This is Toolport's capability on the upstream hop, so it wins over a
+        // downstream server attempting to claim the same vendor namespace.
+        extensions.insert(
+            TOOLPORT_GATEWAY_EXTENSION.to_string(),
+            json!({
+                "version": "1.0.0",
+                "discoveryMode": discovery_mode.as_str(),
+                "codeMode": code_mode_enabled(),
+                "agentControl": reg.allow_agent_control,
+                "destructiveConfirmation": reg.confirm_destructive
+                    && !reg.human_approval_effective(),
+                "humanApproval": reg.human_approval_effective()
+            }),
+        );
+        capabilities["extensions"] = Value::Object(extensions);
     }
     capabilities
 }
@@ -4307,7 +4336,7 @@ fn handle_request_with_cancel(
             id,
             json!({
                 "supportedVersions": SUPPORTED_UPSTREAM_VERSIONS,
-                "capabilities": gateway_capabilities(router, allowed),
+                "capabilities": gateway_capabilities(router, allowed, reg, lazy),
                 "instructions": "Toolport aggregates every configured MCP server behind one \
                                  endpoint. In lazy discovery mode the catalog is reached through \
                                  the toolport_search_tools / toolport_call_tool meta-tools rather \
@@ -4336,7 +4365,7 @@ fn handle_request_with_cancel(
                 id,
                 json!({
                     "protocolVersion": proto,
-                    "capabilities": gateway_capabilities(router, allowed),
+                    "capabilities": gateway_capabilities(router, allowed, reg, lazy),
                     "serverInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") }
                 }),
             ))
@@ -15852,6 +15881,88 @@ mod tests {
         // Scope- and profile-dependent, so a shared intermediary must not reuse
         // one client's answer for another.
         assert_eq!(result["cacheScope"], "private");
+        let toolport = &result["capabilities"]["extensions"][TOOLPORT_GATEWAY_EXTENSION];
+        assert_eq!(toolport["version"], "1.0.0");
+        assert_eq!(toolport["discoveryMode"], "lazy");
+        assert!(toolport["codeMode"].is_boolean());
+        assert_eq!(toolport["agentControl"], false);
+        assert_eq!(toolport["destructiveConfirmation"], false);
+        assert_eq!(toolport["humanApproval"], false);
+    }
+
+    #[test]
+    fn toolport_extension_reports_active_features_without_gating_core_tools() {
+        let _code_mode = CodeModeGuard::acquire();
+        set_code_mode_flag(true);
+        let mut reg = Registry::default();
+        reg.allow_agent_control = true;
+        reg.confirm_destructive = true;
+        let router = Router::new();
+        let request = modern_req(1, "server/discover", json!({}));
+        let response = handle_request(
+            &request,
+            &reg,
+            &router,
+            &[],
+            false,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        let settings = &response["result"]["capabilities"]["extensions"]
+            [TOOLPORT_GATEWAY_EXTENSION];
+        assert_eq!(settings["discoveryMode"], "full");
+        assert_eq!(settings["codeMode"], true);
+        assert_eq!(settings["agentControl"], true);
+        assert_eq!(settings["destructiveConfirmation"], true);
+        assert_eq!(settings["humanApproval"], false);
+
+        reg.human_approval = true;
+        let human_gated = handle_request(
+            &modern_req(3, "server/discover", json!({})),
+            &reg,
+            &router,
+            &[],
+            false,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        let human_settings = &human_gated["result"]["capabilities"]["extensions"]
+            [TOOLPORT_GATEWAY_EXTENSION];
+        assert_eq!(human_settings["destructiveConfirmation"], false);
+        assert_eq!(human_settings["humanApproval"], true);
+
+        // No client extension opt-in is required: the extension describes the
+        // existing core tools, which remain the graceful-degradation path.
+        let tools = handle_request(
+            &modern_req(4, "tools/list", json!({})),
+            &reg,
+            &router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        let names = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"toolport_search_tools"));
+        assert!(names.contains(&"toolport_run_script"));
+        assert!(names.contains(&"toolport_confirm"));
     }
 
     #[test]
@@ -15874,7 +15985,9 @@ mod tests {
                         "capabilities": {
                             "extensions": {
                                 "com.example/passive": { "version": 1 },
-                                "io.modelcontextprotocol/tasks": {}
+                                "io.modelcontextprotocol/tasks": {},
+                                "app.toolport/gateway": { "version": "spoofed" },
+                                "app.toolport/other": { "version": "spoofed" }
                             }
                         }
                     })),
@@ -15923,6 +16036,14 @@ mod tests {
                 ["io.modelcontextprotocol/tasks"],
             json!({})
         );
+        assert_eq!(
+            response["result"]["capabilities"]["extensions"]
+                [TOOLPORT_GATEWAY_EXTENSION]["version"],
+            "1.0.0"
+        );
+        assert!(response["result"]["capabilities"]["extensions"]
+            .get("app.toolport/other")
+            .is_none());
 
         let allowed = std::collections::HashSet::from(["other".to_string()]);
         let scoped = handle_request(
@@ -15938,9 +16059,13 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(scoped["result"]["capabilities"]
-            .get("extensions")
-            .is_none());
+        let scoped_extensions = scoped["result"]["capabilities"]["extensions"]
+            .as_object()
+            .unwrap();
+        assert_eq!(scoped_extensions.len(), 1);
+        assert!(scoped_extensions.contains_key(TOOLPORT_GATEWAY_EXTENSION));
+        assert!(!scoped_extensions.contains_key("com.example/passive"));
+        assert!(!scoped_extensions.contains_key("io.modelcontextprotocol/tasks"));
     }
 
     #[test]

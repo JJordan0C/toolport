@@ -16,6 +16,10 @@ Entries before the rename below shipped under the project's former name, Conduit
   the downstream server that created them and proxies `tasks/get`, `tasks/update`,
   and `tasks/cancel`, including the required Streamable HTTP routing headers.
   Toolport task ids survive router rebuilds and app restarts. (SOU-453)
+- Modern clients can detect Toolport through the `app.toolport/gateway` extension.
+  Its settings report the active discovery, code-mode, agent-control, destructive
+  confirmation, and human-approval state; existing meta-tools remain available as
+  the core-protocol fallback for clients that ignore extensions. (SOU-453)
 
 ### Security
 
