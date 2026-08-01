@@ -32,7 +32,7 @@ use conduit_lib::{audit, usage_report};
 use conduit_lib::clients;
 use conduit_lib::codemode;
 use conduit_lib::downstream::{
-    self, DownstreamServer, MrtrRequest, ResourceUpdatedSink, ServerRequestAction,
+    self, CacheHint, DownstreamServer, MrtrRequest, ResourceUpdatedSink, ServerRequestAction,
     ServerRequestHandler, StdioTransport, Transport,
     MODERN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
@@ -151,6 +151,34 @@ fn decorate_for_upstream(mut result: Value) -> Value {
             json!({ "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") }),
         );
     }
+    result
+}
+
+/// Toolport-owned cacheable results stay fresh for five minutes unless a
+/// contributing downstream server advertises a shorter window. Registry and
+/// list-changed notifications still invalidate them immediately.
+const LOCAL_CACHE_TTL_MS: u64 = 300_000;
+
+fn cacheable_for_upstream(mut result: Value, hint: CacheHint, scoped: bool) -> Value {
+    let Some(obj) = result.as_object_mut() else {
+        return result;
+    };
+    if !serving_modern_client() {
+        // A modern downstream may sit behind a legacy upstream. Keep the legacy
+        // result shape unchanged rather than leaking fields its revision lacks.
+        obj.remove("ttlMs");
+        obj.remove("cacheScope");
+        return result;
+    }
+    obj.insert("ttlMs".to_string(), json!(hint.remaining_ttl_ms()));
+    obj.insert(
+        "cacheScope".to_string(),
+        json!(if !scoped && hint.is_public() {
+            "public"
+        } else {
+            "private"
+        }),
+    );
     result
 }
 
@@ -1873,7 +1901,15 @@ struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
-    fn new(tools: Vec<Value>) -> Self {
+    fn new(mut tools: Vec<Value>) -> Self {
+        // Normalize both fresh and disk-cached catalogs. Without this, the first
+        // tools/list after restart could replay pre-SOU-454 incidental ordering
+        // until the background router build replaced it.
+        tools.sort_by(|left, right| {
+            left.get("name")
+                .and_then(Value::as_str)
+                .cmp(&right.get("name").and_then(Value::as_str))
+        });
         let search = CatalogSearchIndex::build(&tools);
         Self { tools, search }
     }
@@ -4236,6 +4272,9 @@ fn handle_request_with_cancel(
         declared.filter(|v| v.as_str() == MODERN_PROTOCOL_VERSION),
     );
     let _capabilities = UpstreamCapabilitiesGuard::enter(req);
+    // A profile-selected or per-client filtered catalog must never be shared
+    // across authorization contexts, even when every downstream says public.
+    let cache_scoped = profile.is_some() || allowed.is_some();
 
     match method {
         // Modern clients open here instead of handshaking. Servers MUST implement
@@ -4327,7 +4366,14 @@ fn handle_request_with_cancel(
                     "tools/list -> {} meta-tools (lazy discovery)",
                     tools.len()
                 ));
-                return Some(success(id, json!({ "tools": tools })));
+                return Some(success(
+                    id,
+                    cacheable_for_upstream(
+                        json!({ "tools": tools }),
+                        CacheHint::local(LOCAL_CACHE_TTL_MS),
+                        cache_scoped,
+                    ),
+                ));
             }
             // Grouped mode: the lazy meta-tools plus a per-server help_<server> browse
             // tool, so a weak model can pick a server by name instead of inventing a
@@ -4362,7 +4408,17 @@ fn handle_request_with_cancel(
                     tools.len(),
                     distinct_server_prefixes(&scoped).len()
                 ));
-                return Some(success(id, json!({ "tools": tools })));
+                return Some(success(
+                    id,
+                    cacheable_for_upstream(
+                        json!({ "tools": tools }),
+                        router
+                            .tools_cache_hint()
+                            .map(|hint| CacheHint::local(LOCAL_CACHE_TTL_MS).merge(hint))
+                            .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS)),
+                        cache_scoped,
+                    ),
+                ));
             }
             let mut tools = vec![status_tool_def(), fetch_result_tool_def()];
             if code_mode_enabled() {
@@ -4388,7 +4444,17 @@ fn handle_request_with_cancel(
                 tools.len(),
                 !cached.is_empty()
             ));
-            Some(success(id, json!({ "tools": tools })))
+            Some(success(
+                id,
+                cacheable_for_upstream(
+                    json!({ "tools": tools }),
+                    router
+                        .tools_cache_hint()
+                        .map(|hint| CacheHint::local(LOCAL_CACHE_TTL_MS).merge(hint))
+                        .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS)),
+                    cache_scoped,
+                ),
+            ))
         }
         "tools/call" => {
             let params = req.get("params");
@@ -4890,7 +4956,16 @@ fn handle_request_with_cancel(
                 });
             }
             gtrace(&format!("resources/list -> {} resources", resources.len()));
-            Some(success(id, json!({ "resources": resources })))
+            Some(success(
+                id,
+                cacheable_for_upstream(
+                    json!({ "resources": resources }),
+                    router
+                        .resources_cache_hint()
+                        .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS)),
+                    cache_scoped,
+                ),
+            ))
         }
         "resources/templates/list" => {
             let mut templates = router.aggregated_resource_templates();
@@ -4910,7 +4985,16 @@ fn handle_request_with_cancel(
             ));
             // Backward compatible: full aggregated list in one response (no
             // nextCursor), matching tools/resources/prompts list behavior.
-            Some(success(id, json!({ "resourceTemplates": templates })))
+            Some(success(
+                id,
+                cacheable_for_upstream(
+                    json!({ "resourceTemplates": templates }),
+                    router
+                        .resource_templates_cache_hint()
+                        .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS)),
+                    cache_scoped,
+                ),
+            ))
         }
         "resources/read" => {
             let params = req.get("params");
@@ -4957,7 +5041,11 @@ fn handle_request_with_cancel(
                             return Some(error(id, -32602, &msg));
                         }
                     }
-                    Some(success(id, result))
+                    let hint = CacheHint::from_result(&result);
+                    Some(success(
+                        id,
+                        cacheable_for_upstream(result, hint, cache_scoped),
+                    ))
                 }
                 // The error message is downstream-controlled and does not pass through
                 // inspect_result (it's a JSON-RPC error, not a content block), so
@@ -4983,7 +5071,16 @@ fn handle_request_with_cancel(
                 });
             }
             gtrace(&format!("prompts/list -> {} prompts", prompts.len()));
-            Some(success(id, json!({ "prompts": prompts })))
+            Some(success(
+                id,
+                cacheable_for_upstream(
+                    json!({ "prompts": prompts }),
+                    router
+                        .prompts_cache_hint()
+                        .unwrap_or_else(|| CacheHint::local(LOCAL_CACHE_TTL_MS)),
+                    cache_scoped,
+                ),
+            ))
         }
         "prompts/get" => {
             let params = req.get("params");
@@ -6552,7 +6649,15 @@ fn watch_tick(
     // A live downstream server that changed its own tool set (sent
     // tools/list_changed) sets this. Swap before acting so a notification
     // arriving mid-refresh is caught on the next tick rather than lost.
-    let downstream_changed = downstream_dirty.swap(0, Ordering::SeqCst);
+    let downstream_notified = downstream_dirty.swap(0, Ordering::SeqCst);
+    let cache_expired = {
+        let live = router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        live.expired_cache_kinds()
+    };
+    let downstream_changed = downstream_notified | cache_expired;
     let current = mtime(path);
     let file_changed = current != state.last_mtime;
     if !file_changed && downstream_changed == 0 {
@@ -6704,7 +6809,11 @@ fn watch_tick(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (**guard).clone()
             };
-            next.refresh_tools();
+            if downstream_notified & downstream::change::TOOLS != 0 {
+                next.refresh_tools();
+            } else {
+                next.refresh_stale_tools();
+            }
             let tools = next.aggregated_tools();
             *router
                 .lock()
@@ -6728,7 +6837,11 @@ fn watch_tick(
             };
             // Also refreshes resource templates (MCP has no separate templates
             // list_changed; they ride on resources/list_changed).
-            next.refresh_resources();
+            if downstream_notified & downstream::change::RESOURCES != 0 {
+                next.refresh_resources();
+            } else {
+                next.refresh_stale_resources();
+            }
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
@@ -6746,7 +6859,11 @@ fn watch_tick(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (**guard).clone()
             };
-            next.refresh_prompts();
+            if downstream_notified & downstream::change::PROMPTS != 0 {
+                next.refresh_prompts();
+            } else {
+                next.refresh_stale_prompts();
+            }
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
@@ -12460,6 +12577,65 @@ mod tests {
             Ok(())
         }
     }
+
+    struct CacheRoute;
+
+    impl conduit_lib::downstream::Transport for CacheRoute {
+        fn request(
+            &mut self,
+            method: &str,
+            params: Value,
+        ) -> Result<Value, conduit_lib::downstream::TransportError> {
+            let cached = |mut result: Value, ttl_ms: u64| {
+                result["ttlMs"] = json!(ttl_ms);
+                result["cacheScope"] = json!("public");
+                result
+            };
+            match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": { "resources": {}, "prompts": {} }
+                })),
+                "tools/list" => Ok(cached(json!({ "tools": [{ "name": "cached" }] }), 50_000)),
+                "resources/list" => Ok(cached(
+                    json!({ "resources": [{ "uri": "fixture://cached", "name": "cached" }] }),
+                    40_000,
+                )),
+                "resources/templates/list" => Ok(cached(
+                    json!({ "resourceTemplates": [{ "uriTemplate": "fixture://{id}" }] }),
+                    30_000,
+                )),
+                "resources/read" => Ok(cached(
+                    json!({ "contents": [{ "uri": params["uri"], "text": "cached" }] }),
+                    20_000,
+                )),
+                "prompts/list" => Ok(cached(
+                    json!({ "prompts": [{ "name": "cached" }] }),
+                    10_000,
+                )),
+                other => Err(conduit_lib::downstream::TransportError::Fatal(format!(
+                    "unexpected {other}"
+                ))),
+            }
+        }
+
+        fn notify(
+            &mut self,
+            _method: &str,
+            _params: Value,
+        ) -> Result<(), conduit_lib::downstream::TransportError> {
+            Ok(())
+        }
+    }
+
+    fn cache_router() -> Router {
+        let mut server = DownstreamServer::connect("cache".to_string(), Box::new(CacheRoute))
+            .unwrap();
+        server.load_resources_prompts();
+        let mut router = Router::new();
+        router.add(server);
+        router
+    }
     struct PagingRoute {
     body: String,
     }
@@ -15510,6 +15686,77 @@ mod tests {
     }
 
     #[test]
+    fn modern_cacheable_results_preserve_hints_and_scoping_fails_private() {
+        let reg = Registry::default();
+        let router = cache_router();
+        let guard = SearchGuard::default();
+        let confirm = ConfirmGuard::new();
+        let cases = [
+            ("tools/list", json!({}), 50_000_u64),
+            ("resources/list", json!({}), 40_000),
+            ("resources/templates/list", json!({}), 30_000),
+            ("resources/read", json!({ "uri": "fixture://cached" }), 20_000),
+            ("prompts/list", json!({}), 10_000),
+        ];
+
+        for (index, (method, params, max_ttl)) in cases.into_iter().enumerate() {
+            let response = handle_request(
+                &modern_req(index as i64 + 10, method, params),
+                &reg,
+                &router,
+                &[],
+                false,
+                None,
+                &guard,
+                &confirm,
+                None,
+                None,
+            )
+            .unwrap();
+            let result = &response["result"];
+            let ttl = result["ttlMs"].as_u64().unwrap_or_default();
+            assert!(ttl > 0 && ttl <= max_ttl, "{method} must preserve remaining TTL: {result}");
+            assert_eq!(result["cacheScope"], "public", "{method}: {result}");
+        }
+
+        let scoped = handle_request(
+            &modern_req(20, "tools/list", json!({})),
+            &reg,
+            &router,
+            &[],
+            false,
+            Some("client-profile"),
+            &guard,
+            &confirm,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(scoped["result"]["cacheScope"], "private");
+
+        let legacy = handle_request(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "resources/read",
+                "params": { "uri": "fixture://cached" }
+            }),
+            &reg,
+            &router,
+            &[],
+            false,
+            None,
+            &guard,
+            &confirm,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(legacy["result"].get("ttlMs").is_none());
+        assert!(legacy["result"].get("cacheScope").is_none());
+    }
+
+    #[test]
     fn legacy_clients_see_no_modern_fields() {
         // The no-regression guarantee for every client in the wild today: a
         // request without `_meta` gets a byte-identical response to before.
@@ -15526,6 +15773,8 @@ mod tests {
             "legacy results carry no _meta, got {}",
             resp["result"]
         );
+        assert!(resp["result"].get("ttlMs").is_none());
+        assert!(resp["result"].get("cacheScope").is_none());
 
         // ...and initialize still works, unchanged.
         let init = dispatch(&json!({

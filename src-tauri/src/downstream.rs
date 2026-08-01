@@ -320,6 +320,94 @@ fn choose_protocol_version(discovered: &Value) -> Option<String> {
 /// and opens with `initialize`. Toolport is dual-era, so it must drive both.
 pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 
+/// Conservative cache policy for one cacheable MCP result (SOU-454).
+///
+/// `expires_at` is absolute rather than a stored TTL so Toolport never resets a
+/// downstream server's freshness clock each time an upstream client asks for the
+/// aggregated result. `refresh_after` normally matches it; after a failed refresh
+/// it moves forward briefly to avoid retrying on every one-second watcher tick
+/// while the advertised remaining TTL correctly stays at zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheHint {
+    expires_at: Option<Instant>,
+    refresh_after: Option<Instant>,
+    public: bool,
+}
+
+impl Default for CacheHint {
+    fn default() -> Self {
+        Self {
+            expires_at: None,
+            refresh_after: None,
+            public: false,
+        }
+    }
+}
+
+impl CacheHint {
+    pub fn from_result(result: &Value) -> Self {
+        let ttl_ms = result.get("ttlMs").and_then(Value::as_u64).unwrap_or(0);
+        let now = Instant::now();
+        let expires_at = (ttl_ms > 0).then(|| now + Duration::from_millis(ttl_ms));
+        Self {
+            expires_at,
+            refresh_after: expires_at,
+            // Unknown, missing, or malformed values fail closed to private.
+            public: result.get("cacheScope").and_then(Value::as_str) == Some("public"),
+        }
+    }
+
+    pub fn local(ttl_ms: u64) -> Self {
+        let now = Instant::now();
+        let expires_at = (ttl_ms > 0).then(|| now + Duration::from_millis(ttl_ms));
+        Self {
+            expires_at,
+            refresh_after: expires_at,
+            public: true,
+        }
+    }
+
+    /// Most-conservative combination for an aggregated or paginated result.
+    pub fn merge(self, other: Self) -> Self {
+        let expires_at = match (self.expires_at, other.expires_at) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            _ => None,
+        };
+        let refresh_after = match (self.refresh_after, other.refresh_after) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            _ => None,
+        };
+        Self {
+            expires_at,
+            refresh_after,
+            public: self.public && other.public,
+        }
+    }
+
+    pub fn remaining_ttl_ms(&self) -> u64 {
+        self.expires_at
+            .and_then(|expires| expires.checked_duration_since(Instant::now()))
+            .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0)
+    }
+
+    pub fn is_public(&self) -> bool {
+        self.public
+    }
+
+    /// Only positive TTLs schedule polling. A zero/missing TTL means immediately
+    /// stale, but the protocol does not require clients to hammer the server; the
+    /// existing list-changed notification path remains the invalidation mechanism.
+    pub fn needs_refresh(&self) -> bool {
+        self.refresh_after.is_some_and(|at| Instant::now() >= at)
+    }
+
+    fn mark_stale_and_defer(&mut self) {
+        self.expires_at = None;
+        self.refresh_after = Some(Instant::now() + Duration::from_secs(30));
+    }
+}
+
 /// Error codes the 2026-07-28 allocation policy reserves for the specification
 /// (`-32020`..`-32099`). Their presence in a response is what identifies a modern
 /// server during the backward-compatibility probe.
@@ -3603,6 +3691,10 @@ pub struct DownstreamServer {
     /// MCP defines no separate templates list-change notification.
     pub resource_templates: Vec<Value>,
     pub prompts: Vec<Value>,
+    tool_cache_hint: CacheHint,
+    resource_cache_hint: CacheHint,
+    resource_template_cache_hint: CacheHint,
+    prompt_cache_hint: CacheHint,
     /// Whether the server's `initialize` advertised resources / prompts. The
     /// actual lists are fetched lazily via `load_resources_prompts`.
     caps_resources: bool,
@@ -3804,6 +3896,10 @@ impl DownstreamServer {
             resources: Vec::new(),
             resource_templates: Vec::new(),
             prompts: Vec::new(),
+            tool_cache_hint: listed.cache_hint,
+            resource_cache_hint: CacheHint::default(),
+            resource_template_cache_hint: CacheHint::default(),
+            prompt_cache_hint: CacheHint::default(),
             caps_resources,
             caps_prompts,
             caps_completions,
@@ -3956,24 +4052,44 @@ impl DownstreamServer {
     /// announced a `tools/list_changed`. Bounds the wait like the handshake so a
     /// hung server can't stall the refresh; on error the previous list is kept.
     pub fn refresh_tools(&mut self) {
+        self.refresh_tools_inner();
+    }
+
+    /// Refresh a positive-TTL catalog only once its downstream freshness window
+    /// expires. Notifications keep calling `refresh_tools` and therefore bypass
+    /// this check: they invalidate a still-fresh result immediately.
+    pub fn refresh_tools_if_stale(&mut self) {
+        if self.tool_cache_hint.needs_refresh() {
+            self.refresh_tools_inner();
+        }
+    }
+
+    fn refresh_tools_inner(&mut self) {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         match fetch_paginated_list(&mut *self.transport, "tools/list", "tools") {
             Ok(listed) if listed.warning.is_none() => {
+                self.tool_cache_hint = listed.cache_hint;
                 self.tools = if self.modern_http {
                     filter_modern_http_tools(&self.id, listed.items)
                 } else {
                     listed.items
                 };
             }
-            Ok(listed) => eprintln!(
-                "toolport: keeping server '{}' previous tool catalog after an incomplete refresh: {}",
-                self.id,
-                listed.warning.unwrap_or_default()
-            ),
-            Err(error) => eprintln!(
-                "toolport: keeping server '{}' previous tool catalog after refresh failed: {error}",
-                self.id
-            ),
+            Ok(listed) => {
+                self.tool_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous tool catalog after an incomplete refresh: {}",
+                    self.id,
+                    listed.warning.unwrap_or_default()
+                );
+            }
+            Err(error) => {
+                self.tool_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous tool catalog after refresh failed: {error}",
+                    self.id
+                );
+            }
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
@@ -3987,21 +4103,42 @@ impl DownstreamServer {
     /// separate `resources/templates/list_changed`; template catalogs change
     /// under the resources capability, so this is the protocol-aligned trigger.
     pub fn refresh_resources(&mut self) {
+        self.refresh_resources_inner();
+    }
+
+    pub fn refresh_resources_if_stale(&mut self) {
+        if self.resource_cache_hint.needs_refresh()
+            || self.resource_template_cache_hint.needs_refresh()
+        {
+            self.refresh_resources_inner();
+        }
+    }
+
+    fn refresh_resources_inner(&mut self) {
         if !self.caps_resources {
             return;
         }
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         match fetch_paginated_list(&mut *self.transport, "resources/list", "resources") {
-            Ok(listed) if listed.warning.is_none() => self.resources = listed.items,
-            Ok(listed) => eprintln!(
-                "toolport: keeping server '{}' previous resource catalog after an incomplete refresh: {}",
-                self.id,
-                listed.warning.unwrap_or_default()
-            ),
-            Err(error) => eprintln!(
-                "toolport: keeping server '{}' previous resource catalog after refresh failed: {error}",
-                self.id
-            ),
+            Ok(listed) if listed.warning.is_none() => {
+                self.resource_cache_hint = listed.cache_hint;
+                self.resources = listed.items;
+            }
+            Ok(listed) => {
+                self.resource_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous resource catalog after an incomplete refresh: {}",
+                    self.id,
+                    listed.warning.unwrap_or_default()
+                );
+            }
+            Err(error) => {
+                self.resource_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous resource catalog after refresh failed: {error}",
+                    self.id
+                );
+            }
         }
         // Templates share the resources capability and list-change signal.
         // Incomplete/failed traversal keeps the previous complete snapshot.
@@ -4010,16 +4147,25 @@ impl DownstreamServer {
             "resources/templates/list",
             "resourceTemplates",
         ) {
-            Ok(listed) if listed.warning.is_none() => self.resource_templates = listed.items,
-            Ok(listed) => eprintln!(
-                "toolport: keeping server '{}' previous resource-template catalog after an incomplete refresh: {}",
-                self.id,
-                listed.warning.unwrap_or_default()
-            ),
-            Err(error) => eprintln!(
-                "toolport: keeping server '{}' previous resource-template catalog after refresh failed: {error}",
-                self.id
-            ),
+            Ok(listed) if listed.warning.is_none() => {
+                self.resource_template_cache_hint = listed.cache_hint;
+                self.resource_templates = listed.items;
+            }
+            Ok(listed) => {
+                self.resource_template_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous resource-template catalog after an incomplete refresh: {}",
+                    self.id,
+                    listed.warning.unwrap_or_default()
+                );
+            }
+            Err(error) => {
+                self.resource_template_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous resource-template catalog after refresh failed: {error}",
+                    self.id
+                );
+            }
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
@@ -4028,21 +4174,40 @@ impl DownstreamServer {
     /// announced a `prompts/list_changed`. Mirrors [`refresh_tools`]; best-effort,
     /// and a no-op if the server never advertised prompts.
     pub fn refresh_prompts(&mut self) {
+        self.refresh_prompts_inner();
+    }
+
+    pub fn refresh_prompts_if_stale(&mut self) {
+        if self.prompt_cache_hint.needs_refresh() {
+            self.refresh_prompts_inner();
+        }
+    }
+
+    fn refresh_prompts_inner(&mut self) {
         if !self.caps_prompts {
             return;
         }
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         match fetch_paginated_list(&mut *self.transport, "prompts/list", "prompts") {
-            Ok(listed) if listed.warning.is_none() => self.prompts = listed.items,
-            Ok(listed) => eprintln!(
-                "toolport: keeping server '{}' previous prompt catalog after an incomplete refresh: {}",
-                self.id,
-                listed.warning.unwrap_or_default()
-            ),
-            Err(error) => eprintln!(
-                "toolport: keeping server '{}' previous prompt catalog after refresh failed: {error}",
-                self.id
-            ),
+            Ok(listed) if listed.warning.is_none() => {
+                self.prompt_cache_hint = listed.cache_hint;
+                self.prompts = listed.items;
+            }
+            Ok(listed) => {
+                self.prompt_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous prompt catalog after an incomplete refresh: {}",
+                    self.id,
+                    listed.warning.unwrap_or_default()
+                );
+            }
+            Err(error) => {
+                self.prompt_cache_hint.mark_stale_and_defer();
+                eprintln!(
+                    "toolport: keeping server '{}' previous prompt catalog after refresh failed: {error}",
+                    self.id
+                );
+            }
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
@@ -4064,6 +4229,7 @@ impl DownstreamServer {
                         self.id
                     );
                 }
+                self.resource_cache_hint = listed.cache_hint;
                 self.resources = listed.items;
             }
             if let Ok(listed) = fetch_paginated_list(
@@ -4077,6 +4243,7 @@ impl DownstreamServer {
                         self.id
                     );
                 }
+                self.resource_template_cache_hint = listed.cache_hint;
                 self.resource_templates = listed.items;
             }
         }
@@ -4090,6 +4257,7 @@ impl DownstreamServer {
                         self.id
                     );
                 }
+                self.prompt_cache_hint = listed.cache_hint;
                 self.prompts = listed.items;
             }
         }
@@ -4251,6 +4419,23 @@ impl DownstreamServer {
         self.caps_completions
     }
 
+    pub fn tool_cache_hint(&self) -> CacheHint {
+        self.tool_cache_hint
+    }
+
+    pub fn resource_cache_hint(&self) -> Option<CacheHint> {
+        self.caps_resources.then_some(self.resource_cache_hint)
+    }
+
+    pub fn resource_template_cache_hint(&self) -> Option<CacheHint> {
+        self.caps_resources
+            .then_some(self.resource_template_cache_hint)
+    }
+
+    pub fn prompt_cache_hint(&self) -> Option<CacheHint> {
+        self.caps_prompts.then_some(self.prompt_cache_hint)
+    }
+
     /// The protocol era and version this connection negotiated (SOU-445).
     pub fn era(&self) -> &Era {
         &self.era
@@ -4288,6 +4473,9 @@ fn extract_array(result: &Value, key: &str) -> Vec<Value> {
 
 struct PaginatedList {
     items: Vec<Value>,
+    /// Minimum remaining TTL and most-private scope across every page. A partial
+    /// traversal is always reset to the conservative zero/private policy.
+    cache_hint: CacheHint,
     /// Present when at least one page succeeded but traversal could not finish.
     /// Initial discovery may expose that useful prefix; refreshes keep the prior
     /// complete snapshot instead of replacing it with a partial catalog.
@@ -4307,11 +4495,13 @@ fn fetch_paginated_list(
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
     let started = Instant::now();
+    let mut cache_hint: Option<CacheHint> = None;
 
     for page_index in 0..MAX_LIST_PAGES {
         if page_index > 0 && started.elapsed() >= MAX_LIST_DURATION {
             return Ok(PaginatedList {
                 items,
+                cache_hint: CacheHint::default(),
                 warning: Some(format!(
                     "catalog traversal exceeded the {}-second safety cap",
                     MAX_LIST_DURATION.as_secs()
@@ -4326,11 +4516,18 @@ fn fetch_paginated_list(
             Err(error) if page_index > 0 => {
                 return Ok(PaginatedList {
                     items,
+                    cache_hint: CacheHint::default(),
                     warning: Some(format!("page {} failed: {error}", page_index + 1)),
                 });
             }
             Err(error) => return Err(error),
         };
+
+        let page_hint = CacheHint::from_result(&result);
+        cache_hint = Some(match cache_hint {
+            Some(current) => current.merge(page_hint),
+            None => page_hint,
+        });
 
         let page = extract_array(&result, key);
         let remaining = MAX_LIST_ITEMS.saturating_sub(items.len());
@@ -4338,6 +4535,7 @@ fn fetch_paginated_list(
             items.extend(page.into_iter().take(remaining));
             return Ok(PaginatedList {
                 items,
+                cache_hint: CacheHint::default(),
                 warning: Some(format!("catalog exceeded the {MAX_LIST_ITEMS}-item safety cap")),
             });
         }
@@ -4350,12 +4548,14 @@ fn fetch_paginated_list(
         else {
             return Ok(PaginatedList {
                 items,
+                cache_hint: cache_hint.unwrap_or_default(),
                 warning: None,
             });
         };
         if !seen_cursors.insert(next_cursor.clone()) {
             return Ok(PaginatedList {
                 items,
+                cache_hint: CacheHint::default(),
                 warning: Some("server repeated a pagination cursor".to_string()),
             });
         }
@@ -4364,6 +4564,7 @@ fn fetch_paginated_list(
 
     Ok(PaginatedList {
         items,
+        cache_hint: CacheHint::default(),
         warning: Some(format!("catalog exceeded the {MAX_LIST_PAGES}-page safety cap")),
     })
 }
@@ -4373,7 +4574,7 @@ mod tests {
     use super::{
         cwd_validation_error, empty_cwd_variables, expand_cwd, file_uri_to_path, resolve_command,
         resolve_root_token, screen_resolved_addrs, screen_spawn_command, screen_spawn_env,
-        validate_cwd, CancelRegistry, DownstreamServer, MrtrRequest, ServerRequestAction,
+        validate_cwd, CacheHint, CancelRegistry, DownstreamServer, MrtrRequest, ServerRequestAction,
         ServerRequestHandler, Transport, TransportError, MODERN_PROTOCOL_VERSION,
         fetch_paginated_list,
     };
@@ -4491,6 +4692,63 @@ mod tests {
     }
 
     #[test]
+    fn paginated_list_uses_the_shortest_ttl_and_most_private_scope() {
+        let mut transport = PaginationTransport::new(vec![
+            Ok(json!({
+                "tools": [{"name":"a"}],
+                "nextCursor": "two",
+                "ttlMs": 60_000,
+                "cacheScope": "public"
+            })),
+            Ok(json!({
+                "tools": [{"name":"b"}],
+                "ttlMs": 30_000,
+                "cacheScope": "private"
+            })),
+        ]);
+        let listed = fetch_paginated_list(&mut transport, "tools/list", "tools").unwrap();
+        assert_eq!(listed.items.len(), 2);
+        assert!(!listed.cache_hint.is_public());
+        let ttl = listed.cache_hint.remaining_ttl_ms();
+        assert!(ttl > 0 && ttl <= 30_000, "minimum page TTL should win: {ttl}");
+    }
+
+    #[test]
+    fn positive_ttl_refreshes_once_stale_but_zero_ttl_does_not_poll() {
+        let expiring = PaginationTransport::new(vec![
+            Ok(json!({ "capabilities": {} })),
+            Ok(json!({
+                "tools": [{"name":"old"}],
+                "ttlMs": 5,
+                "cacheScope": "public"
+            })),
+            Ok(json!({
+                "tools": [{"name":"fresh"}],
+                "ttlMs": 60_000,
+                "cacheScope": "public"
+            })),
+        ]);
+        let mut server = DownstreamServer::connect("ttl".to_string(), Box::new(expiring)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        server.refresh_tools_if_stale();
+        assert_eq!(server.tools[0]["name"], "fresh");
+
+        // No third scripted response: this panics if zero/missing TTL turns the
+        // one-second watcher into an unbounded polling loop.
+        let zero = PaginationTransport::new(vec![
+            Ok(json!({ "capabilities": {} })),
+            Ok(json!({
+                "tools": [{"name":"stable"}],
+                "ttlMs": 0,
+                "cacheScope": "private"
+            })),
+        ]);
+        let mut server = DownstreamServer::connect("zero".to_string(), Box::new(zero)).unwrap();
+        server.refresh_tools_if_stale();
+        assert_eq!(server.tools[0]["name"], "stable");
+    }
+
+    #[test]
     fn paginated_list_stops_on_a_repeated_cursor() {
         let mut transport = PaginationTransport::new(vec![
             Ok(json!({"resources":[{"uri":"one:"}],"nextCursor":"same"})),
@@ -4547,6 +4805,10 @@ mod tests {
             resources: Vec::new(),
             resource_templates: Vec::new(),
             prompts: Vec::new(),
+            tool_cache_hint: CacheHint::default(),
+            resource_cache_hint: CacheHint::default(),
+            resource_template_cache_hint: CacheHint::default(),
+            prompt_cache_hint: CacheHint::default(),
             caps_resources: false,
             caps_prompts: false,
             caps_completions: false,
@@ -4575,6 +4837,10 @@ mod tests {
             resources: vec![json!({"uri":"stable-r:"})],
             resource_templates: vec![json!({"uriTemplate":"stable://{id}"})],
             prompts: Vec::new(),
+            tool_cache_hint: CacheHint::default(),
+            resource_cache_hint: CacheHint::default(),
+            resource_template_cache_hint: CacheHint::default(),
+            prompt_cache_hint: CacheHint::default(),
             caps_resources: true,
             caps_prompts: false,
             caps_completions: false,
