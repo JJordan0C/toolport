@@ -483,7 +483,11 @@ fn header_gate(
             .and_then(Value::as_str),
         _ => None,
     };
-    if body_name.is_some() && header_name != body_name {
+    let requires_name = matches!(
+        body_method,
+        Some("tools/call") | Some("prompts/get") | Some("resources/read")
+    );
+    if requires_name && (body_name.is_none() || header_name != body_name) {
         return Some(error(
             id.clone(),
             HEADER_MISMATCH,

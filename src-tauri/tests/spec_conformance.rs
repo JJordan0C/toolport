@@ -606,13 +606,13 @@ fn http_fixture_enforces_header_body_agreement() {
     let parsed: Value = ok.into_json().expect("json body");
     assert!(parsed["result"]["tools"].is_array(), "got {parsed}");
 
-    let missing_method_body = json!({
+    let missing_method_header_body = json!({
         "jsonrpc": "2.0", "id": 2, "method": "tools/list",
         "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": MODERN } }
     });
     let missing_method = ureq::post(&fixture.url)
         .set("MCP-Protocol-Version", MODERN)
-        .send_json(missing_method_body);
+        .send_json(missing_method_header_body);
     assert!(
         matches!(missing_method, Err(ureq::Error::Status(400, _))),
         "a missing Mcp-Method must be rejected"
@@ -634,6 +634,22 @@ fn http_fixture_enforces_header_body_agreement() {
     assert!(
         matches!(wrong_name, Err(ureq::Error::Status(400, _))),
         "a mismatched Mcp-Name must be rejected"
+    );
+
+    let missing_name_body = json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {
+            "arguments": { "text": "hi" },
+            "_meta": { "io.modelcontextprotocol/protocolVersion": MODERN }
+        }
+    });
+    let missing_name = ureq::post(&fixture.url)
+        .set("MCP-Protocol-Version", MODERN)
+        .set("Mcp-Method", "tools/call")
+        .send_json(missing_name_body);
+    assert!(
+        matches!(missing_name, Err(ureq::Error::Status(400, _))),
+        "a missing routing name must be rejected"
     );
 }
 
