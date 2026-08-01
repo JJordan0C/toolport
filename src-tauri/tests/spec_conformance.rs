@@ -26,7 +26,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use conduit_lib::downstream::{
-    DownstreamServer, HttpTransport, StdioTransport, Transport, TransportError,
+    DownstreamServer, HttpTransport, MrtrRequest, ServerRequestAction, ServerRequestHandler,
+    StdioTransport, Transport, TransportError,
 };
 use serde_json::{json, Value};
 
@@ -559,6 +560,177 @@ fn gateway_connects_to_a_modern_server() {
         "expected the tools/list and tools/call records to be checked, saw {checked}"
     );
 
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn legacy_client_is_shimmed_across_a_modern_mrtr_server() {
+    let path = scratch_path("mrtr-legacy-shim");
+    let _ = std::fs::remove_file(&path);
+    let env = env_for(Some(MODERN), true, Some(&path.to_string_lossy()));
+    let dirty = Arc::new(AtomicU8::new(0));
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+        .expect("spawn fixture");
+    let mut server =
+        DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
+    let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_request = Arc::clone(&seen);
+    let handler: ServerRequestHandler = Arc::new(move |request| {
+        seen_request.lock().unwrap().push(request.clone());
+        Some(ServerRequestAction::Respond(json!({
+            "jsonrpc": "2.0",
+            "id": request["id"].clone(),
+            "result": { "action": "accept", "content": { "approved": true } }
+        })))
+    });
+    server.set_server_request_handler(handler);
+
+    let result = server
+        .call("mrtr_confirm", json!({}))
+        .expect("legacy compatibility shim should complete the call");
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["content"][0]["text"], "confirmed");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["method"], "elicitation/create");
+    drop(seen);
+    drop(server);
+
+    let transcript = read_transcript(&path);
+    let calls: Vec<&Value> = transcript
+        .iter()
+        .filter(|request| {
+            request["method"] == "tools/call"
+                && request["params"]["name"] == "mrtr_confirm"
+        })
+        .collect();
+    assert_eq!(calls.len(), 2, "MRTR retry must be a new request");
+    assert_ne!(calls[0]["id"], calls[1]["id"], "retry id must change");
+    assert_eq!(calls[1]["params"]["requestState"], "mock-state-byte-exact");
+    assert_eq!(
+        calls[1]["params"]["inputResponses"]["confirm"]["action"],
+        "accept"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn modern_client_controls_native_mrtr_retry_fields() {
+    let path = scratch_path("mrtr-native");
+    let _ = std::fs::remove_file(&path);
+    let env = env_for(Some(MODERN), true, Some(&path.to_string_lossy()));
+    let dirty = Arc::new(AtomicU8::new(0));
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+        .expect("spawn fixture");
+    let mut server =
+        DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
+    let meta = json!({ "io.modelcontextprotocol/protocolVersion": MODERN });
+
+    let incomplete = server
+        .call_with_cancel_and_mrtr("mrtr_confirm", json!({}), None, Some(&meta), None)
+        .expect("native MRTR first round");
+    assert_eq!(incomplete["resultType"], "input_required");
+    assert_eq!(incomplete["requestState"], "mock-state-byte-exact");
+
+    let retry = MrtrRequest {
+        input_responses: Some(json!({
+            "confirm": { "action": "accept", "content": { "approved": true } }
+        })),
+        request_state: Some(json!("mock-state-byte-exact")),
+    };
+    let complete = server
+        .call_with_cancel_and_mrtr(
+            "mrtr_confirm",
+            json!({}),
+            None,
+            Some(&meta),
+            Some(&retry),
+        )
+        .expect("native MRTR retry");
+    assert_eq!(complete["resultType"], "complete");
+    assert_eq!(complete["content"][0]["text"], "confirmed");
+    drop(server);
+
+    let transcript = read_transcript(&path);
+    let calls: Vec<&Value> = transcript
+        .iter()
+        .filter(|request| {
+            request["method"] == "tools/call"
+                && request["params"]["name"] == "mrtr_confirm"
+        })
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert_ne!(calls[0]["id"], calls[1]["id"]);
+    assert_eq!(calls[1]["params"]["requestState"], retry.request_state.unwrap());
+    assert_eq!(calls[1]["params"]["inputResponses"], retry.input_responses.unwrap());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn modern_client_resumes_legacy_stdio_hitl_without_replaying_the_tool() {
+    let path = scratch_path("mrtr-legacy-downstream");
+    let _ = std::fs::remove_file(&path);
+    let env = env_for(Some("2025-11-25"), true, Some(&path.to_string_lossy()));
+    let dirty = Arc::new(AtomicU8::new(0));
+    let transport = StdioTransport::spawn_watched(mock_bin(), &[], &env, None, dirty, None)
+        .expect("spawn legacy fixture");
+    let mut server =
+        DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
+    server.set_server_request_handler(Arc::new(|request| {
+        (request["method"] == "elicitation/create").then_some(ServerRequestAction::InputRequired)
+    }));
+    let meta = json!({ "io.modelcontextprotocol/protocolVersion": MODERN });
+
+    let incomplete = server
+        .call_with_cancel_and_mrtr(
+            "legacy_elicitation",
+            json!({}),
+            None,
+            Some(&meta),
+            None,
+        )
+        .expect("legacy server request should become MRTR");
+    assert_eq!(incomplete["resultType"], "input_required");
+    let state = incomplete["requestState"].clone();
+    let requests = incomplete["inputRequests"]
+        .as_object()
+        .expect("inputRequests map");
+    assert_eq!(requests.len(), 1);
+    let key = requests.keys().next().unwrap().clone();
+    assert_eq!(requests[&key]["method"], "elicitation/create");
+
+    let retry = MrtrRequest {
+        input_responses: Some(json!({
+            key: { "action": "accept", "content": { "approved": true } }
+        })),
+        request_state: Some(state),
+    };
+    let complete = server
+        .call_with_cancel_and_mrtr(
+            "legacy_elicitation",
+            json!({}),
+            None,
+            Some(&meta),
+            Some(&retry),
+        )
+        .expect("MRTR retry should resume the suspended legacy request");
+    assert_eq!(complete["content"][0]["text"], "legacy confirmed");
+    drop(server);
+
+    let transcript = read_transcript(&path);
+    let calls: Vec<&Value> = transcript
+        .iter()
+        .filter(|request| {
+            request["method"] == "tools/call"
+                && request["params"]["name"] == "legacy_elicitation"
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "the modern retry must not replay tools/call");
+    let replies: Vec<&Value> = transcript
+        .iter()
+        .filter(|request| request["id"] == "mock-legacy-elicitation")
+        .collect();
+    assert_eq!(replies.len(), 1, "one input response resumes the legacy call");
     let _ = std::fs::remove_file(&path);
 }
 

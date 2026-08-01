@@ -118,6 +118,9 @@ struct State {
     grown: bool,
     /// Whether a legacy `initialize` has been seen. Only enforced in strict mode.
     initialized: bool,
+    /// Original legacy tools/call waiting for the client to answer a
+    /// server-initiated elicitation request.
+    pending_legacy_elicitation: Option<Value>,
 }
 
 fn success(id: Value, result: Value) -> Value {
@@ -152,7 +155,9 @@ fn decorate(cfg: &Config, method: &str, mut result: Value) -> Value {
     if !cfg.revision.is_modern() {
         return result;
     }
-    result["resultType"] = json!("complete");
+    if result.get("resultType").is_none() {
+        result["resultType"] = json!("complete");
+    }
     result["_meta"] = json!({
         META_SERVER_INFO: { "name": SERVER_NAME, "version": SERVER_VERSION }
     });
@@ -188,6 +193,10 @@ fn tool_list(cfg: &Config, grown: bool) -> Value {
         json!({ "name": "echo_meta", "description": "Return the request's params._meta verbatim.",
                 "inputSchema": { "type": "object", "properties": {} } }),
         json!({ "name": "progress_ping", "description": "Emit notifications/progress, then reply.",
+                "inputSchema": { "type": "object", "properties": {} } }),
+        json!({ "name": "mrtr_confirm", "description": "Require one elicitation round before replying.",
+                "inputSchema": { "type": "object", "properties": {} } }),
+        json!({ "name": "legacy_elicitation", "description": "Issue a legacy server-to-client elicitation request.",
                 "inputSchema": { "type": "object", "properties": {} } }),
     ];
     if grown {
@@ -291,6 +300,21 @@ fn era_gate(cfg: &Config, state: &State, method: &str, req: &Value, id: &Value) 
 fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) -> Option<Value> {
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
+    if method.is_empty()
+        && req.get("id") == Some(&json!("mock-legacy-elicitation"))
+        && req.get("result").is_some()
+    {
+        if let Some(call_id) = state.pending_legacy_elicitation.take() {
+            return Some(success(
+                call_id,
+                json!({
+                    "content": [{ "type": "text", "text": "legacy confirmed" }],
+                    "isError": false
+                }),
+            ));
+        }
+    }
+
     // Notifications carry no id and get no response, but still drive state.
     let id = match req.get("id") {
         Some(id) if !id.is_null() => id.clone(),
@@ -381,6 +405,62 @@ fn handle(cfg: &Config, state: &mut State, req: &Value, pre: &mut Vec<Value>) ->
                         "params": { "progressToken": token, "progress": 1, "total": 2 }
                     }));
                 }
+            }
+            if name == "mrtr_confirm" {
+                let accepted = params
+                    .and_then(|p| p.get("inputResponses"))
+                    .and_then(|r| r.get("confirm"))
+                    .and_then(|r| r.get("action"))
+                    .and_then(Value::as_str)
+                    == Some("accept");
+                let state_matches = params
+                    .and_then(|p| p.get("requestState"))
+                    .and_then(Value::as_str)
+                    == Some("mock-state-byte-exact");
+                let result = if accepted && state_matches {
+                    json!({
+                        "content": [{ "type": "text", "text": "confirmed" }],
+                        "isError": false
+                    })
+                } else {
+                    json!({
+                        "resultType": "input_required",
+                        "inputRequests": {
+                            "confirm": {
+                                "method": "elicitation/create",
+                                "params": {
+                                    "mode": "form",
+                                    "message": "Continue the mock operation?",
+                                    "requestedSchema": {
+                                        "type": "object",
+                                        "properties": { "approved": { "type": "boolean" } },
+                                        "required": ["approved"]
+                                    }
+                                }
+                            }
+                        },
+                        "requestState": "mock-state-byte-exact"
+                    })
+                };
+                return Some(success(id, decorate(cfg, method, result)));
+            }
+            if name == "legacy_elicitation" && !cfg.revision.is_modern() {
+                state.pending_legacy_elicitation = Some(id);
+                pre.push(json!({
+                    "jsonrpc": "2.0",
+                    "id": "mock-legacy-elicitation",
+                    "method": "elicitation/create",
+                    "params": {
+                        "mode": "form",
+                        "message": "Continue the legacy mock operation?",
+                        "requestedSchema": {
+                            "type": "object",
+                            "properties": { "approved": { "type": "boolean" } },
+                            "required": ["approved"]
+                        }
+                    }
+                }));
+                return None;
             }
             let text = match name {
                 "echo" => args.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
@@ -516,7 +596,11 @@ fn serve_http(cfg: &Config) {
     println!("MOCK_MCP_URL=http://127.0.0.1:{port}/mcp");
     let _ = std::io::stdout().flush();
 
-    let mut state = State { grown: false, initialized: false };
+    let mut state = State {
+        grown: false,
+        initialized: false,
+        pending_legacy_elicitation: None,
+    };
     for mut request in server.incoming_requests() {
         let header_version = request
             .headers()
@@ -584,7 +668,11 @@ fn main() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let mut state = State { grown: false, initialized: false };
+    let mut state = State {
+        grown: false,
+        initialized: false,
+        pending_legacy_elicitation: None,
+    };
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
