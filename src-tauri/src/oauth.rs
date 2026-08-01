@@ -294,6 +294,17 @@ fn agent_no_redirect(block_private: bool) -> ureq::Agent {
         .build()
 }
 
+/// Short-lived, no-redirect agent for the optional Bearer challenge probe.
+/// Discovery must not inherit the 30-second credential-exchange timeout when
+/// an older or unhealthy MCP endpoint does not answer the preflight request.
+fn challenge_probe_agent(block_private: bool) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(5))
+        .redirects(0)
+        .resolver(move |netloc: &str| screened_resolve(netloc, block_private))
+        .build()
+}
+
 fn get_json<T: serde::de::DeserializeOwned>(url: &str, block_private: bool) -> Result<T, String> {
     agent(block_private)
         .get(url)
@@ -645,7 +656,7 @@ fn probe_bearer_challenge(mcp_url: &str, block_private: bool) -> Option<BearerCh
             }
         }
     });
-    let response = agent_no_redirect(block_private)
+    let response = challenge_probe_agent(block_private)
         .post(mcp_url)
         .set("Content-Type", "application/json")
         .set("Accept", "application/json, text/event-stream")
