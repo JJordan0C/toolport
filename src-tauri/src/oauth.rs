@@ -267,7 +267,11 @@ fn validated_protected_resource(
     expected_resource: &str,
     metadata: ProtectedResource,
 ) -> Result<(String, Option<String>), String> {
-    if metadata.resource.as_deref() != Some(expected_resource) {
+    let resource = metadata.resource.ok_or_else(|| {
+        "protected-resource metadata has no resource identifier; refusing OAuth discovery"
+            .to_string()
+    })?;
+    if resource != expected_resource {
         return Err(
             "protected-resource metadata describes a different resource; refusing OAuth discovery"
                 .to_string(),
@@ -282,8 +286,15 @@ fn validated_protected_resource(
         })?;
     let scope = metadata
         .scopes_supported
-        .filter(|scopes| !scopes.is_empty())
-        .map(|scopes| scopes.join(" "));
+        .map(|scopes| {
+            scopes
+                .into_iter()
+                .map(|scope| scope.trim().to_string())
+                .filter(|scope| !scope.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|scope| !scope.is_empty());
     Ok((issuer, scope))
 }
 
@@ -506,7 +517,14 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
                     resource_scope = scope;
                     break;
                 }
-                Err(e) => debug_log(&format!("protected-resource metadata rejected at {url}: {e}")),
+                // A document was found and parsed, so rejecting its security
+                // binding must fail closed. Falling back to origin-level AS
+                // discovery here would silently bypass RFC 9728 validation.
+                Err(e) => {
+                    return Err(format!(
+                        "protected-resource metadata rejected at {url}: {e}"
+                    ))
+                }
             }
         }
     }
@@ -1348,6 +1366,23 @@ mod tests {
     }
 
     #[test]
+    fn protected_resource_metadata_normalizes_advertised_scopes() {
+        let metadata = ProtectedResource {
+            resource: Some("https://mcp.example.com/mcp".into()),
+            authorization_servers: Some(vec!["https://auth.example.com".into()]),
+            scopes_supported: Some(vec![
+                " files:read ".into(),
+                "".into(),
+                "  ".into(),
+                "files:write".into(),
+            ]),
+        };
+        let (_, scope) =
+            validated_protected_resource("https://mcp.example.com/mcp", metadata).unwrap();
+        assert_eq!(scope.as_deref(), Some("files:read files:write"));
+    }
+
+    #[test]
     fn protected_resource_scope_absence_does_not_expand_to_all_as_scopes() {
         assert_eq!(
             initial_scope(
@@ -1365,6 +1400,18 @@ mod tests {
 
     #[test]
     fn protected_resource_metadata_rejects_impersonation_and_empty_issuers() {
+        let missing_resource = ProtectedResource {
+            resource: None,
+            authorization_servers: Some(vec!["https://auth.example.com".into()]),
+            scopes_supported: None,
+        };
+        let error = validated_protected_resource(
+            "https://mcp.example.com/mcp",
+            missing_resource,
+        )
+        .unwrap_err();
+        assert!(error.contains("no resource identifier"));
+
         let wrong_resource = ProtectedResource {
             resource: Some("https://other.example.com/mcp".into()),
             authorization_servers: Some(vec!["https://auth.example.com".into()]),
@@ -1382,5 +1429,41 @@ mod tests {
             scopes_supported: None,
         };
         assert!(validated_protected_resource("https://mcp.example.com/mcp", no_issuer).is_err());
+    }
+
+    #[test]
+    fn discover_fails_closed_on_invalid_protected_resource_metadata() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let resource = format!("http://{address}");
+        let requested_paths = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requested_paths);
+        let handle = std::thread::spawn(move || {
+            while let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(250)) {
+                seen.lock().unwrap().push(request.url().to_string());
+                let response = tiny_http::Response::from_string(
+                    serde_json::json!({
+                        "authorization_servers": ["https://auth.example.com"]
+                    })
+                    .to_string(),
+                )
+                .with_header(
+                    tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap(),
+                );
+                request.respond(response).unwrap();
+            }
+        });
+
+        let error = discover(&resource).unwrap_err();
+        handle.join().unwrap();
+
+        assert!(error.contains("no resource identifier"));
+        assert_eq!(
+            requested_paths.lock().unwrap().as_slice(),
+            ["/.well-known/oauth-protected-resource"]
+        );
     }
 }
