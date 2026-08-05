@@ -4496,6 +4496,11 @@ fn read_gateway_profile(client_id: &str) -> Option<String> {
 /// Unlike [`repoint_stale_gateways`], customized entries are **included**. Repoint
 /// leaves them alone, but they still name a binary the user's client will spawn,
 /// which is exactly what must survive.
+///
+/// `plugin_servers` are included for the same reason, and more strongly: they live
+/// outside the main config, are managed by the client rather than by us, and so can
+/// never be re-pointed onto a current binary. Deleting one out from under a plugin
+/// entry leaves a reference nothing will ever repair.
 pub fn referenced_gateway_paths() -> Option<Vec<PathBuf>> {
     let mut out: Vec<PathBuf> = Vec::new();
     for client in detect_clients() {
@@ -4505,7 +4510,7 @@ pub fn referenced_gateway_paths() -> Option<Vec<PathBuf>> {
         if !client.config_exists {
             continue;
         }
-        for server in &client.servers {
+        for server in client.servers.iter().chain(client.plugin_servers.iter()) {
             if !gateway_identity_matches(&server.name, &server.name, server.command.as_deref()) {
                 continue;
             }
