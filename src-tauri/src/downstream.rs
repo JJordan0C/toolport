@@ -1271,16 +1271,28 @@ pub fn augmented_path() -> &'static str {
     })
 }
 
-/// The PATH a downstream child gets when its config does not set one.
+/// The PATH a downstream child would receive with no launcher rewrite in play.
+///
+/// Exists so prepending a resolved `node_modules/.bin` cannot change PATH
+/// precedence as a side effect: the two platforms already disagree about whether a
+/// server's own `env` PATH wins, and that disagreement must not additionally depend
+/// on whether the rewrite happened to succeed.
 #[cfg(windows)]
-fn default_child_path() -> String {
-    // Windows children inherit the gateway's PATH; there is no augmented_path()
-    // equivalent because .cmd shims and node installs are already on it.
-    std::env::var("PATH").unwrap_or_default()
+fn base_child_path(env: &[(String, String)]) -> String {
+    // Windows children inherit the gateway's PATH, and a configured PATH overrides
+    // it through `.envs()`. There is no augmented_path() equivalent because .cmd
+    // shims and node installs are already on the inherited PATH.
+    env.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
 }
 
 #[cfg(not(windows))]
-fn default_child_path() -> String {
+fn base_child_path(_env: &[(String, String)]) -> String {
+    // Non-Windows overwrites PATH with augmented_path() unconditionally, configured
+    // or not, so building on anything else here would silently drop the augmented
+    // entries (nvm/asdf/homebrew) for exactly the servers that got rewritten.
     augmented_path().to_string()
 }
 
@@ -2474,14 +2486,11 @@ impl StdioTransport {
         cmd.env("PATH", augmented_path());
         // Replacing the launcher means also replacing the PATH it set up: the
         // package's own `node_modules/.bin`. Servers that shell out to a sibling
-        // binary would otherwise stop finding it. Prepend rather than replace, and
-        // build on the server's own PATH when it configured one.
+        // binary would otherwise stop finding it. Prepend to whatever PATH the child
+        // would have received anyway, so a rewrite only ever ADDS an entry and never
+        // changes which PATH wins.
         if let Some(dir) = direct.as_ref().and_then(|d| d.bin_dir.as_ref()) {
-            let base = env
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
-                .map(|(_, v)| v.clone())
-                .unwrap_or_else(default_child_path);
+            let base = base_child_path(env);
             let mut merged = dir.to_string_lossy().into_owned();
             if !base.is_empty() {
                 merged.push(if cfg!(windows) { ';' } else { ':' });
@@ -5577,6 +5586,37 @@ mod tests {
         std::env::remove_var(&secret);
         std::env::remove_var(&secret_new);
         std::env::remove_var(&keep);
+    }
+
+    /// Prepending a launcher's `node_modules/.bin` must not also decide whether a
+    /// server's configured PATH wins.
+    ///
+    /// The two platforms already disagree: Windows lets a configured PATH through
+    /// via `.envs()`, while `spawn_inner` overwrites PATH with `augmented_path()`
+    /// unconditionally on everything else. An earlier version of the rewrite always
+    /// preferred the configured PATH, so on non-Windows a server that set PATH
+    /// silently lost the augmented nvm/asdf/homebrew entries - but only when the
+    /// rewrite happened to succeed, which is the worst kind of conditional.
+    #[test]
+    fn a_launcher_rewrite_does_not_change_which_path_wins() {
+        let configured = vec![("PATH".to_string(), "/configured/only".to_string())];
+        let base = super::base_child_path(&configured);
+        // `augmented_path` only exists off Windows, so this splits at compile time
+        // rather than with a runtime `cfg!`.
+        #[cfg(windows)]
+        assert_eq!(
+            base, "/configured/only",
+            "Windows passes a configured PATH to the child, so it is the base"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            base,
+            super::augmented_path(),
+            "non-Windows overwrites PATH regardless, so the rewrite must build on that"
+        );
+        // With nothing configured, both platforms land on the same PATH the child
+        // would have received with no rewrite at all.
+        assert!(!super::base_child_path(&[]).is_empty());
     }
 
     /// Verify that a downstream server spawned with process-group isolation lands

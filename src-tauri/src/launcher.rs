@@ -189,7 +189,9 @@ fn parse_launcher(command: &str, args: &[String]) -> Option<LauncherPlan> {
                 if package_flag.is_some() {
                     return None;
                 }
-                package_flag = Some(a.trim_start_matches("--package=").to_string());
+                // strip_prefix, not trim_start_matches: the latter strips every
+                // repeat, so `--package=--package=pkg` would parse as `pkg`.
+                package_flag = Some(a.strip_prefix("--package=")?.to_string());
                 i += 1;
             }
             // -c/--call, --node-arg/-n, --shell, --loglevel, anything unknown.
@@ -520,10 +522,14 @@ fn resolve_shim(command: &str, args: &[String], node: &Path) -> Option<DirectSpa
     }
     let text = std::fs::read_to_string(path).ok()?;
     let dir = path.parent()?;
+    // A shim lives in `node_modules/.bin` (or a global bin dir) and climbs one level
+    // to reach its package, so containment is enforced against the parent rather
+    // than the shim's own directory.
+    let contains = dir.parent().unwrap_or(dir).to_path_buf();
     let mut found: Option<PathBuf> = None;
     for candidate in shim_script_candidates(&text) {
         let script = safe_join_shim(dir, &candidate)?;
-        if script.is_file() && is_js(&script) {
+        if script.starts_with(&contains) && script.is_file() && is_js(&script) {
             if found.as_ref().is_some_and(|f| *f != script) {
                 return None; // ambiguous shim; let cmd.exe sort it out
             }
@@ -561,8 +567,11 @@ fn shim_script_candidates(text: &str) -> Vec<String> {
 }
 
 /// Like [`safe_join`] but tolerates the `..` npm shims legitimately use to climb from
-/// `node_modules/.bin` to the package. The result is still required to be a real file
-/// under the same `node_modules`, which is checked by the caller.
+/// `node_modules/.bin` to the package.
+///
+/// This function itself allows unbounded `..`; containment is the caller's job.
+/// [`resolve_shim`] requires the result to sit under the shim directory's parent and
+/// to be a real `.js` file.
 fn safe_join_shim(dir: &Path, relative: &str) -> Option<PathBuf> {
     let mut out = dir.to_path_buf();
     for part in relative.split(['\\', '/']) {
@@ -896,6 +905,87 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\..\to
     fn a_shim_with_no_script_path_yields_nothing() {
         assert!(shim_script_candidates("@ECHO off\r\nnpm.cmd %*\r\n").is_empty());
         assert!(shim_script_candidates("").is_empty());
+    }
+
+    /// Build a `.bin` directory holding `shim.cmd` plus the given sibling scripts,
+    /// and return the shim's absolute path. `resolve_command` passes an absolute
+    /// path through untouched on both platforms, so this drives `resolve_shim` for
+    /// real rather than through PATH lookup.
+    fn shim_fixture(fx: &Fixture, body: &str, scripts: &[&str]) -> String {
+        let bin = fx.root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        for script in scripts {
+            let path = super::safe_join_shim(&bin, script).expect("script path");
+            std::fs::create_dir_all(path.parent().unwrap()).expect("script parent");
+            std::fs::write(&path, "// entry\n").expect("script");
+        }
+        let shim = bin.join("shim.cmd");
+        std::fs::write(&shim, body).expect("shim");
+        shim.to_string_lossy().into_owned()
+    }
+
+    /// The shim path end to end. The isolated `shim_script_candidates` /
+    /// `safe_join_shim` assertions keep passing if `resolve_shim` stops consulting
+    /// them, so the ambiguity refusal and the extension gate need driving for real.
+    #[test]
+    fn a_well_formed_shim_resolves_to_its_script() {
+        let fx = Fixture::new("shim-ok");
+        let node = fx.node();
+        let shim = shim_fixture(
+            &fx,
+            "@ECHO off\r\n\"%_prog%\"  \"%dp0%\\..\\pkg\\bin\\cli.js\" %*\r\n",
+            &["..\\pkg\\bin\\cli.js"],
+        );
+
+        let direct = resolve_shim(&shim, &s(&["--flag"]), &node).expect("shim must resolve");
+        assert_eq!(direct.command, node.to_string_lossy());
+        assert!(direct.args[0].replace('\\', "/").ends_with("pkg/bin/cli.js"));
+        assert_eq!(direct.args[1], "--flag", "shim args pass through");
+    }
+
+    #[test]
+    fn an_ambiguous_shim_refuses_to_guess() {
+        let fx = Fixture::new("shim-ambiguous");
+        let node = fx.node();
+        // Two different existing .js targets: which one cmd.exe would pick depends on
+        // batch control flow we are not interpreting, so rewriting is not safe.
+        let shim = shim_fixture(
+            &fx,
+            "@ECHO off\r\n\"%dp0%\\..\\pkg\\bin\\one.js\"\r\n\"%dp0%\\..\\pkg\\bin\\two.js\"\r\n",
+            &["..\\pkg\\bin\\one.js", "..\\pkg\\bin\\two.js"],
+        );
+
+        assert!(resolve_shim(&shim, &[], &node).is_none());
+    }
+
+    /// A shim that climbs out of its own `node_modules` is refused, matching what
+    /// `safe_join_shim`'s doc comment says the caller enforces.
+    #[test]
+    fn a_shim_escaping_its_node_modules_is_refused() {
+        let fx = Fixture::new("shim-escape");
+        let node = fx.node();
+        let outside = fx.root.join("outside.js");
+        std::fs::write(&outside, "// not ours\n").expect("decoy");
+
+        let shim = shim_fixture(
+            &fx,
+            "@ECHO off\r\n\"%dp0%\\..\\..\\outside.js\" %*\r\n",
+            &[],
+        );
+        assert!(outside.is_file(), "the decoy must exist for this to prove anything");
+        assert!(resolve_shim(&shim, &[], &node).is_none());
+    }
+
+    #[test]
+    fn a_shim_naming_a_non_javascript_target_is_refused() {
+        let fx = Fixture::new("shim-nonjs");
+        let node = fx.node();
+        let shim = shim_fixture(
+            &fx,
+            "@ECHO off\r\n\"%dp0%\\..\\pkg\\bin\\cli.sh\" %*\r\n",
+            &["..\\pkg\\bin\\cli.sh"],
+        );
+        assert!(resolve_shim(&shim, &[], &node).is_none());
     }
 
     #[test]
