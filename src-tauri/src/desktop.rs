@@ -4438,19 +4438,59 @@ mod tests {
         );
     }
 
+    /// A second live pid, for union cases that need two distinct surviving entries.
+    /// Killed by the caller; the merge only ever asks whether the pid is running.
+    fn spawn_live_child() -> std::process::Child {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/c", "ping", "-n", "30", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a short-lived helper process")
+    }
+
+    /// Union across SEPARATE passes is the behaviour `RestartAdvice` exists for:
+    /// the delayed launch pass must add what it finds without discarding what the
+    /// first pass already recorded.
     #[test]
-    fn merge_unions_new_apps_and_keeps_one_row_per_app() {
+    fn merge_unions_apps_found_by_different_passes() {
+        let advice = RestartAdvice::default();
+        let mut child = spawn_live_child();
+        let other_pid = child.id();
+
+        let first = advice.merge(vec![advice_entry(live_pid(), "claude.exe")]);
+        assert_eq!(first.len(), 1);
+
+        // A later pass finds a genuinely different app. Both must survive.
+        let merged = advice.merge(vec![advice_entry(other_pid, "grok.exe")]);
+        let mut names: Vec<&str> = merged.iter().map(|c| c.client.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["claude.exe", "grok.exe"],
+            "a later pass adds to the advice instead of replacing it"
+        );
+
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    #[test]
+    fn merge_keeps_one_row_per_app() {
         let advice = RestartAdvice::default();
         let pid = live_pid();
 
         advice.merge(vec![advice_entry(pid, "claude.exe")]);
-        // A later pass sees a different app; both must be present.
+        // The same app seen by a later pass is still one restart to perform.
         let merged = advice.merge(vec![advice_entry(pid, "claude.exe")]);
-        assert_eq!(
-            merged.len(),
-            1,
-            "the same app seen twice is still one restart to perform"
-        );
+        assert_eq!(merged.len(), 1);
 
         // Same app, second obsolete gateway: still one thing for the user to do.
         let mut second_gateway = advice_entry(pid, "claude.exe");

@@ -342,23 +342,34 @@ fn basename_from_exe_link(path: &Path) -> String {
         .unwrap_or_else(|| cleaned.to_string())
 }
 
-/// Parse one line of `ps -ax -o pid= -o ucomm=` (or `comm=`) into `(pid, name)`.
+/// Parse one line of `ps -ax -o pid= -o ppid= -o ucomm=` into `(pid, ppid, name)`.
+///
 /// Pure helper for the macOS enumerator line format. Does **not** prove the `ps`
 /// argv itself is correct — a broken `-axo pid= comm=` still needs a macOS
 /// smoke / CI job (WS4-1 / WS4-8).
+///
+/// Both leading columns are required. A row missing the ppid column must fail
+/// rather than slide the name left, which is how a wrong `-o` argv would quietly
+/// produce nonsense parent attributions instead of an empty list (SOU-435).
+///
+/// Compiled under `test` on every platform, not just macOS, so the parser is
+/// covered on the machines that actually run the suite. Gating it to macOS alone
+/// is how the previous attempt ended up with a test that only ran where the bug
+/// could not appear.
 #[cfg(any(target_os = "macos", test))]
-fn parse_ps_pid_name_line(line: &str) -> Option<(u32, String)> {
+fn parse_ps_pid_ppid_name_line(line: &str) -> Option<(u32, u32, String)> {
     let line = line.trim();
     if line.is_empty() {
         return None;
     }
     let mut parts = line.split_whitespace();
     let pid = parts.next()?.parse().ok()?;
+    let ppid = parts.next()?.parse().ok()?;
     let name = parts.collect::<Vec<_>>().join(" ");
     if name.is_empty() {
         return None;
     }
-    Some((pid, name))
+    Some((pid, ppid, name))
 }
 
 /// True only for names like `toolport-gateway-1.9.4`, not `toolport-gateway-shim`.
@@ -778,10 +789,15 @@ pub fn pid_is_running(pid: u32) -> bool {
         // only the first means gone. They are told apart by stderr because the exit
         // code alone cannot: treating EPERM as gone would expire advice for a live
         // app, the exact direction this function must not fail in.
+        //
+        // LC_ALL=C pins that stderr to English. Without it a non-English locale
+        // makes the match fail, which reports a live app as gone and silently drops
+        // its restart advice - the same failure the stderr check exists to avoid.
         #[cfg(target_os = "macos")]
         {
             match std::process::Command::new("kill")
                 .args(["-0", &pid.to_string()])
+                .env("LC_ALL", "C")
                 .output()
             {
                 Ok(out) if out.status.success() => true,
@@ -1144,26 +1160,6 @@ fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
     procs
 }
 
-/// Parse one `ps -o pid= -o ppid= -o ucomm=` row.
-///
-/// Both leading columns are required. A row missing the ppid column must fail
-/// rather than slide the name left, which is how a wrong `-o` argv would quietly
-/// produce nonsense parent attributions instead of an empty list (SOU-435).
-#[cfg(target_os = "macos")]
-fn parse_ps_pid_ppid_name_line(line: &str) -> Option<(u32, u32, String)> {
-    let line = line.trim();
-    if line.is_empty() {
-        return None;
-    }
-    let mut parts = line.split_whitespace();
-    let pid = parts.next()?.parse().ok()?;
-    let ppid = parts.next()?.parse().ok()?;
-    let name = parts.collect::<Vec<_>>().join(" ");
-    if name.is_empty() {
-        return None;
-    }
-    Some((pid, ppid, name))
-}
 
 /// Full executable path for a pid via libproc (handles spaces and symlinks).
 #[cfg(target_os = "macos")]
@@ -1646,28 +1642,40 @@ mod tests {
         );
     }
 
-    /// WS4-1 / WS4-8: pure parse of `ps -o pid= -o ucomm=` lines (including padded pid).
-    /// Does not prove the `ps` argv itself — that still needs a macOS smoke.
+    /// WS4-1 / WS4-8: pure parse of `ps -o pid= -o ppid= -o ucomm=` rows.
+    /// Does not prove the `ps` argv itself - that still needs a macOS smoke.
     #[test]
-    fn parse_ps_pid_name_line_accepts_padded_pid_and_ucomm() {
+    fn parse_ps_pid_ppid_name_line_accepts_padded_columns_and_ucomm() {
         assert_eq!(
-            parse_ps_pid_name_line("  123 toolport-gateway"),
-            Some((123, "toolport-gateway".into()))
+            parse_ps_pid_ppid_name_line("  123   1 toolport-gateway"),
+            Some((123, 1, "toolport-gateway".into()))
         );
         assert_eq!(
-            parse_ps_pid_name_line("45678 toolport-gateway-1.9.4"),
-            Some((45678, "toolport-gateway-1.9.4".into()))
+            parse_ps_pid_ppid_name_line("45678 4321 toolport-gateway-1.9.4"),
+            Some((45678, 4321, "toolport-gateway-1.9.4".into()))
         );
-        assert_eq!(parse_ps_pid_name_line(""), None);
-        assert_eq!(parse_ps_pid_name_line("not-a-pid toolport-gateway"), None);
-        assert_eq!(parse_ps_pid_name_line("99"), None);
+        assert_eq!(parse_ps_pid_ppid_name_line(""), None);
+        assert_eq!(parse_ps_pid_ppid_name_line("not-a-pid 1 toolport-gateway"), None);
+        // A missing ppid column must not be read as the name, which is how a wrong
+        // `-o` argv would silently produce nonsense parents rather than nothing.
+        assert_eq!(parse_ps_pid_ppid_name_line("99 toolport-gateway"), None);
+        assert_eq!(parse_ps_pid_ppid_name_line("99 1"), None);
+        assert_eq!(parse_ps_pid_ppid_name_line("99"), None);
         // Full-path comm= style still parses; basename filter is applied by the caller.
         assert_eq!(
-            parse_ps_pid_name_line("  42 /Applications/Toolport.app/Contents/MacOS/toolport-gateway"),
+            parse_ps_pid_ppid_name_line(
+                "  42 7 /Applications/Toolport.app/Contents/MacOS/toolport-gateway"
+            ),
             Some((
                 42,
+                7,
                 "/Applications/Toolport.app/Contents/MacOS/toolport-gateway".into()
             ))
+        );
+        // A name with spaces survives, since only the first two columns are positional.
+        assert_eq!(
+            parse_ps_pid_ppid_name_line("5 2 Some App Helper"),
+            Some((5, 2, "Some App Helper".into()))
         );
     }
 
