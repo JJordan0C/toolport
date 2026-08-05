@@ -1271,6 +1271,19 @@ pub fn augmented_path() -> &'static str {
     })
 }
 
+/// The PATH a downstream child gets when its config does not set one.
+#[cfg(windows)]
+fn default_child_path() -> String {
+    // Windows children inherit the gateway's PATH; there is no augmented_path()
+    // equivalent because .cmd shims and node installs are already on it.
+    std::env::var("PATH").unwrap_or_default()
+}
+
+#[cfg(not(windows))]
+fn default_child_path() -> String {
+    augmented_path().to_string()
+}
+
 #[cfg(not(windows))]
 pub fn resolve_command(command: &str) -> String {
     if command.contains('/') {
@@ -2424,6 +2437,18 @@ impl StdioTransport {
         // never reaches a process.
         screen_spawn_command(command, args)?;
         screen_spawn_env(env)?;
+        // Collapse an `npx`/`.cmd`-shim chain to the `node <entry>` it would have
+        // ended at. On Windows that is 4 processes down to 1 per server; the shims
+        // do no work beyond holding pipes open. Anything not provably equivalent
+        // resolves to None and spawns unchanged. Re-screen the rewrite: the guard
+        // must judge what actually runs, not only what was configured, and a refusal
+        // falls back to the original rather than failing the spawn.
+        let direct = crate::launcher::resolve_direct(command, args)
+            .filter(|d| screen_spawn_command(&d.command, &d.args).is_ok());
+        let (command, args) = match &direct {
+            Some(d) => (d.command.as_str(), d.args.as_slice()),
+            None => (command, args),
+        };
         let resolved = resolve_command(command);
         let mut cmd = Command::new(&resolved);
         cmd.args(args)
@@ -2447,6 +2472,23 @@ impl StdioTransport {
         // Give the child the augmented PATH too, so e.g. `npx` can find `node`.
         #[cfg(not(windows))]
         cmd.env("PATH", augmented_path());
+        // Replacing the launcher means also replacing the PATH it set up: the
+        // package's own `node_modules/.bin`. Servers that shell out to a sibling
+        // binary would otherwise stop finding it. Prepend rather than replace, and
+        // build on the server's own PATH when it configured one.
+        if let Some(dir) = direct.as_ref().and_then(|d| d.bin_dir.as_ref()) {
+            let base = env
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(default_child_path);
+            let mut merged = dir.to_string_lossy().into_owned();
+            if !base.is_empty() {
+                merged.push(if cfg!(windows) { ';' } else { ':' });
+                merged.push_str(&base);
+            }
+            cmd.env("PATH", merged);
+        }
         // Isolate each downstream server in its own process group so terminal
         // job-control signals (SIGTTIN/SIGTTOU) generated during the child's
         // startup or runtime cannot propagate to the gateway's own process

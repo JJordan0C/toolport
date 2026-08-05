@@ -41,6 +41,16 @@ Entries before the rename below shipped under the project's former name, Conduit
   `resources/list`. Negotiated app HTML stays byte-faithful for the host's sandbox
   and CSP enforcement, while app-only tools stay out of model-facing search and
   nested-call paths. (SOU-453)
+- Servers launched with `npx` now start about four times fewer processes. An
+  `npx -y some-server` config expanded to a four-process chain on Windows — a
+  `cmd.exe`, the `npx` wrapper, the package's own `.cmd` shim, and finally the
+  server — where only the last one did any work; on one machine that came to
+  roughly 423 processes for 72 servers. Toolport now finds the entry point `npx`
+  would have run and starts it directly. Anything it cannot resolve confidently,
+  including a version range or a `@latest` tag, still runs through `npx` exactly
+  as before. Because this skips the install step, a server stays on the version
+  already in the npm cache instead of quietly picking up a newer release; set
+  `TOOLPORT_NO_DIRECT_SPAWN=1` to restore the old behavior. (SOU-550)
 
 ### Security
 

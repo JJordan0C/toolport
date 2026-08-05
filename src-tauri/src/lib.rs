@@ -13,6 +13,7 @@ pub mod gateway_publish;
 pub mod inspect;
 pub mod instructions;
 pub mod integrity;
+pub mod launcher;
 pub mod metrics;
 pub mod oauth;
 pub mod rate_limits;
