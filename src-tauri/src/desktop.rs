@@ -2899,6 +2899,22 @@ fn log_reap_outcome(kind: &str, outcome: &ReapOutcome) {
     }
 }
 
+/// Entries whose client has not already been announced.
+///
+/// A later pass reads the merged advice, which by design still holds everything an
+/// earlier pass found, so it must be filtered before it becomes a second toast for
+/// the same app. Pure so the "only new clients interrupt the user" rule is pinned by
+/// a test rather than by the shape of a closure.
+fn unannounced(
+    already: &[u32],
+    current: Vec<crate::gateway_publish::ClientNeedingRestart>,
+) -> Vec<crate::gateway_publish::ClientNeedingRestart> {
+    current
+        .into_iter()
+        .filter(|c| !already.contains(&c.client_pid))
+        .collect()
+}
+
 /// Tell the frontend which apps need restarting, if any.
 fn announce_restart_needed(
     handle: &tauri::AppHandle,
@@ -3545,6 +3561,13 @@ pub fn run() {
                 );
                 log_reap_outcome("stale reaper", &stale);
                 announce_restart_needed(&migrate_handle, &stale.needs_restart);
+                // What the user has already been told about. The delayed pass reads
+                // the MERGED list, which by design still contains everything the
+                // first pass found, so announcing it wholesale would toast the same
+                // apps twice three seconds apart. Only genuinely new clients are
+                // worth interrupting for; the Settings panel is the durable view.
+                let already_announced: Vec<u32> =
+                    stale.needs_restart.iter().map(|c| c.client_pid).collect();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(3));
                     let again = reap_stale_and_restore_bridge(
@@ -3552,7 +3575,8 @@ pub fn run() {
                         migrate_handle.state::<RestartAdvice>().inner(),
                     );
                     log_reap_outcome("delayed reaper", &again);
-                    announce_restart_needed(&migrate_handle, &again.needs_restart);
+                    let newly_found = unannounced(&already_announced, again.needs_restart);
+                    announce_restart_needed(&migrate_handle, &newly_found);
                 });
             });
 
@@ -4462,5 +4486,31 @@ mod tests {
         ]);
         assert_eq!(merged.len(), 1, "only the restarted app drops out");
         assert_eq!(merged[0].client, "claude.exe");
+    }
+
+    /// The delayed launch pass reads the merged advice, so without this filter the
+    /// same app would toast twice three seconds apart (Copilot review, PR #622).
+    #[test]
+    fn only_newly_seen_clients_are_announced_again() {
+        let first = advice_entry(101, "claude.exe");
+        let second = advice_entry(202, "grok.exe");
+        let already = vec![first.client_pid];
+
+        // The delayed pass sees the merged list: the first app plus a new one.
+        let merged = vec![first.clone(), second.clone()];
+        assert_eq!(
+            unannounced(&already, merged),
+            vec![second],
+            "only the app the user has not been told about interrupts them again"
+        );
+
+        // Nothing new raced in: the merged list is entirely old news.
+        assert!(
+            unannounced(&already, vec![first]).is_empty(),
+            "re-announcing stored advice would double-toast the same app"
+        );
+
+        // Nothing announced yet (an empty first pass): everything is new.
+        assert_eq!(unannounced(&[], vec![advice_entry(303, "cursor.exe")]).len(), 1);
     }
 }

@@ -1316,9 +1316,15 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                     );
                   }
                   setReapResult(
-                    parts.length === 0
-                      ? "No old gateway processes found."
-                      : parts.join(". "),
+                    parts.length > 0
+                      ? parts.join(". ")
+                      : outcome.needsRestart.length > 0
+                        ? // Saying "found nothing" while the panel below names an
+                          // app still launching an old gateway would be the same
+                          // self-contradiction this panel exists to prevent. None
+                          // are running *now*; the panel explains they come back.
+                          "No old gateway processes are running right now."
+                        : "No old gateway processes found.",
                   );
                 } catch (e) {
                   toastError(`Couldn't stop old gateways: ${e}`);
