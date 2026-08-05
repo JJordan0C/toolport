@@ -5605,12 +5605,13 @@ mod tests {
     /// The connect budget must be decided by the CONFIGURED command, never by the
     /// launcher rewrite's output.
     ///
-    /// `spawn_inner` shadows `command`/`args` with the rewritten pair, so reading
-    /// `is_download_launcher` after that point classifies `node <abs script>` rather
-    /// than `npx -y pkg`. The two disagree, which is exactly the hazard: a server
-    /// whose rewrite succeeded would silently drop from the 120s launcher budget to
-    /// the 10s one, while `stdio_connect_timeout` kept reporting 120s for the same
-    /// server at other call sites.
+    /// `spawn_inner` keeps the rewrite in separate `spawn_command`/`spawn_args`
+    /// bindings and classifies the configured pair before it. Reading
+    /// `is_download_launcher` off the rewritten pair instead would see
+    /// `node <abs script>` rather than `npx -y pkg`. The two disagree, which is the
+    /// hazard: a server whose rewrite succeeded would silently drop from the 120s
+    /// launcher budget to the 10s one, while `stdio_connect_timeout` kept reporting
+    /// 120s for the same server at other call sites.
     #[test]
     fn a_rewritten_command_must_not_decide_the_connect_budget() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -5636,6 +5637,69 @@ mod tests {
             "callers still compute the long budget from the configured command, so \
              the transport must agree with them"
         );
+    }
+
+    /// The capture point itself, driven through `spawn_inner` with a rewrite that
+    /// actually succeeds.
+    ///
+    /// The assertion above proves the two classifications differ; it does not prove
+    /// `spawn_inner` reads the configured one, and moving the capture back after the
+    /// rewrite leaves it green. Verified by exactly that mutation. Needs the rewrite
+    /// to succeed to discriminate at all: on a fallback both pairs are the same
+    /// command, so the wrong capture point still yields the right answer.
+    #[test]
+    fn spawn_inner_takes_the_connect_budget_from_the_configured_command() {
+        let tag = format!("toolport-spawnfix-{}", std::process::id());
+        let root = std::env::temp_dir().join(&tag);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // A fixture npx cache holding one package whose entry just holds stdin open,
+        // so the spawned child survives long enough to inspect the transport.
+        let pkg = root.join("_npx").join("hash").join("node_modules").join("srv");
+        std::fs::create_dir_all(pkg.join("bin")).expect("fixture package");
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"srv","version":"1.0.0","bin":{"srv":"bin/cli.js"}}"#,
+        )
+        .expect("manifest");
+        std::fs::write(pkg.join("bin").join("cli.js"), "process.stdin.resume();\n")
+            .expect("stub entry");
+        std::env::set_var("npm_config_cache", &root);
+
+        // Unique args so the process-wide resolution memo cannot serve a stale miss.
+        let args: Vec<String> = ["-y", "srv", &tag].iter().map(|s| s.to_string()).collect();
+        let resolved = crate::launcher::resolve_direct("npx", &args);
+        std::env::remove_var("npm_config_cache");
+
+        // If node is missing the rewrite cannot happen and the test would assert
+        // nothing, so say so rather than passing vacuously.
+        let Some(direct) = resolved else {
+            let _ = std::fs::remove_dir_all(&root);
+            panic!("fixture package must resolve, or this test discriminates nothing");
+        };
+        assert!(
+            !super::is_download_launcher(&direct.command, &direct.args),
+            "the rewritten pair must classify as a non-launcher for this to bite"
+        );
+
+        std::env::set_var("npm_config_cache", &root);
+        let transport = super::StdioTransport::spawn_inner("npx", &args, &[], None, None, None);
+        std::env::remove_var("npm_config_cache");
+        let transport = transport.expect("the stub server must spawn");
+
+        assert!(
+            transport.launcher,
+            "the connect budget must come from the configured `npx`, not the `node` \
+             the rewrite produced"
+        );
+        assert_eq!(
+            transport.connect_timeout(),
+            super::LAUNCHER_CONNECT_TIMEOUT,
+            "and it must reach connect_timeout as the long budget"
+        );
+
+        drop(transport);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Prepending a launcher's `node_modules/.bin` must not also decide whether a
