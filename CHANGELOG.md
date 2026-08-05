@@ -60,6 +60,11 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- A registry change saved in the app could briefly revert on screen. The disk
+  watcher read the registry file outside the lock that guards the in-memory copy,
+  so a save landing at the same moment could be overwritten by the slightly older
+  contents the watcher had just read, leaving the app showing the previous state.
+  The watcher now drops a read that a newer save has already superseded. (SOU-329)
 - OAuth loopback callbacks now reject an empty authorization code instead of showing
   a success page and sending an invalid token-exchange request.
 
