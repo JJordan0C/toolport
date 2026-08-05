@@ -2009,6 +2009,17 @@ fn set_client_discovery(
 /// held across the whole op so app threads serialize on it before the file lock; together
 /// with `registry::update` this stops any app command from reverting a concurrent gateway
 /// or team-sync write (SOU-23). Returns the new registry and `f`'s value.
+fn write_registry<T>(
+    state: &RegistryState,
+    f: impl FnOnce(&mut Registry) -> Result<T, String>,
+) -> Result<(Registry, T), String> {
+    let mut guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (reg, out) = registry::update(f)?;
+    *guard = reg.clone();
+    bump_registry_generation();
+    Ok((reg, out))
+}
+
 /// Bumped every time the in-memory registry cache is replaced, while the
 /// `RegistryState` mutex is held.
 ///
@@ -2039,17 +2050,6 @@ fn bump_registry_generation() {
     REGISTRY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
-fn write_registry<T>(
-    state: &RegistryState,
-    f: impl FnOnce(&mut Registry) -> Result<T, String>,
-) -> Result<(Registry, T), String> {
-    let mut guard = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (reg, out) = registry::update(f)?;
-    *guard = reg.clone();
-    bump_registry_generation();
-    Ok((reg, out))
-}
-
 /// Refresh the in-memory cache from disk. Formerly `flush_to_disk`, which PUSHED the
 /// in-memory snapshot to disk; that blind write could revert a concurrent gateway/team
 /// change (SOU-23), and it is now unnecessary because every mutation persists immediately
@@ -2070,8 +2070,26 @@ fn refresh_from_disk(state: &RegistryState) -> Result<(), String> {
 /// On a lost race the caller gets the cached registry, which is the newer of the
 /// two, so the return value is always the authoritative current state.
 fn reload_into_state(state: &RegistryState) -> Result<Registry, String> {
+    reload_with(state, registry::load)
+}
+
+/// The body of [`reload_into_state`], with the disk read left as a parameter.
+///
+/// Split out purely so a test can drive the real sample -> load -> publish -> fall back
+/// sequence: `registry::load` reads the user's actual registry file, so a test calling
+/// `reload_into_state` could neither choose what comes back nor land a competing write
+/// inside the window. Passing the load in lets the test do both, by performing the racing
+/// write from inside the closure - which is exactly where the real race happens.
+///
+/// This is the only body; `reload_into_state` is a one-line delegation. Inlining a disk
+/// load back into it would mean deleting that delegation, which is the visible edit this
+/// arrangement is meant to force.
+fn reload_with(
+    state: &RegistryState,
+    load: impl FnOnce() -> Result<Registry, String>,
+) -> Result<Registry, String> {
     let sampled = registry_generation();
-    let fresh = registry::load()?;
+    let fresh = load()?;
     if publish_if_unchanged(state, sampled, &fresh) {
         return Ok(fresh);
     }
@@ -4723,29 +4741,35 @@ mod tests {
     /// could restore a stale cache even after the watcher was fixed. Found by review
     /// on #624, not by the original SOU-329 report.
     ///
-    /// It goes through the shared `publish_if_unchanged` rather than its own copy of
-    /// the guard, which is what lets this one test speak for both callers.
+    /// Drives the real body via `reload_with` and lands the competing write from
+    /// inside the load closure, i.e. in the actual window between the generation
+    /// sample and the publish. An earlier version of this test open-coded that
+    /// sequence and called `publish_if_unchanged` directly; it passed with the whole
+    /// guard stripped out of `reload_into_state`, because it never ran that function.
     #[test]
-    fn the_shared_guard_protects_the_reload_path_too() {
+    fn the_reload_path_drops_a_load_older_than_the_cache() {
         let _serial = GEN_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state: RegistryState = Mutex::new(registry_named("before"));
 
-        // Stand in for the body of reload_into_state with a write landing in the
-        // window between its disk load and its mutex acquisition.
-        let sampled = registry_generation();
-        let from_disk = registry_named("stale-A");
-        {
+        let returned = reload_with(&state, || {
+            // Runs where the disk read runs: after the generation sample, before the
+            // publish. A command persisting and caching B lands right here.
             let mut guard = state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard = registry_named("fresh-B");
             bump_registry_generation();
-        }
+            Ok(registry_named("stale-A"))
+        })
+        .expect("a lost race is not an error");
 
-        let applied = publish_if_unchanged(&state, sampled, &from_disk);
-        assert!(!applied, "the reload must not publish a load older than the cache");
+        assert_eq!(
+            only_server(&returned),
+            "fresh-B",
+            "the caller must get the newer cached registry, not the stale disk read"
+        );
         let guard = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4754,6 +4778,25 @@ mod tests {
             "fresh-B",
             "refresh_from_disk must not be able to restore stale cached state"
         );
+    }
+
+    /// The uncontended reload: nothing touches the cache during the load, so the disk
+    /// value is published and handed back.
+    #[test]
+    fn the_reload_path_applies_an_uncontended_load() {
+        let _serial = GEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state: RegistryState = Mutex::new(registry_named("before"));
+
+        let returned = reload_with(&state, || Ok(registry_named("from-disk")))
+            .expect("an uncontended reload must succeed");
+
+        assert_eq!(only_server(&returned), "from-disk");
+        let guard = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(only_server(&guard), "from-disk");
     }
 
     /// Applying must itself bump the generation, or a second stale load sampled at
