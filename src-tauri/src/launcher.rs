@@ -174,8 +174,15 @@ fn parse_launcher(command: &str, args: &[String]) -> Option<LauncherPlan> {
             break;
         }
         match a {
+            // Flags that do not change what gets run, or that ask for exactly the
+            // cache-only behavior this rewrite provides.
+            //
+            // `--prefer-online` and `--ignore-existing` are deliberately NOT here:
+            // they ask npx to revalidate against the registry or to skip a cached
+            // copy, which is the opposite of resolving out of `_npx`. They fall
+            // through to the catch-all below and run through npx unchanged.
             "-y" | "--yes" | "-q" | "--quiet" | "--silent" | "--no-install"
-            | "--prefer-online" | "--prefer-offline" | "--offline" | "--ignore-existing" => {
+            | "--prefer-offline" | "--offline" => {
                 i += 1;
             }
             "-p" | "--package" => {
@@ -723,6 +730,23 @@ mod tests {
         assert!(parse_launcher("npm", &s(&["run", "start"])).is_none());
         // Nothing to run.
         assert!(parse_launcher("npx", &s(&["-y"])).is_none());
+        // These ask npx to revalidate against the registry or ignore a cached copy.
+        // A cache-only rewrite cannot honor either, so both must fall back.
+        assert!(parse_launcher("npx", &s(&["--prefer-online", "pkg"])).is_none());
+        assert!(parse_launcher("npx", &s(&["--ignore-existing", "pkg"])).is_none());
+        // `--package=` must strip exactly one prefix. With trim_start_matches this
+        // parsed as `pkg`; the repeated form is not a package name, so it falls back.
+        assert!(parse_launcher("npx", &s(&["--package=--package=pkg", "bin"])).is_none());
+    }
+
+    /// The attached `--package=<spec>` spelling, which nothing else covers.
+    #[test]
+    fn parses_the_attached_package_flag() {
+        let plan = parse_launcher("npx", &s(&["--package=@scope/tools", "other-bin", "x"]))
+            .expect("--package= form must parse");
+        assert_eq!(plan.package, "@scope/tools");
+        assert_eq!(plan.bin.as_deref(), Some("other-bin"));
+        assert_eq!(plan.forwarded, s(&["x"]));
     }
 
     /// The name is concatenated into a filesystem path, so traversal attempts must be

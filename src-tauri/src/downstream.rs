@@ -2455,15 +2455,29 @@ impl StdioTransport {
         // resolves to None and spawns unchanged. Re-screen the rewrite: the guard
         // must judge what actually runs, not only what was configured, and a refusal
         // falls back to the original rather than failing the spawn.
+        //
+        // Classify the CONFIGURED invocation before the rewrite shadows it. The
+        // `launcher` field decides the connect budget (120s vs 10s), and
+        // `stdio_connect_timeout` computes that from the original command at other
+        // call sites; reading it off the rewritten pair would say `node`, i.e. not a
+        // launcher, and quietly cut a slow-starting server's handshake budget to a
+        // tenth for the ones the rewrite happened to succeed on.
+        let launcher = is_download_launcher(command, args);
         let direct = crate::launcher::resolve_direct(command, args)
             .filter(|d| screen_spawn_command(&d.command, &d.args).is_ok());
-        let (command, args) = match &direct {
+        // Bind the rewrite to NEW names rather than shadowing `command`/`args`.
+        // Shadowing left every later read silently referring to `node <abs script>`,
+        // which is right for the spawn and wrong for everything that describes the
+        // server: the connect-budget classification below, and the spawn error
+        // message. Keeping both pairs addressable makes each read state which one it
+        // means instead of depending on where it sits in the function.
+        let (spawn_command, spawn_args) = match &direct {
             Some(d) => (d.command.as_str(), d.args.as_slice()),
             None => (command, args),
         };
-        let resolved = resolve_command(command);
+        let resolved = resolve_command(spawn_command);
         let mut cmd = Command::new(&resolved);
-        cmd.args(args)
+        cmd.args(spawn_args)
             .envs(env.iter().cloned())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2605,7 +2619,7 @@ impl StdioTransport {
             next_id: 1,
             read_timeout: STDIO_READ_TIMEOUT,
             armed,
-            launcher: is_download_launcher(command, args),
+            launcher,
             server_handler: None,
             pending_mrtr: None,
             progress,
@@ -5586,6 +5600,42 @@ mod tests {
         std::env::remove_var(&secret);
         std::env::remove_var(&secret_new);
         std::env::remove_var(&keep);
+    }
+
+    /// The connect budget must be decided by the CONFIGURED command, never by the
+    /// launcher rewrite's output.
+    ///
+    /// `spawn_inner` shadows `command`/`args` with the rewritten pair, so reading
+    /// `is_download_launcher` after that point classifies `node <abs script>` rather
+    /// than `npx -y pkg`. The two disagree, which is exactly the hazard: a server
+    /// whose rewrite succeeded would silently drop from the 120s launcher budget to
+    /// the 10s one, while `stdio_connect_timeout` kept reporting 120s for the same
+    /// server at other call sites.
+    #[test]
+    fn a_rewritten_command_must_not_decide_the_connect_budget() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let configured = ("npx", a(&["-y", "toolport-mcp-servers", "vercel"]));
+        // What resolve_direct turns the above into.
+        let rewritten = (
+            r"C:\Program Files\nodejs\node.exe",
+            a(&[r"C:\cache\_npx\h\node_modules\toolport-mcp-servers\bin\cli.js", "vercel"]),
+        );
+
+        assert!(
+            super::is_download_launcher(configured.0, &configured.1),
+            "the configured invocation is a download launcher"
+        );
+        assert!(
+            !super::is_download_launcher(rewritten.0, &rewritten.1),
+            "the rewritten invocation is not, which is why the classification has to \
+             be captured before the rewrite shadows the original"
+        );
+        assert_eq!(
+            super::stdio_connect_timeout(configured.0, &configured.1),
+            super::LAUNCHER_CONNECT_TIMEOUT,
+            "callers still compute the long budget from the configured command, so \
+             the transport must agree with them"
+        );
     }
 
     /// Prepending a launcher's `node_modules/.bin` must not also decide whether a
