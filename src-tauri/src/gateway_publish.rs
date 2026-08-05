@@ -876,15 +876,31 @@ fn version_sort_key(basename: &str) -> Vec<u64> {
         .rsplit_once("-gateway-")
         .map(|(_, v)| v)
         .unwrap_or(stem);
-    let (release, is_release) = match version.split_once('-') {
-        Some((release, _pre)) => (release, 0u64),
-        None => (version, 1u64),
+    let (release, pre) = match version.split_once('-') {
+        Some((release, pre)) => (release, Some(pre)),
+        None => (version, None),
     };
-    let mut key: Vec<u64> = release
-        .split('.')
-        .map(|part| part.parse::<u64>().unwrap_or(0))
-        .collect();
-    key.push(is_release);
+    let numbers = |s: &str| {
+        s.split('.')
+            .map(|part| part.parse::<u64>().unwrap_or(0))
+            .collect::<Vec<u64>>()
+    };
+    let mut key = numbers(release);
+    // Sentinel first, so a release outranks every pre-release of the same version
+    // regardless of what follows.
+    key.push(if pre.is_some() { 0 } else { 1 });
+    // Then the pre-release's own numbers, so `rc.2` outranks `rc.1`. Without this
+    // the two collapse to an identical key and `newest_non_current` falls back to
+    // `read_dir` order, which can protect the older candidate and delete the newer
+    // one. Reachable: the reported directory contains `-1.9.7-rc.1.exe`.
+    //
+    // Non-numeric identifiers parse to 0, so `rc.1` and `beta.1` still tie. That is
+    // deliberate: ordering two different pre-release *channels* of one version needs
+    // real semver precedence rules, and the recency floor is a safety net, not a
+    // release-management feature. Ties only mean both may be kept.
+    if let Some(pre) = pre {
+        key.extend(numbers(pre));
+    }
     key
 }
 
@@ -2481,6 +2497,47 @@ mod tests {
             version_sort_key("toolport-gateway-1.9.7-rc.1.exe")
                 > version_sort_key("toolport-gateway-1.9.6.exe")
         );
+        // Two candidates of the same version must be ordered, or the recency floor
+        // falls back to `read_dir` order and can keep rc.1 while deleting rc.2.
+        assert!(
+            version_sort_key("toolport-gateway-1.9.7-rc.2.exe")
+                > version_sort_key("toolport-gateway-1.9.7-rc.1.exe")
+        );
+        assert!(
+            version_sort_key("toolport-gateway-1.9.7-rc.10.exe")
+                > version_sort_key("toolport-gateway-1.9.7-rc.9.exe"),
+            "pre-release numbers compare numerically too"
+        );
+    }
+
+    /// The floor must protect the newest candidate, not whichever one the directory
+    /// listing happened to yield first.
+    #[test]
+    fn recency_floor_picks_the_newest_of_two_candidates() {
+        let dir = advice_temp_dir("prune-two-rcs");
+        // Deliberately listed oldest-first, the order that hid this.
+        let all: Vec<PathBuf> = [
+            "toolport-gateway-1.9.6.exe",
+            "toolport-gateway-1.9.7-rc.1.exe",
+            "toolport-gateway-1.9.7-rc.2.exe",
+        ]
+        .iter()
+        .map(|n| bin(&dir, n))
+        .collect();
+
+        let names: Vec<String> = newest_non_current(&all, "1.10.0")
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "toolport-gateway-1.9.7-rc.2.exe".to_string(),
+                "toolport-gateway-1.9.7-rc.1.exe".to_string(),
+            ],
+            "the two newest are both candidates of 1.9.7, newest first"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The whole reported directory, end to end: 14 binaries, one current, one held
