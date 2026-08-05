@@ -4482,6 +4482,49 @@ fn read_gateway_profile(client_id: &str) -> Option<String> {
 /// Only entries we still own are ever rewritten. Ownership is the registry record
 /// when present, else the SOU-405 command-basename heuristic (issue #487 / SOU-406).
 /// A Customized entry is left byte-identical and reported in [`RepointOutcome::customized`].
+/// Every gateway binary path a detected client would spawn.
+///
+/// Used to decide which published gateway binaries are safe to delete (SOU-484).
+/// Deleting one a client still names turns "runs old code" into "cannot start the
+/// gateway at all", so this is the authoritative do-not-delete set.
+///
+/// Returns `None` when any client's config could not be read. That client's
+/// reference set is then unknown, and an unknown reference must not be treated as
+/// an absent one: pruning is never urgent, so the caller skips the pass entirely
+/// and retries on the next launch.
+///
+/// Unlike [`repoint_stale_gateways`], customized entries are **included**. Repoint
+/// leaves them alone, but they still name a binary the user's client will spawn,
+/// which is exactly what must survive.
+pub fn referenced_gateway_paths() -> Option<Vec<PathBuf>> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for client in detect_clients() {
+        if client.error.is_some() {
+            return None;
+        }
+        if !client.config_exists {
+            continue;
+        }
+        for server in &client.servers {
+            if !gateway_identity_matches(&server.name, &server.name, server.command.as_deref()) {
+                continue;
+            }
+            let Some(command) = server.command.as_deref() else {
+                continue;
+            };
+            let command = command.trim();
+            if command.is_empty() {
+                continue;
+            }
+            let path = PathBuf::from(command);
+            if !out.iter().any(|p| p == &path) {
+                out.push(path);
+            }
+        }
+    }
+    Some(out)
+}
+
 pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> RepointOutcome {
     let mut outcome = RepointOutcome::default();
     let Some(current) = resolve_gateway_path().map(|p| p.to_string_lossy().into_owned()) else {

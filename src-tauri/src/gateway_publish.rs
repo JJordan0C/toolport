@@ -749,6 +749,236 @@ pub fn reap_stale(extra_keep: &[PathBuf]) -> ReapReport {
     report
 }
 
+// ---------------------------------------------------------------------------
+// Pruning published gateway binaries (SOU-484)
+//
+// The reaper stops stale *processes*; nothing ever deleted a stale *file*, so
+// `%APPDATA%\Toolport\bin` accumulates every gateway ever published (~18 MB a
+// release). The naive fix is worse than the leak: a client caches its spawn
+// command at its own startup, so deleting a binary it still names converts
+// "silently runs old code" - a surfaced, recoverable state since SOU-435 - into
+// "cannot start the gateway at all", which looks like a broken client with no
+// cause. Every rule below therefore fails closed: anything we cannot prove is
+// unused is kept, and pruning is never urgent enough to guess.
+// ---------------------------------------------------------------------------
+
+/// How many non-current versions to keep regardless of evidence.
+///
+/// Evidence-based rules cover every client we can *observe*, but a client that has
+/// been idle since before the app started has spawned nothing and appears in no
+/// live-process list, while a repoint has already removed its path from the config.
+/// Its cached path is almost always the version we just upgraded from, so the two
+/// newest non-current binaries stay whatever the evidence says. Costs ~36 MB of the
+/// ~200 MB this reclaims.
+const PRUNE_KEEP_RECENT: usize = 2;
+
+/// Inputs for the pure delete/keep decision, built at the call site so tests need
+/// no real install layout.
+#[derive(Debug, Clone, Default)]
+pub struct PruneContext {
+    pub current_version: String,
+    /// Never deleted: current published binary, app-local copy, macOS helper, etc.
+    pub keep_paths: Vec<PathBuf>,
+    /// Backing a live process right now.
+    pub live_paths: Vec<PathBuf>,
+    /// Named by some client's config. See `clients::referenced_gateway_paths`.
+    pub referenced_paths: Vec<PathBuf>,
+    /// Gateway basenames from current restart advice: a client is known to be
+    /// relaunching these from a cached path even though the config no longer names
+    /// them and no process may be alive at this instant. This is the case that
+    /// makes evidence-based pruning safe at all, and it only became knowable with
+    /// SOU-435 (`toolport-gateway-1.9.7-rc.1.exe` was serving a live Claude Code
+    /// two minutes after the 1.10.0 upgrade reaped it).
+    pub advised_basenames: Vec<String>,
+    /// Newest non-current versions to keep unconditionally, see [`PRUNE_KEEP_RECENT`].
+    pub keep_recent: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneDecision {
+    /// Kept, with the reason, so a log explains why 200 MB is still there.
+    Keep(&'static str),
+    Delete,
+}
+
+/// Pure keep/delete decision for one file in the published gateway directory.
+pub fn decide_prune(path: &Path, ctx: &PruneContext) -> PruneDecision {
+    let basename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Only ever delete versioned images we published. This is what protects the
+    // unversioned `toolport-gateway.exe` / `conduit-gateway.exe`, the manifest
+    // json, and anything else that happens to share the directory.
+    if !is_gateway_basename(&basename) || !is_versioned_gateway_basename(&basename) {
+        return PruneDecision::Keep("not a versioned gateway image");
+    }
+    if basename_matches_current_version(&basename, &ctx.current_version) {
+        return PruneDecision::Keep("current version");
+    }
+    if ctx.keep_paths.iter().any(|k| paths_equal(k, path)) {
+        return PruneDecision::Keep("protected path");
+    }
+    if ctx.live_paths.iter().any(|k| paths_equal(k, path)) {
+        return PruneDecision::Keep("backing a running process");
+    }
+    if ctx.referenced_paths.iter().any(|k| paths_equal(k, path)) {
+        return PruneDecision::Keep("named by a client config");
+    }
+    if ctx
+        .advised_basenames
+        .iter()
+        .any(|b| b.eq_ignore_ascii_case(&basename))
+    {
+        return PruneDecision::Keep("a client is still relaunching it");
+    }
+    if ctx.keep_recent.iter().any(|k| paths_equal(k, path)) {
+        return PruneDecision::Keep("recent enough to still be cached somewhere");
+    }
+    PruneDecision::Delete
+}
+
+/// The `PRUNE_KEEP_RECENT` newest non-current versions among `paths`.
+///
+/// Ordered by parsed version rather than mtime: a re-published binary can be
+/// rewritten at any time, and publish order is what "recent" means here.
+pub fn newest_non_current(paths: &[PathBuf], current_version: &str) -> Vec<PathBuf> {
+    let mut versioned: Vec<(Vec<u64>, PathBuf)> = paths
+        .iter()
+        .filter_map(|p| {
+            let name = p.file_name()?.to_string_lossy().into_owned();
+            if !is_versioned_gateway_basename(&name)
+                || basename_matches_current_version(&name, current_version)
+            {
+                return None;
+            }
+            Some((version_sort_key(&name), p.clone()))
+        })
+        .collect();
+    versioned.sort_by(|a, b| b.0.cmp(&a.0));
+    versioned
+        .into_iter()
+        .take(PRUNE_KEEP_RECENT)
+        .map(|(_, p)| p)
+        .collect()
+}
+
+/// Numeric sort key from a versioned gateway basename.
+///
+/// `toolport-gateway-1.10.0.exe` must sort above `-1.9.6`, so components are
+/// compared numerically rather than lexically. A pre-release suffix
+/// (`1.9.7-rc.1`) sorts just below its release, which is what the trailing
+/// sentinel achieves without parsing semver properly.
+fn version_sort_key(basename: &str) -> Vec<u64> {
+    let lower = basename.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    let version = stem
+        .rsplit_once("-gateway-")
+        .map(|(_, v)| v)
+        .unwrap_or(stem);
+    let (release, is_release) = match version.split_once('-') {
+        Some((release, _pre)) => (release, 0u64),
+        None => (version, 1u64),
+    };
+    let mut key: Vec<u64> = release
+        .split('.')
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .collect();
+    key.push(is_release);
+    key
+}
+
+/// Result of a prune pass.
+#[derive(Debug, Clone, Default)]
+pub struct PruneReport {
+    pub deleted: Vec<String>,
+    pub reclaimed_bytes: u64,
+    /// Files we tried to delete and could not. Expected on Windows, where a running
+    /// image is locked; the next launch retries. Logged, never surfaced as an error.
+    pub failed: Vec<String>,
+}
+
+/// Delete published gateway binaries that nothing can still be using.
+///
+/// `referenced_paths` comes from `clients::referenced_gateway_paths`; pass `None`
+/// when a client config could not be read, and the pass is skipped entirely rather
+/// than deleting against an incomplete picture.
+///
+/// `advised_basenames` are the gateway images from current restart advice (SOU-435).
+pub fn prune_published_gateways(
+    referenced_paths: Option<Vec<PathBuf>>,
+    advised_basenames: Vec<String>,
+) -> PruneReport {
+    let mut report = PruneReport::default();
+    let Some(referenced_paths) = referenced_paths else {
+        eprintln!(
+            "toolport: skipping gateway binary prune - at least one client config could not \
+             be read, so its cached gateway path is unknown"
+        );
+        return report;
+    };
+    let Some(dir) = gateway_bin_dir() else {
+        return report;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return report;
+    };
+    let on_disk: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+
+    let ctx = PruneContext {
+        current_version: env!("CARGO_PKG_VERSION").to_string(),
+        keep_paths: default_keep_paths(),
+        live_paths: list_gateway_processes()
+            .into_iter()
+            .filter_map(|p| p.path)
+            .collect(),
+        referenced_paths,
+        advised_basenames,
+        keep_recent: newest_non_current(&on_disk, env!("CARGO_PKG_VERSION")),
+    };
+
+    for path in on_disk {
+        if decide_prune(&path, &ctx) != PruneDecision::Delete {
+            continue;
+        }
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                report.deleted.push(label);
+                report.reclaimed_bytes += size;
+            }
+            // A locked image on Windows is the normal case, not an error: the file
+            // is in use, so keeping it is the correct outcome anyway.
+            Err(e) => report.failed.push(format!("{label} ({e})")),
+        }
+    }
+    if !report.deleted.is_empty() {
+        eprintln!(
+            "toolport: pruned {} old gateway binar(ies), reclaiming {} MB: {}",
+            report.deleted.len(),
+            report.reclaimed_bytes / 1_048_576,
+            report.deleted.join("; ")
+        );
+    }
+    if !report.failed.is_empty() {
+        eprintln!(
+            "toolport: could not delete {} old gateway binar(ies) (in use; will retry next \
+             launch): {}",
+            report.failed.len(),
+            report.failed.join("; ")
+        );
+    }
+    report
+}
+
 /// Is this pid still running?
 ///
 /// Used to expire stored restart advice once the user actually restarts the app.
@@ -2072,6 +2302,228 @@ mod tests {
         assert!(
             after.needs_restart.is_empty(),
             "a post-kill table cannot produce the advice, so it must never be the source"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ----- SOU-484: pruning published gateway binaries ------------------------
+
+    fn bin(dir: &Path, name: &str) -> PathBuf {
+        dir.join(name)
+    }
+
+    /// A context where nothing is in use, so every rule below is the only thing
+    /// standing between a file and deletion.
+    fn prune_ctx(current: &str) -> PruneContext {
+        PruneContext {
+            current_version: current.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prune_deletes_only_old_versioned_images() {
+        let dir = advice_temp_dir("prune-basic");
+        let ctx = prune_ctx("1.10.0");
+
+        assert_eq!(
+            decide_prune(&bin(&dir, "toolport-gateway-1.9.4.exe"), &ctx),
+            PruneDecision::Delete,
+            "an old versioned image with no evidence against it is the whole point"
+        );
+        // The unversioned app-local copy is what clients fall back to; deleting it
+        // would break every client at once.
+        assert!(matches!(
+            decide_prune(&bin(&dir, "toolport-gateway.exe"), &ctx),
+            PruneDecision::Keep(_)
+        ));
+        assert!(matches!(
+            decide_prune(&bin(&dir, "conduit-gateway.exe"), &ctx),
+            PruneDecision::Keep(_)
+        ));
+        // Anything else sharing the directory, including our own manifest.
+        assert!(matches!(
+            decide_prune(&bin(&dir, "gateway-manifest.json"), &ctx),
+            PruneDecision::Keep(_)
+        ));
+        assert!(matches!(
+            decide_prune(&bin(&dir, "some-other-vendor-1.2.3.exe"), &ctx),
+            PruneDecision::Keep(_)
+        ));
+        // Never the current version, however the evidence looks.
+        assert!(matches!(
+            decide_prune(&bin(&dir, "toolport-gateway-1.10.0.exe"), &ctx),
+            PruneDecision::Keep(_)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The exact situation from the SOU-484 report: on the machine where this was
+    /// found, `toolport-gateway-1.9.7-rc.1.exe` was serving a live Claude Code two
+    /// minutes after the 1.10.0 upgrade reaped it, and no config named it any more.
+    /// Deleting it there would have broken Claude Code rather than updated it.
+    #[test]
+    fn prune_keeps_a_binary_a_live_process_is_running() {
+        let dir = advice_temp_dir("prune-live");
+        let rc = bin(&dir, "toolport-gateway-1.9.7-rc.1.exe");
+        let mut ctx = prune_ctx("1.10.0");
+        // No config references it; only the live process speaks for it.
+        ctx.live_paths = vec![rc.clone()];
+
+        assert_eq!(
+            decide_prune(&rc, &ctx),
+            PruneDecision::Keep("backing a running process")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prune_keeps_a_binary_a_client_config_still_names() {
+        let dir = advice_temp_dir("prune-referenced");
+        let old = bin(&dir, "toolport-gateway-1.8.0.exe");
+        let mut ctx = prune_ctx("1.10.0");
+        // Nothing is running it, but a client will spawn exactly this path.
+        ctx.referenced_paths = vec![old.clone()];
+
+        assert_eq!(
+            decide_prune(&old, &ctx),
+            PruneDecision::Keep("named by a client config")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The window evidence alone misses: the client was reaped, has not respawned
+    /// yet, and the repoint already removed its path from the config. Nothing is
+    /// running and nothing references it, yet it is precisely the binary that client
+    /// will spawn next. Restart advice is the only witness, which is why this became
+    /// safe to do only after SOU-435.
+    #[test]
+    fn prune_keeps_a_binary_a_client_is_still_relaunching() {
+        let dir = advice_temp_dir("prune-advised");
+        let old = bin(&dir, "toolport-gateway-1.9.6.exe");
+        let mut ctx = prune_ctx("1.10.0");
+        assert_eq!(
+            decide_prune(&old, &ctx),
+            PruneDecision::Delete,
+            "with no evidence at all this file looks deletable"
+        );
+
+        ctx.advised_basenames = vec!["toolport-gateway-1.9.6.exe".into()];
+        assert_eq!(
+            decide_prune(&old, &ctx),
+            PruneDecision::Keep("a client is still relaunching it"),
+            "restart advice must veto deletion even with no process and no config"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prune_keeps_the_two_newest_non_current_versions() {
+        let dir = advice_temp_dir("prune-recent");
+        let all: Vec<PathBuf> = [
+            "toolport-gateway-1.6.2.exe",
+            "toolport-gateway-1.9.0.exe",
+            "toolport-gateway-1.9.6.exe",
+            "toolport-gateway-1.9.7-rc.1.exe",
+            "toolport-gateway-1.10.0.exe",
+        ]
+        .iter()
+        .map(|n| bin(&dir, n))
+        .collect();
+
+        let recent = newest_non_current(&all, "1.10.0");
+        let names: Vec<String> = recent
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "toolport-gateway-1.9.7-rc.1.exe".to_string(),
+                "toolport-gateway-1.9.6.exe".to_string(),
+            ],
+            "the current version is excluded, and a pre-release sorts just under its release"
+        );
+
+        let mut ctx = prune_ctx("1.10.0");
+        ctx.keep_recent = recent;
+        // The two newest survive on the recency floor alone.
+        assert!(matches!(
+            decide_prune(&bin(&dir, "toolport-gateway-1.9.6.exe"), &ctx),
+            PruneDecision::Keep(_)
+        ));
+        // Everything older is genuinely gone.
+        assert_eq!(
+            decide_prune(&bin(&dir, "toolport-gateway-1.9.0.exe"), &ctx),
+            PruneDecision::Delete
+        );
+        assert_eq!(
+            decide_prune(&bin(&dir, "toolport-gateway-1.6.2.exe"), &ctx),
+            PruneDecision::Delete
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `1.10.0` must sort above `1.9.6`, which a lexical compare gets backwards and
+    /// would make the recency floor protect the wrong two files.
+    #[test]
+    fn version_sort_is_numeric_not_lexical() {
+        assert!(
+            version_sort_key("toolport-gateway-1.10.0.exe")
+                > version_sort_key("toolport-gateway-1.9.6.exe")
+        );
+        assert!(
+            version_sort_key("toolport-gateway-1.9.7.exe")
+                > version_sort_key("toolport-gateway-1.9.7-rc.1.exe"),
+            "a release outranks its own pre-release"
+        );
+        assert!(
+            version_sort_key("toolport-gateway-1.9.7-rc.1.exe")
+                > version_sort_key("toolport-gateway-1.9.6.exe")
+        );
+    }
+
+    /// The whole reported directory, end to end: 14 binaries, one current, one held
+    /// by a live client, and the rest reclaimable.
+    #[test]
+    fn prune_plan_over_the_reported_directory() {
+        let dir = advice_temp_dir("prune-whole");
+        let names = [
+            "toolport-gateway-1.6.2.exe",
+            "toolport-gateway-1.7.0.exe",
+            "toolport-gateway-1.7.1.exe",
+            "toolport-gateway-1.7.2.exe",
+            "toolport-gateway-1.8.0.exe",
+            "toolport-gateway-1.9.0.exe",
+            "toolport-gateway-1.9.1.exe",
+            "toolport-gateway-1.9.2.exe",
+            "toolport-gateway-1.9.3.exe",
+            "toolport-gateway-1.9.4.exe",
+            "toolport-gateway-1.9.5.exe",
+            "toolport-gateway-1.9.6.exe",
+            "toolport-gateway-1.9.7-rc.1.exe",
+            "toolport-gateway-1.10.0.exe",
+        ];
+        let all: Vec<PathBuf> = names.iter().map(|n| bin(&dir, n)).collect();
+
+        let mut ctx = prune_ctx("1.10.0");
+        ctx.keep_recent = newest_non_current(&all, "1.10.0");
+        // Claude Code is still running the rc, as it was on the real machine.
+        ctx.live_paths = vec![bin(&dir, "toolport-gateway-1.9.7-rc.1.exe")];
+
+        let kept: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| decide_prune(&bin(&dir, n), &ctx) != PruneDecision::Delete)
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                "toolport-gateway-1.9.6.exe",
+                "toolport-gateway-1.9.7-rc.1.exe",
+                "toolport-gateway-1.10.0.exe",
+            ],
+            "current, the live rc, and the recency floor survive; the other 11 go"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

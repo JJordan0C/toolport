@@ -3577,6 +3577,24 @@ pub fn run() {
                     log_reap_outcome("delayed reaper", &again);
                     let newly_found = unannounced(&already_announced, again.needs_restart);
                     announce_restart_needed(&migrate_handle, &newly_found);
+
+                    // Only now delete old gateway binaries (SOU-484). Both reaper
+                    // passes have run, so clients that were going to respawn an
+                    // obsolete image have done so and are recorded in the advice;
+                    // deleting one a client still spawns would break it outright
+                    // rather than leave it on old code. Last, and deliberately
+                    // after the delay, because every input this needs is evidence
+                    // the passes above produced.
+                    let advised = migrate_handle
+                        .state::<RestartAdvice>()
+                        .current()
+                        .into_iter()
+                        .map(|c| c.gateway)
+                        .collect();
+                    crate::gateway_publish::prune_published_gateways(
+                        clients::referenced_gateway_paths(),
+                        advised,
+                    );
                 });
             });
 

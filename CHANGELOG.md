@@ -8,6 +8,13 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Added
 
+- Old gateway binaries are now cleaned up instead of accumulating forever. Every
+  published gateway stayed on disk (about 18 MB a release, roughly 200 MB on a
+  long-lived install). Toolport now deletes the ones nothing can still be using,
+  and keeps any binary that is running, that a client config still names, that a
+  client is known to be relaunching, or that is recent enough to plausibly be
+  cached, so cleanup can never turn an app that runs old code into one that
+  cannot start the gateway at all. (SOU-484)
 - Toolport now names the apps that keep launching an obsolete gateway. Stopping a
   stale gateway process is not always enough: an app caches its spawn command when
   it starts, so one pinned to a path an upgrade never rewrites simply launches the
