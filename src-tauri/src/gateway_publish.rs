@@ -176,6 +176,18 @@ pub struct GatewayProcess {
     pub path: Option<PathBuf>,
     /// Process image basename, e.g. `toolport-gateway-1.9.4.exe` or `toolport-gateway`.
     pub basename: String,
+    /// The application that spawned this gateway, when it can be attributed.
+    /// `None` when the parent is gone, unreadable, or cannot be trusted (see
+    /// `windows_parent_predates_child`). Only used to name apps needing a restart;
+    /// the keep/kill decision never reads it.
+    pub parent: Option<ParentProcess>,
+}
+
+/// The application that spawned a gateway, e.g. `claude.exe`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentProcess {
+    pub pid: u32,
+    pub basename: String,
 }
 
 /// Inputs for the pure keep/kill decision. Built at the call site so tests do not
@@ -207,17 +219,43 @@ pub enum ReapDecision {
 }
 
 /// Result of a reaper pass, for logging and the Tauri command surface.
+///
+/// `needs_restart` is carried here rather than queried separately because it is
+/// only knowable from the pre-kill process table: once a pass has killed the
+/// obsolete gateways, the evidence for which app spawned them is gone. Any
+/// caller that asks afterwards necessarily reads an emptier table than the one
+/// that produced the advice, which is how #542 shipped a panel that erased
+/// itself (see [`RestartAdvice`](../desktop/struct.RestartAdvice.html) for the
+/// merge that keeps it).
 #[derive(Debug, Clone, Default)]
 pub struct ReapReport {
     pub killed: Vec<String>,
     pub kept: Vec<String>,
     pub failed: Vec<String>,
+    /// Apps still launching an obsolete gateway, from this pass's pre-kill snapshot.
+    pub needs_restart: Vec<ClientNeedingRestart>,
 }
 
 impl ReapReport {
     pub fn killed_labels(&self) -> Vec<String> {
         self.killed.clone()
     }
+}
+
+/// An application that keeps relaunching an obsolete gateway and therefore has to
+/// be restarted by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientNeedingRestart {
+    /// Basename of the client application, e.g. `claude.exe`.
+    pub client: String,
+    /// Pid of that application. Carried so stored advice can be revalidated and
+    /// expired: without it the advice can never be cleared once the user complies,
+    /// because absence of a respawned gateway is indistinguishable from a client
+    /// that simply has not made a tool call yet (#542 review).
+    pub client_pid: u32,
+    /// The obsolete gateway image it relaunched, e.g. `toolport-gateway-1.9.4.exe`.
+    pub gateway: String,
 }
 
 /// Build keep-paths known to this crate without calling into `clients` (avoids a
@@ -441,6 +479,156 @@ pub fn decide_reap(proc: &GatewayProcess, ctx: &ReapContext) -> ReapDecision {
     ReapDecision::Keep
 }
 
+/// Is `basename` one of our own processes rather than a third-party MCP client?
+///
+/// The supervised HTTP bridge is spawned by the Toolport app itself, so it would
+/// otherwise be reported as a client the user must restart.
+fn is_our_own_process(basename: &str) -> bool {
+    let lower = basename.to_ascii_lowercase();
+    lower.starts_with("toolport") || lower.starts_with("conduit")
+}
+
+/// Is this "parent" the init system or the kernel rather than an application?
+///
+/// An orphaned gateway is reparented to pid 1 on Unix, and Windows reports pid 0 /
+/// pid 4 for its kernel processes. None of them is something a user can restart,
+/// and each platform previously guarded a different subset of these, so the same
+/// orphan produced "restart systemd" on Linux and nothing on macOS. Name-matched
+/// as well as pid-matched because a systemd *user* session is a child subreaper
+/// with a pid of its own (#542 review).
+fn is_init_like(parent: &ParentProcess) -> bool {
+    if parent.pid <= 1 || parent.pid == 4 {
+        return true;
+    }
+    let lower = parent.basename.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "systemd" | "init" | "launchd" | "system" | "[system process]"
+    )
+}
+
+/// Will the path this client cached start yielding new code by itself?
+///
+/// Only one case self-heals, and the ` (deleted)` marker alone does not identify
+/// it. On Linux `/proc/<pid>/exe` gains that marker whenever the file was
+/// *unlinked*, which covers two opposite outcomes:
+///
+/// * **Replaced in place** (a package upgrade wrote a new file at the same path):
+///   the cached path now resolves to the new binary, so the next spawn picks it up
+///   and there is nothing to advise.
+/// * **Moved or removed** (a stale install location that an upgrade abandoned):
+///   the cached path resolves to nothing, so the client cannot spawn a gateway at
+///   all. That is worse, not better, and the user still has to restart the app.
+///
+/// Treating the marker itself as "self-heals" silently dropped the second case.
+/// The test that was supposed to cover it passed only because it ran on macOS,
+/// where no marker appears and the entry survives for unrelated reasons; on Linux,
+/// the platform where the marker is real, it was silent (#542 review). Probing the
+/// stripped path tells the two apart. A path with no marker is unchanged on disk
+/// and never self-heals, which is why non-Linux platforms fall through to `false`.
+fn cached_path_self_heals(proc: &GatewayProcess) -> bool {
+    let Some(path) = proc.path.as_ref().and_then(|p| p.to_str()) else {
+        return false;
+    };
+    match path.strip_suffix(" (deleted)") {
+        Some(stripped) => Path::new(stripped).exists(),
+        None => false,
+    }
+}
+
+/// Applications running an obsolete gateway they will relaunch from a cached path.
+///
+/// An MCP client reads its config once at its own startup and caches the spawn
+/// command; see [`cached_path_self_heals`] for when that traps it on old code.
+///
+/// Deduplicated per (client pid, gateway) so one entry per app the user has to act
+/// on, not one per respawn. Pure so the grouping is testable without a process table.
+fn clients_needing_restart(
+    procs: &[GatewayProcess],
+    ctx: &ReapContext,
+) -> Vec<ClientNeedingRestart> {
+    // The updater kills every gateway including the current one, so every process
+    // reaches a Kill verdict and "obsolete" stops meaning anything. Computing advice
+    // there yields a list of apps to restart because they are running the CURRENT
+    // gateway, which is nonsense the user would act on (#542 review).
+    if ctx.kill_all {
+        return Vec::new();
+    }
+    let mut out: Vec<ClientNeedingRestart> = Vec::new();
+    for proc in procs {
+        if decide_reap(proc, ctx) != ReapDecision::Kill {
+            continue;
+        }
+        // A path we could not read means a process we could not inspect - a
+        // foreign user's session, or one whose ACL denied us. `decide_reap` still
+        // reaches Kill there via the basename-only fallback, but that path skips
+        // the `path_looks_like_our_install` guard, and we cannot stop the process
+        // either. Advising a restart for someone else's app is worse than silence.
+        if proc.path.is_none() {
+            // Logged rather than dropped silently: this is the one branch that
+            // withholds advice for a reason the user cannot see, so a support case
+            // ("why does it keep coming back and say nothing?") is otherwise
+            // untraceable (#542 review).
+            eprintln!(
+                "toolport: {} (pid {}) looks obsolete but its path could not be read, \
+                 so it is not attributed to an app",
+                proc.basename, proc.pid
+            );
+            continue;
+        }
+        if cached_path_self_heals(proc) {
+            continue;
+        }
+        // No parent means no name to show. Staying silent beats telling someone to
+        // restart "something".
+        let Some(parent) = proc.parent.as_ref() else {
+            continue;
+        };
+        if is_our_own_process(&parent.basename) || is_init_like(parent) {
+            continue;
+        }
+        let advice = ClientNeedingRestart {
+            client: parent.basename.clone(),
+            client_pid: parent.pid,
+            gateway: proc.basename.clone(),
+        };
+        if !out.contains(&advice) {
+            out.push(advice);
+        }
+    }
+    out
+}
+
+/// What a reaper pass will do, decided before it does any of it.
+#[derive(Debug, Clone, Default)]
+pub struct ReapPlan {
+    pub to_kill: Vec<GatewayProcess>,
+    pub kept: Vec<String>,
+    pub needs_restart: Vec<ClientNeedingRestart>,
+}
+
+/// Pure planner: classify a process table, and derive restart advice from that same
+/// pre-kill snapshot.
+///
+/// Exists so the "advice must be computed before anything is killed" requirement
+/// holds *by construction* rather than by where a line sits in the reaping loop.
+/// Three review rounds of #542 each moved that requirement somewhere new instead of
+/// removing it, and each move looked correct in isolation. Here the snapshot is an
+/// argument, so there is no later table to accidentally read.
+pub fn plan_reap(procs: &[GatewayProcess], ctx: &ReapContext) -> ReapPlan {
+    let mut plan = ReapPlan {
+        needs_restart: clients_needing_restart(procs, ctx),
+        ..Default::default()
+    };
+    for proc in procs {
+        match decide_reap(proc, ctx) {
+            ReapDecision::Keep => plan.kept.push(label_process(proc)),
+            ReapDecision::Kill => plan.to_kill.push(proc.clone()),
+        }
+    }
+    plan
+}
+
 fn label_process(proc: &GatewayProcess) -> String {
     match &proc.path {
         Some(p) => format!("{} (pid {} @ {})", proc.basename, proc.pid, p.display()),
@@ -450,15 +638,10 @@ fn label_process(proc: &GatewayProcess) -> String {
 
 fn reap_with_context(ctx: &ReapContext) -> ReapReport {
     let mut report = ReapReport::default();
-    let procs = list_gateway_processes();
-    let mut to_kill: Vec<GatewayProcess> = Vec::new();
-    for proc in procs {
-        match decide_reap(&proc, ctx) {
-            ReapDecision::Keep => report.kept.push(label_process(&proc)),
-            ReapDecision::Kill => to_kill.push(proc),
-        }
-    }
-    for proc in to_kill {
+    let plan = plan_reap(&list_gateway_processes(), ctx);
+    report.kept = plan.kept;
+    report.needs_restart = plan.needs_restart;
+    for proc in plan.to_kill {
         let label = label_process(&proc);
         if kill_gateway_process(&proc) {
             report.killed.push(label);
@@ -529,6 +712,15 @@ pub fn stop_stale_gateways() -> Vec<String> {
 /// Like [`stop_stale_gateways`], with extra keep-paths (e.g. nested macOS helper
 /// from `clients::resolve_gateway_path`).
 pub fn stop_stale_gateways_with_keep(extra_keep: &[PathBuf]) -> Vec<String> {
+    reap_stale(extra_keep).killed_labels()
+}
+
+/// Full-report variant of [`stop_stale_gateways_with_keep`].
+///
+/// Callers that surface anything beyond the killed list want this: the restart
+/// advice cannot be recovered after the fact, and `failed` is the difference
+/// between "nothing was stale" and "something is stale and we could not stop it".
+pub fn reap_stale(extra_keep: &[PathBuf]) -> ReapReport {
     let mut keep = default_keep_paths();
     for p in extra_keep {
         if !keep.iter().any(|e| paths_equal(e, p)) {
@@ -543,7 +735,68 @@ pub fn stop_stale_gateways_with_keep(extra_keep: &[PathBuf]) -> Vec<String> {
     };
     let report = reap_with_context(&ctx);
     log_reap_report("stale reaper", &report);
-    report.killed_labels()
+    report
+}
+
+/// Is this pid still running?
+///
+/// Used to expire stored restart advice once the user actually restarts the app.
+/// Fails *safe* by returning true on an inconclusive answer: keeping stale advice
+/// visible one pass longer is recoverable, dropping live advice is the failure that
+/// leaves a user pinned to an obsolete gateway with the UI saying nothing.
+pub fn pid_is_running(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if !handle.is_null() {
+                CloseHandle(handle);
+                return true;
+            }
+            // Only ERROR_INVALID_PARAMETER positively means "no such pid". Access
+            // denied means it exists and we cannot see it.
+            windows_sys::Win32::Foundation::GetLastError() != ERROR_INVALID_PARAMETER
+        }
+    }
+    #[cfg(unix)]
+    {
+        // Linux exposes a definitive answer without spawning anything.
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Path::new(&format!("/proc/{pid}")).exists();
+        }
+        // macOS has no /proc, so `kill -0` it is: the existence/permission check
+        // without delivering a signal. Shelled out rather than via libc to match
+        // `unix_kill_pid`, which does the same deliberately so this module needs no
+        // libc dependency.
+        //
+        // A non-zero exit means either "no such process" or "not permitted", and
+        // only the first means gone. They are told apart by stderr because the exit
+        // code alone cannot: treating EPERM as gone would expire advice for a live
+        // app, the exact direction this function must not fail in.
+        #[cfg(target_os = "macos")]
+        {
+            match std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .output()
+            {
+                Ok(out) if out.status.success() => true,
+                Ok(out) => String::from_utf8_lossy(&out.stderr)
+                    .to_ascii_lowercase()
+                    .contains("permitted"),
+                Err(_) => true,
+            }
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = pid;
+        true
+    }
 }
 
 // ----- OS process list / kill ------------------------------------------------
@@ -588,18 +841,26 @@ fn windows_list_gateway_processes() -> Vec<GatewayProcess> {
         }
         let mut entry: PROCESSENTRY32W = zeroed();
         entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
-        let mut out = Vec::new();
+        let mut out: Vec<(GatewayProcess, u32)> = Vec::new();
+        // Every pid in the snapshot, so a gateway's parent can be named even though
+        // the walk may reach the parent after the child.
+        let mut names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
         if Process32FirstW(snap, &mut entry) != 0 {
             loop {
                 let basename = widestr_to_string(&entry.szExeFile);
+                names.insert(entry.th32ProcessID, basename.clone());
                 if is_gateway_basename(&basename) {
                     let pid = entry.th32ProcessID;
                     let path = windows_process_path(pid);
-                    out.push(GatewayProcess {
-                        pid,
-                        path,
-                        basename,
-                    });
+                    out.push((
+                        GatewayProcess {
+                            pid,
+                            path,
+                            basename,
+                            parent: None,
+                        },
+                        entry.th32ParentProcessID,
+                    ));
                 }
                 if Process32NextW(snap, &mut entry) == 0 {
                     break;
@@ -607,7 +868,68 @@ fn windows_list_gateway_processes() -> Vec<GatewayProcess> {
             }
         }
         CloseHandle(snap);
-        out
+        // Resolve after the walk: a parent can appear later in the snapshot than
+        // its child, so this cannot be done inline.
+        out.into_iter()
+            .map(|(mut proc, ppid)| {
+                proc.parent = names
+                    .get(&ppid)
+                    .filter(|_| windows_parent_predates_child(ppid, proc.pid))
+                    .map(|basename| ParentProcess {
+                        pid: ppid,
+                        basename: basename.clone(),
+                    });
+                proc
+            })
+            .collect()
+    }
+}
+
+/// Guard against a recycled parent pid naming an unrelated application.
+///
+/// Unlike Unix, Windows never reparents an orphan and never clears the dead
+/// parent's pid from the child, so `th32ParentProcessID` dangles once the parent
+/// exits - and orphaned gateways are exactly the population the reaper exists to
+/// clean up. Windows then recycles pids freely, so the dangling value can point at
+/// something started later, and the user is told to restart an app that never
+/// spawned a gateway (#542 review).
+///
+/// A real parent always starts before its child. Fails closed: if either creation
+/// time is unreadable we drop the attribution rather than guess, because a wrong
+/// app name is worse than none.
+#[cfg(windows)]
+fn windows_parent_predates_child(ppid: u32, child_pid: u32) -> bool {
+    match (
+        windows_process_start_time(ppid),
+        windows_process_start_time(child_pid),
+    ) {
+        (Some(parent), Some(child)) => parent <= child,
+        _ => false,
+    }
+}
+
+/// Process creation time as a raw FILETIME tick count, for ordering only.
+#[cfg(windows)]
+fn windows_process_start_time(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut created: FILETIME = std::mem::zeroed();
+        let mut exited: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        Some(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
     }
 }
 
@@ -712,6 +1034,7 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
                 pid,
                 path: exe,
                 basename: exe_base,
+                parent: linux_parent_of(pid),
             });
             continue;
         }
@@ -720,9 +1043,38 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
             pid,
             path,
             basename,
+            parent: linux_parent_of(pid),
         });
     }
     out
+}
+
+/// Parent application of a pid, from `/proc/<pid>/status`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_parent_of(pid: u32) -> Option<ParentProcess> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let ppid: u32 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))?
+        .trim()
+        .parse()
+        .ok()?;
+    // pid 0 is the kernel scheduler, never an application to restart.
+    if ppid == 0 {
+        return None;
+    }
+    // `comm` is truncated to 15 chars, which is fine for a display name.
+    let basename = std::fs::read_to_string(format!("/proc/{ppid}/comm"))
+        .ok()?
+        .trim()
+        .to_string();
+    if basename.is_empty() {
+        return None;
+    }
+    Some(ParentProcess {
+        pid: ppid,
+        basename,
+    })
 }
 
 /// macOS: `ps` for pid + accounting name (`ucomm`), then `proc_pidpath` for the
@@ -732,7 +1084,7 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
 #[cfg(target_os = "macos")]
 fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
     let Ok(out) = std::process::Command::new("ps")
-        .args(["-ax", "-o", "pid=", "-o", "ucomm="])
+        .args(["-ax", "-o", "pid=", "-o", "ppid=", "-o", "ucomm="])
         .output()
     else {
         return Vec::new();
@@ -748,31 +1100,69 @@ fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
         return Vec::new();
     }
     let text = String::from_utf8_lossy(&out.stdout);
+    // One pass over the whole table: `-ax` already lists every process, so the
+    // parent's name is here and needs no second `ps` (SOU-435).
+    let rows: Vec<(u32, u32, String)> = text
+        .lines()
+        .filter_map(parse_ps_pid_ppid_name_line)
+        .collect();
+    let names: std::collections::HashMap<u32, &str> = rows
+        .iter()
+        .map(|(pid, _, ucomm)| (*pid, ucomm.as_str()))
+        .collect();
+
     let mut procs = Vec::new();
-    for line in text.lines() {
-        let Some((pid, ucomm)) = parse_ps_pid_name_line(line) else {
-            continue;
-        };
+    for (pid, ppid, ucomm) in &rows {
         // ucomm is the accounting basename; filter before the more expensive path lookup.
-        if !is_gateway_basename(&ucomm) {
+        if !is_gateway_basename(ucomm) {
             continue;
         }
-        let path = macos_proc_pidpath(pid);
+        let path = macos_proc_pidpath(*pid);
         let basename = path
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or(ucomm);
+            .unwrap_or_else(|| ucomm.clone());
         if !is_gateway_basename(&basename) {
             continue;
         }
+        // pid 1 is launchd, never an application a user can restart.
+        let parent = (*ppid > 1)
+            .then(|| names.get(ppid))
+            .flatten()
+            .map(|name| ParentProcess {
+                pid: *ppid,
+                basename: (*name).to_string(),
+            });
         procs.push(GatewayProcess {
-            pid,
+            pid: *pid,
             path,
             basename,
+            parent,
         });
     }
     procs
+}
+
+/// Parse one `ps -o pid= -o ppid= -o ucomm=` row.
+///
+/// Both leading columns are required. A row missing the ppid column must fail
+/// rather than slide the name left, which is how a wrong `-o` argv would quietly
+/// produce nonsense parent attributions instead of an empty list (SOU-435).
+#[cfg(target_os = "macos")]
+fn parse_ps_pid_ppid_name_line(line: &str) -> Option<(u32, u32, String)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let pid = parts.next()?.parse().ok()?;
+    let ppid = parts.next()?.parse().ok()?;
+    let name = parts.collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        return None;
+    }
+    Some((pid, ppid, name))
 }
 
 /// Full executable path for a pid via libproc (handles spaces and symlinks).
@@ -877,6 +1267,24 @@ mod tests {
             pid,
             basename: basename.into(),
             path: path.map(PathBuf::from),
+            parent: None,
+        }
+    }
+
+    /// Same, with an attributed parent application.
+    fn proc_with_parent(
+        pid: u32,
+        basename: &str,
+        path: Option<&str>,
+        parent_pid: u32,
+        parent_name: &str,
+    ) -> GatewayProcess {
+        GatewayProcess {
+            parent: Some(ParentProcess {
+                pid: parent_pid,
+                basename: parent_name.into(),
+            }),
+            ..proc(pid, basename, path)
         }
     }
 
@@ -1217,6 +1625,7 @@ mod tests {
                     pid: 1,
                     path: Some(keep),
                     basename: "toolport-gateway".into(),
+                    parent: None,
                 },
                 &c
             ),
@@ -1229,6 +1638,7 @@ mod tests {
                     pid: 2,
                     path: Some(deleted),
                     basename: "toolport-gateway".into(),
+                    parent: None,
                 },
                 &c
             ),
@@ -1377,5 +1787,284 @@ mod tests {
         );
 
         drop(guard);
+    }
+
+    // ----- SOU-435: restart advice -------------------------------------------
+
+    /// Unique temp dir for a test that needs real files on disk.
+    ///
+    /// Ends in a literal `Toolport` segment because `decide_reap` only kills a
+    /// versioned gateway under a path `path_looks_like_our_install` recognizes; a
+    /// bare temp dir is treated as a stranger's binary and kept.
+    fn advice_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!(
+                "toolport-advice-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .join("Toolport");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A context where anything not at `keep` and not current-version is obsolete.
+    fn advice_ctx(keep: &Path) -> ReapContext {
+        ReapContext {
+            current_version: "9.9.9".into(),
+            keep_paths: vec![keep.to_path_buf()],
+            keep_pids: Vec::new(),
+            kill_all: false,
+        }
+    }
+
+    #[test]
+    fn advice_names_the_parent_app_and_carries_its_pid() {
+        let dir = advice_temp_dir("names-parent");
+        let keep = dir.join("toolport-gateway-9.9.9.exe");
+        let stale = dir.join("toolport-gateway-1.9.4.exe");
+        let ctx = advice_ctx(&keep);
+
+        let advice = clients_needing_restart(
+            &[proc_with_parent(
+                10,
+                "toolport-gateway-1.9.4.exe",
+                stale.to_str(),
+                77,
+                "claude.exe",
+            )],
+            &ctx,
+        );
+
+        assert_eq!(
+            advice,
+            vec![ClientNeedingRestart {
+                client: "claude.exe".into(),
+                client_pid: 77,
+                gateway: "toolport-gateway-1.9.4.exe".into(),
+            }],
+            "an obsolete gateway with a named parent must be attributed to that app"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn advice_is_empty_for_the_updater_kill_all_pass() {
+        let dir = advice_temp_dir("kill-all");
+        let keep = dir.join("toolport-gateway-9.9.9.exe");
+        let mut ctx = advice_ctx(&keep);
+        ctx.kill_all = true;
+
+        // The CURRENT gateway, which kill_all also reaps so the installer can
+        // replace it. Advising a restart because an app runs the current binary is
+        // nonsense the user would act on.
+        let procs = [proc_with_parent(
+            10,
+            "toolport-gateway-9.9.9.exe",
+            keep.to_str(),
+            77,
+            "claude.exe",
+        )];
+        assert_eq!(decide_reap(&procs[0], &ctx), ReapDecision::Kill);
+        assert!(
+            clients_needing_restart(&procs, &ctx).is_empty(),
+            "kill_all gives every process a Kill verdict, so obsolescence means nothing there"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The case #542 got backwards. ` (deleted)` means *unlinked*, which covers an
+    /// in-place replacement (self-heals, stay silent) and an abandoned install
+    /// location (does not self-heal, must advise). The old check treated the marker
+    /// alone as self-healing and so was silent for the second, and its test only
+    /// passed because it ran on macOS where no marker appears at all.
+    #[test]
+    fn deleted_marker_advises_only_when_the_path_is_really_gone() {
+        let dir = advice_temp_dir("deleted-marker");
+        let keep = dir.join("toolport-gateway-9.9.9");
+        let ctx = advice_ctx(&keep);
+
+        // Replaced in place: the file at the stripped path exists again, so the
+        // cached spawn command already resolves to the new binary.
+        let replaced = dir.join("toolport-gateway-1.9.4");
+        std::fs::write(&replaced, b"new code").unwrap();
+        let replaced_marked = format!("{} (deleted)", replaced.display());
+        let replaced_proc = proc_with_parent(
+            11,
+            "toolport-gateway-1.9.4",
+            Some(&replaced_marked),
+            77,
+            "claude.exe",
+        );
+        assert_eq!(
+            decide_reap(&replaced_proc, &ctx),
+            ReapDecision::Kill,
+            "the marked path must still miss keep-paths so the old inode is reaped"
+        );
+        assert!(
+            cached_path_self_heals(&replaced_proc),
+            "a replaced-in-place binary self-heals on the next spawn"
+        );
+        assert!(
+            clients_needing_restart(&[replaced_proc], &ctx).is_empty(),
+            "nothing to advise when the cached path already yields new code"
+        );
+
+        // Moved or removed: nothing at the stripped path. The client cannot spawn a
+        // gateway at all, which is worse than running an old one.
+        let removed = dir.join("toolport-gateway-1.9.5");
+        let removed_marked = format!("{} (deleted)", removed.display());
+        assert!(!removed.exists());
+        let removed_proc = proc_with_parent(
+            12,
+            "toolport-gateway-1.9.5",
+            Some(&removed_marked),
+            78,
+            "grok.exe",
+        );
+        assert!(
+            !cached_path_self_heals(&removed_proc),
+            "an abandoned install location never starts yielding new code"
+        );
+        assert_eq!(
+            clients_needing_restart(&[removed_proc], &ctx),
+            vec![ClientNeedingRestart {
+                client: "grok.exe".into(),
+                client_pid: 78,
+                gateway: "toolport-gateway-1.9.5".into(),
+            }],
+            "the stale-install-location case must be reported, on every platform"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn advice_skips_unattributable_and_non_app_parents() {
+        let dir = advice_temp_dir("skips");
+        let keep = dir.join("toolport-gateway-9.9.9.exe");
+        let stale = dir.join("toolport-gateway-1.9.4.exe");
+        let ctx = advice_ctx(&keep);
+        let stale_str = stale.to_str();
+
+        // No parent at all: nothing to name.
+        assert!(clients_needing_restart(
+            &[proc(10, "toolport-gateway-1.9.4.exe", stale_str)],
+            &ctx
+        )
+        .is_empty());
+
+        // Our own supervised HTTP bridge is not a client the user restarts.
+        assert!(clients_needing_restart(
+            &[proc_with_parent(
+                10,
+                "toolport-gateway-1.9.4.exe",
+                stale_str,
+                5,
+                "toolport.exe"
+            )],
+            &ctx
+        )
+        .is_empty());
+
+        // Init/kernel parents are not restartable applications. Both pid- and
+        // name-matched, so a systemd *user* session with its own pid is caught too.
+        for (ppid, name) in [
+            (1u32, "launchd"),
+            (4, "System"),
+            (900, "systemd"),
+            (0, "kernel"),
+        ] {
+            assert!(
+                clients_needing_restart(
+                    &[proc_with_parent(
+                        10,
+                        "toolport-gateway-1.9.4.exe",
+                        stale_str,
+                        ppid,
+                        name
+                    )],
+                    &ctx
+                )
+                .is_empty(),
+                "parent {name} (pid {ppid}) is not an app a user can restart"
+            );
+        }
+
+        // Unreadable path: decide_reap still reaches Kill via the basename fallback,
+        // but that skips the install-location guard and we cannot stop it either, so
+        // it may be a foreign user's process. Silence beats naming someone else's app.
+        assert!(clients_needing_restart(
+            &[proc_with_parent(
+                10,
+                "toolport-gateway-1.9.4.exe",
+                None,
+                77,
+                "claude.exe"
+            )],
+            &ctx
+        )
+        .is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn advice_dedupes_repeat_respawns_of_the_same_app() {
+        let dir = advice_temp_dir("dedupe");
+        let keep = dir.join("toolport-gateway-9.9.9.exe");
+        let stale = dir.join("toolport-gateway-1.9.4.exe");
+        let ctx = advice_ctx(&keep);
+        let stale_str = stale.to_str();
+
+        // One app that respawned the same gateway three times is one thing to do.
+        let advice = clients_needing_restart(
+            &[
+                proc_with_parent(10, "toolport-gateway-1.9.4.exe", stale_str, 77, "claude.exe"),
+                proc_with_parent(11, "toolport-gateway-1.9.4.exe", stale_str, 77, "claude.exe"),
+                proc_with_parent(12, "toolport-gateway-1.9.4.exe", stale_str, 77, "claude.exe"),
+            ],
+            &ctx,
+        );
+        assert_eq!(advice.len(), 1, "one entry per app to act on, not per respawn");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The ordering requirement that three review rounds kept relocating: advice is
+    /// derived from the same snapshot the kill list is, so it cannot be read from a
+    /// table a previous pass already cleared.
+    #[test]
+    fn plan_reap_derives_advice_from_the_same_prekill_snapshot() {
+        let dir = advice_temp_dir("plan");
+        let keep = dir.join("toolport-gateway-9.9.9.exe");
+        let stale = dir.join("toolport-gateway-1.9.4.exe");
+        let ctx = advice_ctx(&keep);
+
+        let procs = vec![
+            proc_with_parent(10, "toolport-gateway-1.9.4.exe", stale.to_str(), 77, "claude.exe"),
+            proc_with_parent(11, "toolport-gateway-9.9.9.exe", keep.to_str(), 78, "cursor.exe"),
+        ];
+        let plan = plan_reap(&procs, &ctx);
+
+        assert_eq!(plan.to_kill.len(), 1, "only the obsolete gateway is killed");
+        assert_eq!(plan.to_kill[0].pid, 10);
+        assert_eq!(plan.kept.len(), 1, "the current gateway is kept");
+        assert_eq!(
+            plan.needs_restart,
+            vec![ClientNeedingRestart {
+                client: "claude.exe".into(),
+                client_pid: 77,
+                gateway: "toolport-gateway-1.9.4.exe".into(),
+            }],
+            "advice comes from the pre-kill snapshot, alongside the kill list"
+        );
+
+        // The post-kill table: the obsolete process is gone and its client has not
+        // respawned yet. Planning against it yields nothing, which is exactly why
+        // the advice must not be recomputed after a reap.
+        let after = plan_reap(&procs[1..], &ctx);
+        assert!(
+            after.needs_restart.is_empty(),
+            "a post-kill table cannot produce the advice, so it must never be the source"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

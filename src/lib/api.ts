@@ -363,13 +363,51 @@ export function httpBridgeStatus(): Promise<HttpBridgeStatus> {
 }
 
 /**
+ * An application that keeps relaunching an obsolete gateway, so only restarting
+ * that application delivers the new gateway code (SOU-435).
+ */
+export type ClientNeedingRestart = {
+  /** Application basename, e.g. `claude.exe`. */
+  client: string;
+  /** Its pid. The entry disappears once that process is gone. */
+  clientPid: number;
+  /** The obsolete gateway image it relaunched. */
+  gateway: string;
+};
+
+/** What a reaper run did, and what the user still has to do about it. */
+export type ReapOutcome = {
+  /** Human-readable labels of processes that were stopped. */
+  killed: string[];
+  /** Matched but could not be stopped. Distinct from "nothing was stale". */
+  failed: string[];
+  /** Apps needing a manual restart, accumulated across passes this session. */
+  needsRestart: ClientNeedingRestart[];
+};
+
+/**
  * Stop obsolete Toolport gateway processes (older versions / stale paths).
  * Keeps the current resolved binary and the supervised HTTP bridge when they
- * match. Clients that auto-respawn MCP pick up the current binary on the next
- * tool call. Returns human-readable labels of processes that were stopped.
+ * match.
+ *
+ * Reaping alone does not always deliver new gateway code: a client caches its
+ * spawn command at its own startup, so one pinned to a path an upgrade never
+ * rewrites relaunches the same obsolete binary. Those apps come back in
+ * `needsRestart`, which is why this returns an outcome rather than a killed list.
  */
-export function stopStaleGateways(): Promise<string[]> {
-  return invoke<string[]>("stop_stale_gateways");
+export function stopStaleGateways(): Promise<ReapOutcome> {
+  return invoke<ReapOutcome>("stop_stale_gateways");
+}
+
+/**
+ * Apps needing a restart, without running a reaper pass.
+ *
+ * Read from stored state rather than recomputed: the advice is only visible in a
+ * pre-kill process table, so asking after a reap would always come back emptier
+ * than the truth.
+ */
+export function clientsNeedingRestart(): Promise<ClientNeedingRestart[]> {
+  return invoke<ClientNeedingRestart[]>("clients_needing_restart");
 }
 
 /**

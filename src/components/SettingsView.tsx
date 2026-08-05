@@ -58,6 +58,8 @@ import {
   startHttpBridge,
   stopHttpBridge,
   stopStaleGateways,
+  clientsNeedingRestart,
+  type ClientNeedingRestart,
   type HttpBridgeStatus,
   type QuarantinedTool,
 } from "@/lib/api";
@@ -572,6 +574,15 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   const [clientBusy, setClientBusy] = useState(false);
   const [reapBusy, setReapBusy] = useState(false);
   const [reapResult, setReapResult] = useState<string | null>(null);
+  // Apps still launching an obsolete gateway. Seeded from stored state because the
+  // launch reaper already found them before this view existed; refreshed from the
+  // button's own outcome, which merges rather than replaces (SOU-435).
+  const [needsRestart, setNeedsRestart] = useState<ClientNeedingRestart[]>([]);
+  useEffect(() => {
+    clientsNeedingRestart()
+      .then(setNeedsRestart)
+      .catch(() => {});
+  }, []);
   const [autostartOn, setAutostartOn] = useState(false);
 
   const httpClients = registry?.httpClients ?? [];
@@ -1286,11 +1297,28 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                 setReapBusy(true);
                 setReapResult(null);
                 try {
-                  const stopped = await stopStaleGateways();
+                  const outcome = await stopStaleGateways();
+                  // Always from the outcome: it carries the merged advice, so
+                  // clicking Run before a client has respawned cannot blank the
+                  // panel below (SOU-435).
+                  setNeedsRestart(outcome.needsRestart);
+                  const parts: string[] = [];
+                  if (outcome.killed.length > 0) {
+                    parts.push(
+                      `Stopped ${outcome.killed.length}: ${outcome.killed.join("; ")}`,
+                    );
+                  }
+                  // Reporting "found nothing" while a process is still running would
+                  // be the same lie the panel exists to prevent.
+                  if (outcome.failed.length > 0) {
+                    parts.push(
+                      `Could not stop ${outcome.failed.length}: ${outcome.failed.join("; ")}`,
+                    );
+                  }
                   setReapResult(
-                    stopped.length === 0
+                    parts.length === 0
                       ? "No old gateway processes found."
-                      : `Stopped ${stopped.length}: ${stopped.join("; ")}`,
+                      : parts.join(". "),
                   );
                 } catch (e) {
                   toastError(`Couldn't stop old gateways: ${e}`);
@@ -1304,6 +1332,28 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
             </button>
           </div>
           {reapResult && <p className="text-xs text-muted-foreground">{reapResult}</p>}
+          {needsRestart.length > 0 && (
+            <div className="rounded-md border border-warning/40 bg-warning/5 p-3">
+              <p className="text-xs font-medium text-warning">
+                {needsRestart.length === 1
+                  ? "1 app is still launching an old gateway"
+                  : `${needsRestart.length} apps are still launching an old gateway`}
+              </p>
+              <ul className="mt-1.5 space-y-1">
+                {needsRestart.map((c) => (
+                  <li key={c.clientPid} className="text-xs text-muted-foreground">
+                    <span className="font-medium text-foreground">{c.client}</span> keeps
+                    starting <code className="font-mono">{c.gateway}</code>
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-2 text-xs text-muted-foreground">
+                These apps cached the old gateway path when they started, so stopping the
+                process only makes them launch it again. Restart each one to pick up the
+                current gateway. This list clears itself as you do.
+              </p>
+            </div>
+          )}
         </div>
       </section>
     </div>

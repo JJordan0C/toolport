@@ -35,6 +35,7 @@ import {
   setAllEnabled,
   setServerEnabled,
   teamSyncWait,
+  type ClientNeedingRestart,
 } from "@/lib/api";
 import {
   importableServers,
@@ -287,6 +288,31 @@ function App() {
     const unlisten = listen<ProbeResult>("server-probed", (e) => {
       setHealth((h) => ({ ...h, [e.payload.serverId]: e.payload }));
       setBackendReachable(true);
+    });
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, []);
+
+  // The launch reaper stops obsolete gateways, but an app that was already running
+  // cached the old spawn command and just launches it again. Only restarting that
+  // app fixes it, and nothing else in the UI would say so (SOU-435). Settings keeps
+  // the durable list; this is the nudge for someone who never opens it.
+  useEffect(() => {
+    const unlisten = listen<ClientNeedingRestart[]>("gateway-restart-needed", (e) => {
+      const apps = e.payload;
+      if (apps.length === 0) return;
+      const names = [...new Set(apps.map((a) => a.client))].join(", ");
+      toast.warning(
+        apps.length === 1
+          ? `${names} is still starting an old gateway`
+          : `${names} are still starting an old gateway`,
+        {
+          description:
+            "They cached the old path at startup, so restarting them is the only way to pick up the current gateway. Settings keeps the list.",
+          duration: 10000,
+        },
+      );
     });
     return () => {
       void unlisten.then((f) => f());

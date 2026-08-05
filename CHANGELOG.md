@@ -8,6 +8,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Added
 
+- Toolport now names the apps that keep launching an obsolete gateway. Stopping a
+  stale gateway process is not always enough: an app caches its spawn command when
+  it starts, so one pinned to a path an upgrade never rewrites simply launches the
+  same old binary again, and only restarting that app picks up the current gateway.
+  Settings lists which apps are in that state, a launch notification names them, and
+  each entry clears itself once you restart that app. Settings also now reports
+  processes it found but could not stop, instead of reading as if nothing was
+  stale. (SOU-435)
 - Modern extension negotiation now passes opaque client extension settings to
   downstream servers and aggregates compatible downstream extension declarations
   in `server/discover`. Unknown `_meta` and result fields continue through unchanged;
