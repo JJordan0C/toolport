@@ -4231,7 +4231,8 @@ fn execute_call(
             } else {
                 recovery_hint(cached, srv)
             };
-            let out = defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
+            let Defended { result: out, pii } =
+                defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
             if let Some(profiler) = &mut call_profiler {
                 profiler.mark_postprocess();
             }
@@ -4242,7 +4243,7 @@ fn execute_call(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let err = if ok { None } else { Some(content_text(&out)) };
-            audit::record_timed_with_hash(
+            audit::record_timed_with_pii(
                 srv,
                 tool,
                 ok,
@@ -4250,6 +4251,7 @@ fn execute_call(
                 err.as_deref(),
                 client,
                 Some(&call_args_hash),
+                pii,
             );
             if let Some(profiler) = call_profiler {
                 profiler.finish();
@@ -4259,15 +4261,6 @@ fn execute_call(
         Err(e) => {
             finish_modern_hitl(active_modern_hitl.as_deref());
             let ms = started.elapsed().as_millis() as u64;
-            audit::record_timed_with_hash(
-                srv,
-                tool,
-                false,
-                Some(ms),
-                Some(&e),
-                client,
-                Some(&call_args_hash),
-            );
             // Live inspection: capture the failed call too, with the error
             // as the response body. Only when live_inspect is on.
             if let Some(req) = &inspect_args {
@@ -4283,7 +4276,10 @@ fn execute_call(
                 "content": [{ "type": "text", "text": e }],
                 "isError": true,
             });
-            defend_and_shape(
+            // Defend first, then audit: the error text runs through the same PII pass as
+            // a successful result, and the audit row has to carry that pass's count like
+            // the success path does (SBS-607).
+            let Defended { result: out, pii } = defend_and_shape(
                 reg,
                 srv,
                 tool,
@@ -4291,7 +4287,18 @@ fn execute_call(
                 result,
                 &recovery_hint(cached, srv),
                 shape,
-            )
+            );
+            audit::record_timed_with_pii(
+                srv,
+                tool,
+                false,
+                Some(ms),
+                Some(&e),
+                client,
+                Some(&call_args_hash),
+                pii,
+            );
+            out
         }
     }
 }
@@ -4606,7 +4613,11 @@ fn rehydrated_for_local_approver(
     copy
 }
 
-/// An incomplete pass is logged. This path fails OPEN -- a full map or an over-cap
+/// `None` when PII redaction is off for this call. `Some` carries the count and the
+/// `complete` flag out to the audit record, so Activity can show "N values
+/// pseudonymized" and, crucially, flag a pass that did not fully apply (SBS-607).
+///
+/// An incomplete pass is also logged. This path fails OPEN -- a full map or an over-cap
 /// result leaves values in the clear -- and the whole point of returning
 /// `complete` was so that could be noticed rather than assumed away.
 fn pseudonymize_if_enabled(
@@ -4614,9 +4625,9 @@ fn pseudonymize_if_enabled(
     client: Option<&str>,
     server: &str,
     result: &mut Value,
-) -> usize {
+) -> Option<audit::PiiPass> {
     if !reg.pii_redaction_effective() {
-        return 0;
+        return None;
     }
     let origin = pii_origin_id(server);
     let out = with_pii_session(client, |map| pii::pseudonymize_result(map, &origin, result));
@@ -4625,7 +4636,10 @@ fn pseudonymize_if_enabled(
             "toolport: PII pseudonymization was incomplete for this result - some values reached the model in the clear (the session map is full, or the result exceeded the scan cap)."
         );
     }
-    out.replaced
+    Some(audit::PiiPass {
+        replaced: out.replaced,
+        complete: out.complete,
+    })
 }
 
 fn defend_and_shape(
@@ -4636,14 +4650,14 @@ fn defend_and_shape(
     mut result: Value,
     trailer: &str,
     shape: bool,
-) -> Value {
+) -> Defended {
     // Scan untrusted output for injection; label always, optionally fail closed.
     // Block mode alone must still run the scanner: an org forceBlockOnInjection (or a
     // local blockOnInjection) with contentDefense off would otherwise silently do
     // nothing (SOU-345).
     // PII first, then injection defense: the wrap must go around already-
     // pseudonymized text, not the other way round.
-    pseudonymize_if_enabled(reg, client, srv, &mut result);
+    let pii = pseudonymize_if_enabled(reg, client, srv, &mut result);
     if reg.content_defense_effective() || reg.block_on_injection_effective() {
         let block = reg.should_block_injection_for(srv);
         if let Some(msg) = integrity::defend_content(srv, tool, &mut result, block) {
@@ -4681,7 +4695,19 @@ fn defend_and_shape(
             arr.push(json!({ "type": "text", "text": trailer }));
         }
     }
-    result
+    Defended { result, pii }
+}
+
+/// [`defend_and_shape`]'s output: the agent-facing result, plus what the PII pass did on
+/// the way through.
+///
+/// The pass runs deep inside this function but has to reach the audit record the CALLER
+/// writes, so it rides back out here rather than being logged in two places or
+/// recomputed (SBS-607).
+struct Defended {
+    result: Value,
+    /// `None` when PII redaction was off for this call -- see [`pseudonymize_if_enabled`].
+    pii: Option<audit::PiiPass>,
 }
 
 /// Exposed tool names for code-mode `servers.*` stubs: full catalog minus gateway
@@ -12552,8 +12578,12 @@ mod tests {
         let mut result = json!({
             "contents": [{ "type": "text", "text": "owner ada@example.com" }]
         });
-        let replaced = pseudonymize_if_enabled(&reg, client, "my-crm", &mut result);
-        assert_eq!(replaced, 1, "the resource text should have been tokenized");
+        let pass = pseudonymize_if_enabled(&reg, client, "my-crm", &mut result)
+            .expect("redaction is on, so the pass must be reported");
+        assert_eq!(
+            pass.replaced, 1,
+            "the resource text should have been tokenized"
+        );
 
         // Then dispatch the way execute_call does: the sanitized id.
         let sanitized = sanitize_segment("my-crm");
@@ -12565,6 +12595,80 @@ mod tests {
         assert_eq!(
             out["to"], "ada@example.com",
             "resource-minted PII must resolve for a tool on the same server"
+        );
+    }
+
+    #[test]
+    fn defend_and_shape_reports_the_pii_pass_to_the_audit_caller() {
+        // SBS-607: the count is computed deep inside defend_and_shape, but the audit
+        // record is written by its caller, so the pass has to survive the return.
+        let client = Some("pii-audit-pass");
+        let mut reg = Registry::default();
+        let body = |text: &str| json!({ "content": [{ "type": "text", "text": text }] });
+        let rendered = |v: &Value| serde_json::to_string(v).expect("a JSON result");
+
+        // Redaction off reports NO pass. "Not enabled" and "enabled, found nothing" are
+        // different facts, and a zero pass here would make an untouched call read as a
+        // clean redaction.
+        with_pii_session(client, |map| *map = pii::SessionMap::new());
+        let off = defend_and_shape(
+            &reg,
+            "crm",
+            "crm__lookup",
+            client,
+            body("ada@example.com"),
+            "",
+            true,
+        );
+        assert!(
+            off.pii.is_none(),
+            "redaction is off, so no pass is reported"
+        );
+        assert!(
+            rendered(&off.result).contains("ada@example.com"),
+            "guard the premise: with redaction off nothing was rewritten"
+        );
+
+        // On, and the pass fully applied.
+        reg.pii_redaction = true;
+        with_pii_session(client, |map| *map = pii::SessionMap::new());
+        let on = defend_and_shape(
+            &reg,
+            "crm",
+            "crm__lookup",
+            client,
+            body("ada@example.com and bob@example.com"),
+            "",
+            true,
+        );
+        let pass = on.pii.expect("redaction is on, so a pass must be reported");
+        assert_eq!(pass.replaced, 2, "both addresses were tokenized");
+        assert!(pass.complete, "nothing was left in the clear");
+
+        // A full map leaves values in the clear. This path fails OPEN by design, so an
+        // incomplete pass is precisely what the flag exists to surface -- without it the
+        // call is indistinguishable from a clean one.
+        with_pii_session(client, |map| *map = pii::SessionMap::with_capacity(1));
+        let leaky = defend_and_shape(
+            &reg,
+            "crm",
+            "crm__lookup",
+            client,
+            body("ada@example.com and bob@example.com"),
+            "",
+            true,
+        );
+        let pass = leaky
+            .pii
+            .expect("redaction is on, so a pass must be reported");
+        assert_eq!(pass.replaced, 1, "only the first value fit in the map");
+        assert!(
+            !pass.complete,
+            "the second value reached the model in the clear"
+        );
+        assert!(
+            rendered(&leaky.result).contains("bob@example.com"),
+            "guard the premise: the unmapped value really is still in the clear"
         );
     }
 
@@ -12943,7 +13047,8 @@ mod tests {
             "content": [{ "type": "text", "text": payload }],
             "isError": true,
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
+        let out =
+            defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true).result;
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(
             text.contains("external data"),
@@ -12960,7 +13065,7 @@ mod tests {
             "content": [{ "type": "text", "text": "e".repeat(200_000) }],
             "isError": true,
         });
-        let shaped = defend_and_shape(&reg, "srv", "srv__t", None, huge, "", true);
+        let shaped = defend_and_shape(&reg, "srv", "srv__t", None, huge, "", true).result;
         let shaped_text = shaped["content"][0]["text"].as_str().unwrap();
         assert!(
             shaped_text.len() < 200_000,
@@ -12980,7 +13085,8 @@ mod tests {
             clean,
             "Try list_things first.",
             true,
-        );
+        )
+        .result;
         let blocks = with_hint["content"].as_array().unwrap();
         let trailer = blocks.last().unwrap()["text"].as_str().unwrap();
         assert_eq!(trailer, "Try list_things first.");
@@ -13000,7 +13106,8 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
+        let out =
+            defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true).result;
         assert_eq!(out["isError"], true, "blocked call must be isError");
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("blocked"), "security message");
@@ -13019,7 +13126,8 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
+        let out =
+            defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true).result;
         assert_ne!(
             out["content"][0]["text"]
                 .as_str()
@@ -13041,7 +13149,8 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
+        let out =
+            defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true).result;
         assert!(out["content"][0]["text"]
             .as_str()
             .unwrap()
@@ -13060,7 +13169,8 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
+        let out =
+            defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true).result;
         assert_eq!(out["isError"], true);
         assert!(
             out["content"][0]["text"]

@@ -73,6 +73,14 @@ export interface AuditEntry {
   /** The registered HTTP client that made the call, when known. Absent for the
    * local desktop client and legacy/open tokens. */
   client?: string;
+  /** How many values this call's result had pseudonymized. Absent when PII redaction was
+   * off for the call — which is deliberately distinct from `0` ("it ran, found nothing").
+   * A count only; the values themselves never enter the audit log. */
+  piiReplaced?: number;
+  /** Present (and always `true`) when the pass left values in the clear: the session map
+   * hit its cap, or the result exceeded the scan cap. Pseudonymization fails OPEN by
+   * design, so this is the case the row most needs to show. */
+  piiIncomplete?: boolean;
 }
 
 /** One live-inspection capture: a tool call's request args and response, plus timing.
