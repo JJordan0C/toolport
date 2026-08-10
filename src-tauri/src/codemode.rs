@@ -1562,11 +1562,22 @@ mod tests {
     }
 
     #[test]
-    fn parallel_host_calls_overlap_in_wall_clock() {
-        // Each call sleeps ~80ms. Three sequential would be ~240ms; with max_parallel >= 3
-        // the batch should finish near one sleep (+ overhead).
-        let call: CallBinding = Arc::new(|name: &str, _: Value| {
+    fn parallel_host_calls_overlap() {
+        // Measure overlap directly instead of inferring it from wall-clock timing. The
+        // latter flakes on loaded runners even when all three workers are concurrent.
+        let in_flight = Arc::new(Mutex::new(0usize));
+        let peak = Arc::new(Mutex::new(0usize));
+        let in_flight2 = in_flight.clone();
+        let peak2 = peak.clone();
+        let call: CallBinding = Arc::new(move |name: &str, _: Value| {
+            {
+                let mut current = in_flight2.lock().unwrap();
+                *current += 1;
+                let mut observed_peak = peak2.lock().unwrap();
+                *observed_peak = (*observed_peak).max(*current);
+            }
             thread::sleep(StdDuration::from_millis(80));
+            *in_flight2.lock().unwrap() -= 1;
             json!({ "echo": name })
         });
         let limits = Limits {
@@ -1574,7 +1585,6 @@ mod tests {
             wall_clock: StdDuration::from_secs(10),
             ..Limits::default()
         };
-        let started = Instant::now();
         let out = run(
             r#"
                 return await Promise.all([
@@ -1587,14 +1597,9 @@ mod tests {
             call,
             limits,
         );
-        let elapsed = started.elapsed();
         assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
         assert_eq!(out.calls, 3);
-        // Three 80ms sequential would be ~240ms; allow headroom for scheduler noise.
-        assert!(
-            elapsed < StdDuration::from_millis(220),
-            "expected overlapping host calls, took {elapsed:?}"
-        );
+        assert_eq!(*peak.lock().unwrap(), 3, "all host calls should overlap");
     }
 
     #[test]
