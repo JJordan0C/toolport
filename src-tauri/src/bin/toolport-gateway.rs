@@ -58,7 +58,10 @@ use conduit_lib::{audit, usage_report};
 /// without relying on process-wide single-client state (SBS-551).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum UpstreamTransport {
+    /// No transport was installed for this worker. Delivery decisions must fail
+    /// closed rather than guessing that process stdout belongs to the caller.
     #[default]
+    Unknown,
     Stdio,
     Http,
 }
@@ -68,7 +71,7 @@ struct ActiveRequestContext {
     /// Protocol version when the active client is modern (2026-07-28+).
     upstream_version: Option<String>,
     /// Per-request modern client capabilities used for MRTR/server RPC gating.
-    upstream_capabilities: Option<Value>,
+    upstream_capabilities: Option<Arc<Value>>,
     /// Legacy HTTP session or modern subscription key used for upstream routing.
     mcp_session: Option<String>,
     /// Transport carrying the originating request. Progress and notifications
@@ -82,7 +85,7 @@ thread_local! {
             upstream_version: None,
             upstream_capabilities: None,
             mcp_session: None,
-            upstream_transport: UpstreamTransport::Stdio,
+            upstream_transport: UpstreamTransport::Unknown,
         }) };
 }
 
@@ -112,7 +115,7 @@ fn serving_modern_client() -> bool {
     ACTIVE_REQUEST_CONTEXT.with(|cell| cell.borrow().upstream_version.is_some())
 }
 
-struct UpstreamCapabilitiesGuard(Option<Value>);
+struct UpstreamCapabilitiesGuard(Option<Arc<Value>>);
 
 impl UpstreamCapabilitiesGuard {
     fn enter(req: &Value) -> Self {
@@ -120,7 +123,8 @@ impl UpstreamCapabilitiesGuard {
             .get("params")
             .and_then(|params| params.get("_meta"))
             .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"))
-            .cloned();
+            .cloned()
+            .map(Arc::new);
         let previous = ACTIVE_REQUEST_CONTEXT.with(|cell| {
             std::mem::replace(&mut cell.borrow_mut().upstream_capabilities, capabilities)
         });
@@ -18858,6 +18862,61 @@ mod tests {
         assert_eq!(active_mcp_session().as_deref(), Some("parent-session"));
         assert!(serving_modern_client());
         assert!(modern_client_supports_server_rpc("roots/list"));
+    }
+
+    #[test]
+    fn cloned_request_context_shares_large_capability_snapshot() {
+        let large = "x".repeat(256 * 1024);
+        let req = json!({
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": { "test/large": { "payload": large } }
+                    }
+                }
+            }
+        });
+        let _capabilities = UpstreamCapabilitiesGuard::enter(&req);
+        let original = active_request_context();
+        let original_caps = original
+            .upstream_capabilities
+            .as_ref()
+            .expect("capabilities installed");
+
+        for _ in 0..64 {
+            let worker = original.clone();
+            assert!(Arc::ptr_eq(
+                original_caps,
+                worker
+                    .upstream_capabilities
+                    .as_ref()
+                    .expect("worker retains capabilities")
+            ));
+        }
+    }
+
+    #[test]
+    fn missing_transport_fails_closed_for_progress() {
+        assert_eq!(
+            active_request_context().upstream_transport,
+            UpstreamTransport::Unknown,
+            "test starts without a transport installed"
+        );
+        assert_eq!(
+            progress_target(),
+            None,
+            "an unknown transport is not an implicit stdio delivery channel"
+        );
+
+        let meta = json!({ "progressToken": "must-not-route" });
+        let (registration, relayed) = prepare_progress(Some(&meta), "alpha");
+        assert!(registration.is_none());
+        assert!(
+            relayed
+                .expect("metadata is relayed without progress")
+                .get("progressToken")
+                .is_none()
+        );
     }
 
     #[test]
