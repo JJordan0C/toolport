@@ -12615,6 +12615,9 @@ mod tests {
         // SBS-605 at the dispatch boundary: an injected result talks the model into
         // putting the CRM's customer address in a URL for an unrelated fetch tool.
         // This is the call that must never leave the machine.
+        // Refusal path: needs a guaranteed-broker-free env, or a stub broker published by
+        // a concurrent test would approve the release this test exists to prevent.
+        let _env = pii_test_env("pii-cross-server-regression");
         let client = Some("pii-cross-server-regression");
         with_pii_session(client, |map| {
             *map = pii::SessionMap::new();
@@ -12632,12 +12635,41 @@ mod tests {
         );
     }
 
-    /// Point the gateway's broker lookup at `dir` and publish a stub broker there that
-    /// answers every request with `decision`, handing back what it was asked.
+    /// A serialized, broker-free environment for a test that can hit the PII dispatch path.
     ///
-    /// The descriptor lives in the data dir, so a test that does NOT call this sees no
-    /// broker at all — which is both the headless case and the reason a developer running
-    /// the real desktop app can't have these tests block on a live prompt.
+    /// EVERY test that can produce a cross-server refusal must hold one, because the
+    /// refusal now dials the approval broker (SBS-696) and the data-dir override deciding
+    /// whether a broker exists is process-GLOBAL. Without this, a refusal test running
+    /// beside [`stub_broker`] dials that stub, is approved, and both tests fail: the
+    /// refusal test because its value was released, and the stub's owner because its one
+    /// `accept()` was consumed. That is exactly how this first failed on CI.
+    ///
+    /// Holding it also means a developer with the real desktop app running cannot have
+    /// these tests block on a live human prompt: the scratch dir has no descriptor unless
+    /// the test puts one there.
+    struct PiiTestEnv {
+        dir: std::path::PathBuf,
+        // Declaration order IS drop order: release the override before the lock, so the
+        // next test never observes this scratch dir.
+        _data_dir: conduit_lib::registry::DataDirOverride,
+        _env: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn pii_test_env(name: &str) -> PiiTestEnv {
+        let env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("toolport-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a writable scratch dir");
+        let data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        PiiTestEnv {
+            dir,
+            _data_dir: data_dir,
+            _env: env,
+        }
+    }
+
+    /// Publish a stub broker into `env`'s data dir that answers one request with
+    /// `decision`, handing back what it was asked.
     fn stub_broker(
         dir: &std::path::Path,
         decision: approval::ApprovalDecision,
@@ -12677,21 +12709,12 @@ mod tests {
         rx
     }
 
-    fn pii_scratch_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("toolport-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a writable scratch dir");
-        dir
-    }
-
     #[test]
     fn a_cross_server_refusal_stands_when_there_is_nobody_to_ask() {
         // SBS-696 headless: the release is a HUMAN decision, so with no reachable broker
         // the SBS-605 refusal is unchanged. This is the case that must never fail open.
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = pii_scratch_dir("pii-release-headless");
-        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
-        // No descriptor written: nothing for the gateway to dial.
+        // No stub broker published into this env: nothing for the gateway to dial.
+        let _env = pii_test_env("pii-release-headless");
 
         let client = Some("pii-release-headless");
         with_pii_session(client, |map| {
@@ -12727,10 +12750,8 @@ mod tests {
         // The whole point of SBS-696: read a customer from the CRM, then mail them via a
         // different server. The first pass refuses, a human approves, the retry dispatches
         // the real address.
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = pii_scratch_dir("pii-release-approved");
-        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
-        let asked = stub_broker(&dir, approval::ApprovalDecision::Approved);
+        let env = pii_test_env("pii-release-approved");
+        let asked = stub_broker(&env.dir, approval::ApprovalDecision::Approved);
 
         let client = Some("pii-release-approved");
         with_pii_session(client, |map| {
@@ -12780,10 +12801,8 @@ mod tests {
 
     #[test]
     fn a_denied_release_refuses_and_grants_nothing() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = pii_scratch_dir("pii-release-denied");
-        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
-        let _asked = stub_broker(&dir, approval::ApprovalDecision::Denied);
+        let env = pii_test_env("pii-release-denied");
+        let _asked = stub_broker(&env.dir, approval::ApprovalDecision::Denied);
 
         let client = Some("pii-release-denied");
         with_pii_session(client, |map| {
@@ -12842,6 +12861,8 @@ mod tests {
 
     #[test]
     fn mrtr_retry_fields_refuse_another_servers_token() {
+        // Same reason as the arguments-path refusal above: this dials the broker now.
+        let _env = pii_test_env("pii-mrtr-cross-server");
         let client = Some("pii-mrtr-cross-server");
         with_pii_session(client, |map| {
             *map = pii::SessionMap::new();
