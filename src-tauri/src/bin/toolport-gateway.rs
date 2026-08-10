@@ -4293,12 +4293,13 @@ fn execute_call(
                 &recovery_hint(cached, srv),
                 shape,
             );
+            let defended_err = audited_error_text(&e, &out);
             audit::record_timed_with_pii(
                 srv,
                 tool,
                 false,
                 Some(ms),
-                Some(&e),
+                Some(&defended_err),
                 client,
                 Some(&call_args_hash),
                 pii,
@@ -4549,10 +4550,13 @@ fn rehydrate_for_downstream(
             let mut retry = pristine;
             let still =
                 with_pii_session(client, |map| pii::rehydrate_args(map, &origin, &mut retry));
-            // The approval covered exactly the refused set, so an empty result here is the
-            // expected outcome. A non-empty one means the map changed under us (a session
-            // reset between the prompt and the retry); fall through and refuse.
-            if still.is_empty() {
+            // Both checks are required. An empty `still` alone does NOT mean the release
+            // took effect: `pii::rehydrate` reports an unknown token as resolved-with-
+            // nothing rather than as a refusal, so a session map cleared during the human
+            // wait yields an empty set while the arguments still carry literal pseudonyms.
+            // Dispatching those would send a request the user never meant and log it as a
+            // successful release.
+            if still.is_empty() && all_tokens_substituted(&retry, &refused) {
                 return Ok(retry);
             }
         }
@@ -4583,6 +4587,11 @@ fn approve_pii_release(
 ) -> bool {
     // Real values, read out of the session map for the prompt. They go to the loopback
     // broker and nowhere else -- not the audit record below, not the model.
+    //
+    // These are also the binding record of WHAT was approved. The human decision takes up
+    // to two minutes, and the map can be cleared and re-minted by another session on
+    // another thread in that window, so the same token can stand for a different person by
+    // the time the answer arrives.
     let values: Vec<approval::PiiReleaseValue> = with_pii_session(client, |map| {
         refused
             .iter()
@@ -4616,7 +4625,9 @@ fn approve_pii_release(
         url_elicitation: None,
         pii_release: Some(approval::PiiReleaseRequest {
             server: server.to_string(),
-            values,
+            // Cloned: the originals stay here as the record of what was on screen, to be
+            // re-checked against the map once the answer comes back.
+            values: values.clone(),
         }),
     });
     // The audit record names the tokens' count via the args hash only -- `record_decision`
@@ -4634,12 +4645,58 @@ fn approve_pii_release(
         return false;
     }
     let origin = pii_origin_id(server);
+    // Bind the grant to the VALUES the human was shown, not merely to the token ids. If a
+    // token now stands for someone else -- or for nothing, because the map was cleared --
+    // the approval on screen was for a different question, and widening origins on it
+    // would release a value nobody ever saw.
+    //
+    // Verified in full before anything is granted, under one lock: a partial grant would
+    // leave origins widened for a release the caller then refuses.
     with_pii_session(client, |map| {
-        for token in refused {
-            map.approve_origin(token, &origin);
+        let unchanged = values.iter().all(|shown| {
+            map.disclose(&shown.token)
+                .is_some_and(|now| now.value == shown.value)
+        });
+        if !unchanged {
+            return false;
         }
-    });
-    true
+        values
+            .iter()
+            .all(|shown| map.approve_origin(&shown.token, &origin))
+    })
+}
+
+/// The text a failed call is audited under.
+///
+/// The DEFENDED body, not `raw`. A downstream error is attacker-controlled and routinely
+/// echoes the arguments, so it can carry the very values the PII pass just removed from
+/// `defended` -- and the audit row now asserts `piiReplaced` beside it (SBS-607). Logging
+/// the raw string there would put an address in the append-only log while claiming
+/// redaction ran.
+///
+/// Falls back to `raw` only when the defended body has no text at all, so a failure is
+/// never audited with an empty reason.
+fn audited_error_text(raw: &str, defended: &Value) -> String {
+    let text = content_text(defended);
+    if text.trim().is_empty() {
+        raw.to_string()
+    } else {
+        text
+    }
+}
+
+/// True when none of `tokens` still appears literally in `value`.
+///
+/// The post-approval check an empty refused set cannot make on its own:
+/// [`pii::SessionMap::rehydrate`] deliberately reports an UNKNOWN token as
+/// resolved-with-nothing rather than as a refusal (the model may echo a token from another
+/// session, and there is no value behind it to leak). So a map cleared mid-approval yields
+/// "nothing refused" over arguments that still carry literal pseudonyms.
+fn all_tokens_substituted(value: &Value, tokens: &std::collections::BTreeSet<String>) -> bool {
+    let rendered = value.to_string();
+    tokens
+        .iter()
+        .all(|token| !rendered.contains(token.as_str()))
 }
 
 /// The same resolve-and-refuse pass as [`rehydrate_for_downstream`], for the MRTR
@@ -4696,17 +4753,25 @@ fn rehydrate_mrtr_for_downstream(
         if approve_pii_release(client, server, tool, &refused, &shown) {
             let mut retry = mrtr.clone();
             let still = pass(&mut retry);
-            if still.is_empty() {
+            // Same two-part check as the arguments path: an empty refused set does not by
+            // itself prove the release landed, because an unknown token resolves to
+            // nothing rather than refusing.
+            let substituted = [&retry.input_responses, &retry.request_state]
+                .into_iter()
+                .flatten()
+                .all(|field| all_tokens_substituted(field, &refused));
+            if still.is_empty() && substituted {
                 return Ok(Some(retry));
             }
-            refused = still;
+            refused = if still.is_empty() { refused } else { still };
         }
     }
     if !refused.is_empty() {
         let list = refused.into_iter().collect::<Vec<_>>().join(", ");
         return Err(format!(
             "refusing to send redacted values to '{server}' in a retry response: {list} came from \
-             a different server. Toolport only returns a value to the server that provided it."
+             a different server. Toolport only returns a value to the server that provided it. \
+             Approve the release in the Toolport app to allow it."
         ));
     }
     Ok(Some(out))
@@ -12674,6 +12739,20 @@ mod tests {
         dir: &std::path::Path,
         decision: approval::ApprovalDecision,
     ) -> std::sync::mpsc::Receiver<approval::ApprovalRequest> {
+        stub_broker_with(dir, decision, || {})
+    }
+
+    /// [`stub_broker`], but running `during` after the request is read and BEFORE the
+    /// decision is written.
+    ///
+    /// That window is the real one: the human decision takes up to two minutes, and
+    /// another MCP session can clear or re-mint the map on another thread while it is open.
+    /// Running the mutation here reproduces it deterministically instead of by timing.
+    fn stub_broker_with(
+        dir: &std::path::Path,
+        decision: approval::ApprovalDecision,
+        during: impl FnOnce() + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<approval::ApprovalRequest> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");
         let endpoint = listener.local_addr().expect("a bound address").to_string();
         std::fs::write(
@@ -12700,6 +12779,7 @@ mod tests {
             if let Ok(req) = serde_json::from_str::<approval::ApprovalRequest>(&line) {
                 let _ = tx.send(req);
             }
+            during();
             let mut stream = stream;
             let answer = serde_json::to_string(&decision).expect("a serializable decision");
             let _ = stream.write_all(answer.as_bytes());
@@ -12828,6 +12908,94 @@ mod tests {
     }
 
     #[test]
+    fn all_tokens_substituted_rejects_a_pass_that_left_pseudonyms_behind() {
+        // Defense in depth on the release retry. The grant checks above catch the cases we
+        // can drive deterministically; this guards the residual window where the map moves
+        // between the grant and the retry, which no test can schedule. Pinned directly so
+        // it cannot be quietly weakened.
+        let tokens = BTreeSet::from(["⟦EMAIL_1⟧".to_string(), "⟦PHONE_1⟧".to_string()]);
+        assert!(all_tokens_substituted(
+            &json!({ "to": "ada@example.com", "cc": "+15551234567" }),
+            &tokens
+        ));
+        // Anywhere in the tree counts, and one survivor is enough to refuse.
+        assert!(!all_tokens_substituted(
+            &json!({ "to": "ada@example.com", "body": { "x": ["⟦PHONE_1⟧"] } }),
+            &tokens
+        ));
+        // An empty token set is vacuously satisfied: nothing was refused, nothing to prove.
+        assert!(all_tokens_substituted(
+            &json!({ "to": "⟦EMAIL_9⟧" }),
+            &BTreeSet::new()
+        ));
+    }
+
+    #[test]
+    fn a_map_cleared_during_the_wait_refuses_instead_of_dispatching_literal_tokens() {
+        // The human wait is up to two minutes, and another MCP session can clear the map on
+        // another thread inside it. `pii::rehydrate` reports an unknown token as
+        // resolved-with-nothing rather than as a refusal, so "nothing refused" alone would
+        // wave through arguments that still read `⟦EMAIL_1⟧` — dispatching a request the
+        // user never meant and logging it as an approved release.
+        let env = pii_test_env("pii-release-cleared");
+        let client = Some("pii-release-cleared");
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+        let _asked = stub_broker_with(&env.dir, approval::ApprovalDecision::Approved, || {
+            clear_pii_session(Some("pii-release-cleared"));
+        });
+
+        let err = rehydrate_for_downstream(
+            client,
+            "mailer",
+            "mailer__send",
+            json!({ "to": "⟦EMAIL_1⟧" }),
+        )
+        .expect_err("an approval over a vanished value must not dispatch");
+        assert!(err.contains("⟦EMAIL_1⟧"), "name the token: {err}");
+    }
+
+    #[test]
+    fn an_approval_does_not_release_a_value_reminted_during_the_wait() {
+        // The worst shape: the token id survives but now stands for someone else. The human
+        // said yes to ada; granting on the token id alone would hand bob to the mail server.
+        let env = pii_test_env("pii-release-reminted");
+        let client = Some("pii-release-reminted");
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+        let _asked = stub_broker_with(&env.dir, approval::ApprovalDecision::Approved, || {
+            // Same token id, different person.
+            with_pii_session(Some("pii-release-reminted"), |map| {
+                *map = pii::SessionMap::new();
+                map.pseudonymize("crm", "bob@example.com");
+            });
+        });
+
+        let err = rehydrate_for_downstream(
+            client,
+            "mailer",
+            "mailer__send",
+            json!({ "to": "⟦EMAIL_1⟧" }),
+        )
+        .expect_err("the approval was for a different value");
+        assert!(
+            !err.contains("bob@example.com") && !err.contains("ada@example.com"),
+            "the refusal must not leak either value: {err}"
+        );
+        // And the re-minted value must NOT have inherited the grant.
+        let refused = with_pii_session(client, |map| map.rehydrate("mailer", "⟦EMAIL_1⟧").refused);
+        assert_eq!(
+            refused,
+            BTreeSet::from(["⟦EMAIL_1⟧".to_string()]),
+            "approving ada must never widen origins for bob"
+        );
+    }
+
+    #[test]
     fn mrtr_retry_fields_are_rehydrated_on_the_downstream_leg() {
         // SBS-606: a host that answers an elicitation from model context puts the
         // pseudonym in `inputResponses`. Relaying that literal gives the server a
@@ -12878,6 +13046,50 @@ mod tests {
 
         assert!(err.contains("⟦EMAIL_1⟧"), "name the token: {err}");
         assert!(!err.contains("ada@example.com"), "must not leak: {err}");
+        // The remedy has to be named here too, or a host answering an elicitation with a
+        // foreign token looks permanently dead-ended even with the desktop app running.
+        assert!(
+            err.contains("Approve the release in the Toolport app"),
+            "point at the release approval: {err}"
+        );
+    }
+
+    #[test]
+    fn a_pii_bearing_downstream_error_is_audited_defended_not_raw() {
+        // SBS-607 threads a `piiReplaced` onto the error path's audit row. That claim sits
+        // beside the `error` field, so auditing the RAW downstream error would put an
+        // address in the append-only log while asserting redaction ran.
+        let mut reg = Registry::default();
+        reg.pii_redaction = true;
+        let client = Some("pii-error-audit");
+        with_pii_session(client, |map| *map = pii::SessionMap::new());
+
+        // The shape execute_call builds for a failed downstream call.
+        let raw = "connect failed for ada@example.com";
+        let defended = defend_and_shape(
+            &reg,
+            "crm",
+            "crm__lookup",
+            client,
+            json!({ "content": [{ "type": "text", "text": raw }], "isError": true }),
+            "",
+            true,
+        );
+        let pass = defended.pii.expect("redaction is on");
+        assert_eq!(pass.replaced, 1, "the error text carried one address");
+
+        let audited = audited_error_text(raw, &defended.result);
+        assert!(
+            !audited.contains("ada@example.com"),
+            "the audited text must be the pseudonymized one: {audited}"
+        );
+        assert!(
+            audited.contains("⟦EMAIL_1⟧"),
+            "and it must still say what failed: {audited}"
+        );
+
+        // A defended body with no text at all still audits a reason rather than nothing.
+        assert_eq!(audited_error_text(raw, &json!({ "content": [] })), raw);
     }
 
     #[test]
