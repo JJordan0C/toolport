@@ -561,24 +561,30 @@ fn with_meta(mut params: Value, meta: Option<&Value>) -> Value {
     params
 }
 
-/// Copy only extension declarations from the upstream client's per-request
-/// capabilities onto a modern downstream hop.
+/// Declare the upstream input capabilities Toolport can service on this downstream hop,
+/// plus opaque extension declarations that are intentionally transparent.
 ///
 /// Core client capabilities remain per-hop: Toolport may only advertise roots,
 /// sampling, or elicitation when it can service those callbacks itself. Unknown
 /// extension declarations are different. Their negotiation and payloads are
 /// intentionally opaque to a transparent gateway, so preserving the settings
 /// object is the only future-compatible behavior (SOU-453).
-fn attach_client_extensions(params: &mut Value, meta: Option<&Value>) {
-    let Some(extensions) = meta
+fn attach_serviceable_client_capabilities(params: &mut Value, meta: Option<&Value>) {
+    let Some(upstream) = meta
         .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"))
-        .and_then(|capabilities| capabilities.get("extensions"))
         .and_then(Value::as_object)
-        .filter(|extensions| !extensions.is_empty())
-        .cloned()
     else {
         return;
     };
+    let mut serviceable = serde_json::Map::new();
+    for key in ["roots", "sampling", "elicitation", "extensions"] {
+        if let Some(value) = upstream.get(key) {
+            serviceable.insert(key.to_string(), value.clone());
+        }
+    }
+    if serviceable.is_empty() {
+        return;
+    }
     let Some(params) = params.as_object_mut() else {
         return;
     };
@@ -588,9 +594,7 @@ fn attach_client_extensions(params: &mut Value, meta: Option<&Value>) {
     if !meta.is_object() {
         *meta = Value::Object(serde_json::Map::new());
     }
-    meta["io.modelcontextprotocol/clientCapabilities"] = json!({
-        "extensions": Value::Object(extensions)
-    });
+    meta["io.modelcontextprotocol/clientCapabilities"] = Value::Object(serviceable);
 }
 
 /// Wire-only fields used when a 2026-07-28 client retries an incomplete request.
@@ -666,20 +670,16 @@ fn merge_protocol_meta(params: &mut Value, protocol: &Value) {
     }
     if let Some(meta) = slot.as_object_mut() {
         for (key, value) in protocol {
-            // `clientCapabilities` is still owned by this hop, but extension
-            // negotiation is the one intentionally transparent part. The
-            // request builder copied only the upstream extension map here; keep
-            // it while replacing every core capability with Toolport's own.
+            // `clientCapabilities` is owned by this hop. The request builder has already
+            // copied only capabilities Toolport can service, so merge those explicit
+            // declarations with Toolport's connection-level declarations.
             let mut value = value.clone();
             if key == "io.modelcontextprotocol/clientCapabilities" {
-                if let Some(extensions) = meta
-                    .get(key)
-                    .and_then(|capabilities| capabilities.get("extensions"))
-                    .and_then(Value::as_object)
-                    .filter(|extensions| !extensions.is_empty())
-                    .cloned()
-                {
-                    value["extensions"] = Value::Object(extensions);
+                if let (Some(target), Some(serviceable)) = (
+                    value.as_object_mut(),
+                    meta.get(key).and_then(Value::as_object),
+                ) {
+                    target.extend(serviceable.clone());
                 }
             }
             meta.insert(key.clone(), value);
@@ -695,9 +695,8 @@ fn protocol_meta_for(version: &str) -> Value {
             "name": "toolport-gateway",
             "version": env!("CARGO_PKG_VERSION")
         },
-        // Toolport speaks for itself on this hop. It advertises no client
-        // capabilities of its own yet; SOU-449 fills these in once MRTR lets the
-        // gateway service sampling/elicitation on a client's behalf.
+        // Toolport speaks for itself on this hop. Request-scoped capabilities are added
+        // only when the active upstream client declared input Toolport can relay.
         "io.modelcontextprotocol/clientCapabilities": {}
     })
 }
@@ -1520,6 +1519,125 @@ pub fn resolve_command(command: &str) -> String {
 pub enum ServerRequestAction {
     Respond(Value),
     InputRequired,
+}
+
+/// A URL elicitation after Toolport has applied the same public-host boundary used by its
+/// existing SSRF defenses. The origin is derived from the parsed URL, never from server text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScreenedUrlElicitation {
+    pub url: String,
+    pub origin: String,
+    pub message: String,
+}
+
+/// Validate a URL-mode elicitation before it can reach either the MCP host or Toolport's
+/// desktop broker. A server-provided browser link is an internal-network and phishing
+/// primitive, so unlike ordinary envelope relay Toolport permits only credential-free HTTPS
+/// URLs resolving exclusively to public addresses. The verified origin is appended to the
+/// user-visible message rather than trusting the server to identify itself honestly.
+pub fn screen_url_elicitation_request(
+    request: &mut Value,
+) -> Result<Option<ScreenedUrlElicitation>, String> {
+    if request.get("method").and_then(Value::as_str) != Some("elicitation/create") {
+        return Ok(None);
+    }
+    let Some(params) = request.get_mut("params").and_then(Value::as_object_mut) else {
+        return Err("URL elicitation is missing params".to_string());
+    };
+    if params.get("mode").and_then(Value::as_str) != Some("url") {
+        return Ok(None);
+    }
+    let raw_url = params
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "URL elicitation is missing a URL".to_string())?
+        .to_string();
+    let parsed = url::Url::parse(&raw_url)
+        .map_err(|_| "URL elicitation contains an invalid URL".to_string())?;
+    if parsed.scheme() != "https" {
+        return Err("URL elicitation must use HTTPS".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL elicitation must not contain embedded credentials".to_string());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL elicitation URL has no host".to_string())?;
+    if crate::oauth::host_is_private(host) {
+        return Err(format!(
+            "URL elicitation points at a private, loopback, or unresolvable host ({host})"
+        ));
+    }
+    let origin = parsed.origin().ascii_serialization();
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "URL elicitation is missing a message".to_string())?
+        .to_string();
+    let origin_line = format!("Toolport destination: {origin}");
+    if !message.lines().any(|line| line == origin_line) {
+        params.insert(
+            "message".to_string(),
+            Value::String(format!("{message}\n\n{origin_line}")),
+        );
+    }
+    Ok(Some(ScreenedUrlElicitation {
+        url: raw_url,
+        origin,
+        message,
+    }))
+}
+
+fn screen_input_required(result: &mut Value) -> Result<(), TransportError> {
+    let Some(requests) = result.get_mut("inputRequests").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    for request in requests.values_mut() {
+        screen_url_elicitation_request(request).map_err(|message| {
+            TransportError::Fatal(format!("Toolport refused unsafe URL elicitation: {message}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn modern_client_supports_input_request(meta: Option<&Value>, request: &Value) -> bool {
+    let capabilities = meta
+        .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"));
+    match request.get("method").and_then(Value::as_str) {
+        Some("roots/list") => capabilities.and_then(|caps| caps.get("roots")).is_some(),
+        Some("sampling/createMessage") => {
+            capabilities.and_then(|caps| caps.get("sampling")).is_some()
+        }
+        Some("elicitation/create") => {
+            let Some(elicitation) = capabilities
+                .and_then(|caps| caps.get("elicitation"))
+                .and_then(Value::as_object)
+            else {
+                return false;
+            };
+            match request
+                .get("params")
+                .and_then(|params| params.get("mode"))
+                .and_then(Value::as_str)
+                .unwrap_or("form")
+            {
+                "url" => elicitation.get("url").is_some(),
+                "form" => elicitation.is_empty() || elicitation.get("form").is_some(),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn modern_client_supports_input_required(meta: Option<&Value>, result: &Value) -> bool {
+    let Some(requests) = result.get("inputRequests").and_then(Value::as_object) else {
+        return false;
+    };
+    !requests.is_empty()
+        && requests
+            .values()
+            .all(|request| modern_client_supports_input_request(meta, request))
 }
 
 /// A bidirectional JSON-RPC channel to one downstream server.
@@ -3069,11 +3187,16 @@ impl Transport for StdioTransport {
             if trimmed.is_empty() {
                 continue;
             }
-            let value: Value = match serde_json::from_str(trimmed) {
+            let mut value: Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
             if is_server_initiated_request(&value) {
+                screen_url_elicitation_request(&mut value).map_err(|message| {
+                    TransportError::Fatal(format!(
+                        "Toolport refused unsafe URL elicitation: {message}"
+                    ))
+                })?;
                 if let Some(handler) = &self.server_handler {
                     match handler(&value) {
                         Some(ServerRequestAction::Respond(response)) => {
@@ -3840,7 +3963,7 @@ impl HttpTransport {
                 if data.is_empty() {
                     continue;
                 }
-                let Ok(v) = serde_json::from_str::<Value>(data) else {
+                let Ok(mut v) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
                 // Resource updates may arrive mid-stream alongside the response
@@ -3859,6 +3982,13 @@ impl HttpTransport {
                         sink(note);
                         continue;
                     }
+                }
+                if is_server_initiated_request(&v) {
+                    screen_url_elicitation_request(&mut v).map_err(|message| {
+                        TransportError::Fatal(format!(
+                            "Toolport refused unsafe URL elicitation: {message}"
+                        ))
+                    })?;
                 }
                 match self.inline_server_action(&v) {
                     Some(ServerRequestAction::Respond(response)) => {
@@ -4617,7 +4747,10 @@ impl DownstreamServer {
         self.server_handler = Some(handler);
     }
 
-    fn fulfill_input_required(&self, result: &Value) -> Result<MrtrRequest, TransportError> {
+    fn fulfill_input_required(
+        &self,
+        result: &Value,
+    ) -> Result<Option<MrtrRequest>, TransportError> {
         let requests = match result.get("inputRequests") {
             None => None,
             Some(Value::Object(requests)) => Some(requests),
@@ -4651,6 +4784,12 @@ impl DownstreamServer {
                 )
             })?;
             for (key, input) in requests {
+                let mut input = input.clone();
+                screen_url_elicitation_request(&mut input).map_err(|message| {
+                    TransportError::Fatal(format!(
+                        "Toolport refused unsafe URL elicitation: {message}"
+                    ))
+                })?;
                 let method = input.get("method").and_then(Value::as_str).ok_or_else(|| {
                     TransportError::Fatal(format!("input request '{key}' is missing a method"))
                 })?;
@@ -4675,9 +4814,7 @@ impl DownstreamServer {
                 let response = match handler(&request) {
                     Some(ServerRequestAction::Respond(response)) => response,
                     Some(ServerRequestAction::InputRequired) => {
-                        return Err(TransportError::Fatal(
-                            "cannot nest an input_required bridge while fulfilling one".to_string(),
-                        ))
+                        return Ok(None)
                     }
                     None => {
                         return Err(TransportError::Fatal(format!(
@@ -4700,10 +4837,10 @@ impl DownstreamServer {
         if input_responses.is_empty() {
             std::thread::sleep(MRTR_STATE_ONLY_DELAY);
         }
-        Ok(MrtrRequest {
+        Ok(Some(MrtrRequest {
             input_responses: (!input_responses.is_empty()).then(|| Value::Object(input_responses)),
             request_state,
-        })
+        }))
     }
 
     fn request_with_mrtr(
@@ -4721,17 +4858,21 @@ impl DownstreamServer {
         for round in 0..=MRTR_LEGACY_MAX_ROUNDS {
             let mut params = with_meta_and_mrtr(params.clone(), meta, Some(&retry));
             if modern_downstream {
-                attach_client_extensions(&mut params, meta);
+                attach_serviceable_client_capabilities(&mut params, meta);
             }
-            let result = self.transport.request_with_cancel_and_headers(
+            let mut result = self.transport.request_with_cancel_and_headers(
                 method,
                 params,
                 cancel.clone(),
                 headers,
             )?;
-            if result.get("resultType").and_then(Value::as_str) != Some("input_required")
-                || modern_upstream
-            {
+            if result.get("resultType").and_then(Value::as_str) == Some("input_required") {
+                screen_input_required(&mut result)?;
+            }
+            if result.get("resultType").and_then(Value::as_str) != Some("input_required") {
+                return Ok(result);
+            }
+            if modern_upstream && modern_client_supports_input_required(meta, &result) {
                 return Ok(result);
             }
             if round == MRTR_LEGACY_MAX_ROUNDS {
@@ -4739,7 +4880,29 @@ impl DownstreamServer {
                     "modern server exceeded the {MRTR_LEGACY_MAX_ROUNDS}-round input_required limit"
                 )));
             }
-            retry = self.fulfill_input_required(&result)?;
+            match self.fulfill_input_required(&result) {
+                Ok(Some(next)) => retry = next,
+                Ok(None) if modern_upstream => return Ok(result),
+                Ok(None) => {
+                    return Err(TransportError::Fatal(
+                        "cannot nest an input_required bridge while fulfilling one".to_string(),
+                    ))
+                }
+                Err(TransportError::Rpc(error))
+                    if modern_upstream
+                        && error.get("code").and_then(Value::as_i64)
+                            == Some(MISSING_REQUIRED_CLIENT_CAPABILITY) =>
+                {
+                    return Ok(json!({
+                        "_toolportProtocolError": {
+                            "code": MISSING_REQUIRED_CLIENT_CAPABILITY,
+                            "message": error.get("message").cloned().unwrap_or_else(|| json!("URL elicitation requires client support or a running Toolport desktop broker")),
+                            "requiredCapability": "elicitation"
+                        }
+                    }));
+                }
+                Err(error) => return Err(error),
+            }
         }
         unreachable!("bounded MRTR loop always returns")
     }
@@ -5231,7 +5394,7 @@ impl DownstreamServer {
         let original_meta = params.get("_meta").cloned();
         sanitize_forwarded_meta(&mut params);
         if matches!(self.era, Era::Modern { .. }) {
-            attach_client_extensions(&mut params, original_meta.as_ref());
+            attach_serviceable_client_capabilities(&mut params, original_meta.as_ref());
         }
         self.transport
             .request_with_cancel("completion/complete", params, cancel)
@@ -6582,6 +6745,48 @@ mod tests {
     }
 
     #[test]
+    fn url_elicitation_is_screened_and_shows_the_verified_origin() {
+        let mut request = json!({
+            "method": "elicitation/create",
+            "params": {
+                "mode": "url",
+                "message": "Connect your account",
+                "url": "https://93.184.216.34:8443/authorize?state=opaque"
+            }
+        });
+        let screened = super::screen_url_elicitation_request(&mut request)
+            .unwrap()
+            .expect("URL mode");
+        assert_eq!(screened.origin, "https://93.184.216.34:8443");
+        assert_eq!(screened.message, "Connect your account");
+        assert_eq!(
+            request["params"]["message"],
+            "Connect your account\n\nToolport destination: https://93.184.216.34:8443"
+        );
+        assert!(request["params"].get("elicitationId").is_none());
+    }
+
+    #[test]
+    fn url_elicitation_refuses_non_https_credentials_and_private_hosts() {
+        for (url, expected) in [
+            ("http://93.184.216.34/connect", "must use HTTPS"),
+            (
+                "https://user:secret@93.184.216.34/connect",
+                "embedded credentials",
+            ),
+            ("https://127.0.0.1/connect", "private, loopback"),
+            ("https://169.254.169.254/latest", "private, loopback"),
+        ] {
+            let mut request = json!({
+                "method": "elicitation/create",
+                "params": { "mode": "url", "message": "Continue", "url": url }
+            });
+            let error = super::screen_url_elicitation_request(&mut request).unwrap_err();
+            assert!(error.contains(expected), "{url}: {error}");
+        }
+    }
+
+    #[test]
     fn legacy_client_auto_fulfills_modern_input_required() {
         let (transport, requests) = MrtrTransport::modern(vec![
             Ok(json!({
@@ -6681,7 +6886,8 @@ mod tests {
             None
         }));
         let meta = json!({
-            "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION
+            "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
         });
 
         let incomplete = server
@@ -6714,6 +6920,131 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1]["requestState"], "byte-exact-state");
         assert_eq!(calls[1]["inputResponses"], retry.input_responses.unwrap());
+    }
+
+    #[test]
+    fn modern_url_elicitation_relays_screened_request_to_capable_client() {
+        let (transport, _) = MrtrTransport::modern(vec![Ok(json!({
+            "resultType": "input_required",
+            "inputRequests": {
+                "auth": {
+                    "method": "elicitation/create",
+                    "params": {
+                        "mode": "url",
+                        "message": "Sign in",
+                        "url": "https://93.184.216.34/authorize"
+                    }
+                }
+            }
+        }))]);
+        let mut server = DownstreamServer::connect("modern".into(), Box::new(transport)).unwrap();
+        server.set_server_request_handler(Arc::new(|_| {
+            Some(ServerRequestAction::InputRequired)
+        }));
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": { "elicitation": { "url": {} } }
+        });
+
+        let result = server
+            .call_with_cancel_and_mrtr("echo", json!({}), None, Some(&meta), None)
+            .unwrap();
+        assert_eq!(result["resultType"], "input_required");
+        assert_eq!(
+            result["inputRequests"]["auth"]["params"]["message"],
+            "Sign in\n\nToolport destination: https://93.184.216.34"
+        );
+    }
+
+    #[test]
+    fn modern_url_elicitation_can_use_desktop_broker_fallback() {
+        let (transport, requests) = MrtrTransport::modern(vec![
+            Ok(json!({
+                "resultType": "input_required",
+                "inputRequests": {
+                    "auth": {
+                        "method": "elicitation/create",
+                        "params": {
+                            "mode": "url",
+                            "message": "Sign in",
+                            "url": "https://93.184.216.34/authorize"
+                        }
+                    }
+                },
+                "requestState": "out-of-band-state"
+            })),
+            Ok(json!({ "resultType": "complete", "content": [] })),
+        ]);
+        let mut server = DownstreamServer::connect("modern".into(), Box::new(transport)).unwrap();
+        server.set_server_request_handler(Arc::new(|request| {
+            Some(ServerRequestAction::Respond(json!({
+                "jsonrpc": "2.0",
+                "id": request["id"].clone(),
+                "result": { "action": "accept" }
+            })))
+        }));
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+
+        let result = server
+            .call_with_cancel_and_mrtr("echo", json!({}), None, Some(&meta), None)
+            .unwrap();
+        assert_eq!(result["resultType"], "complete");
+        let requests = requests.lock().unwrap();
+        let calls: Vec<&Value> = requests
+            .iter()
+            .filter(|(method, _)| method == "tools/call")
+            .map(|(_, params)| params)
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1]["requestState"], "out-of-band-state");
+        assert_eq!(calls[1]["inputResponses"]["auth"]["action"], "accept");
+    }
+
+    #[test]
+    fn modern_url_elicitation_refuses_clearly_without_client_or_broker() {
+        let (transport, _) = MrtrTransport::modern(vec![Ok(json!({
+            "resultType": "input_required",
+            "inputRequests": {
+                "auth": {
+                    "method": "elicitation/create",
+                    "params": {
+                        "mode": "url",
+                        "message": "Sign in",
+                        "url": "https://93.184.216.34/authorize"
+                    }
+                }
+            }
+        }))]);
+        let mut server = DownstreamServer::connect("modern".into(), Box::new(transport)).unwrap();
+        server.set_server_request_handler(Arc::new(|request| {
+            Some(ServerRequestAction::Respond(json!({
+                "jsonrpc": "2.0",
+                "id": request["id"].clone(),
+                "error": {
+                    "code": super::MISSING_REQUIRED_CLIENT_CAPABILITY,
+                    "message": "URL elicitation requires client support or a running Toolport desktop broker"
+                }
+            })))
+        }));
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+
+        let result = server
+            .call_with_cancel_and_mrtr("echo", json!({}), None, Some(&meta), None)
+            .unwrap();
+        assert_eq!(
+            result["_toolportProtocolError"]["code"],
+            super::MISSING_REQUIRED_CLIENT_CAPABILITY
+        );
+        assert!(result["_toolportProtocolError"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("desktop broker"));
     }
 
     #[test]
@@ -8130,10 +8461,9 @@ mod tests {
                 ["com.example/opaque"]["mode"],
             "strict"
         );
-        assert!(
-            params["_meta"]["io.modelcontextprotocol/clientCapabilities"]
-                .get("sampling")
-                .is_none()
+        assert_eq!(
+            params["_meta"]["io.modelcontextprotocol/clientCapabilities"]["sampling"],
+            json!({})
         );
 
         // A non-object `_meta` is rebuilt rather than panicking or being ignored.
@@ -8143,7 +8473,7 @@ mod tests {
     }
 
     #[test]
-    fn modern_requests_forward_only_client_extension_capabilities() {
+    fn modern_requests_declare_only_serviceable_client_capabilities() {
         use super::{DownstreamServer, Transport, TransportError, MODERN_PROTOCOL_VERSION};
         use std::sync::{Arc, Mutex};
 
@@ -8194,6 +8524,7 @@ mod tests {
             "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
             "io.modelcontextprotocol/clientCapabilities": {
                 "sampling": {},
+                "elicitation": { "url": {} },
                 "extensions": {
                     "com.example/opaque": { "mimeTypes": ["text/html"] },
                     "io.modelcontextprotocol/tasks": {}
@@ -8212,7 +8543,8 @@ mod tests {
             capabilities["extensions"]["com.example/opaque"]["mimeTypes"][0],
             "text/html"
         );
-        assert!(capabilities.get("sampling").is_none());
+        assert_eq!(capabilities["sampling"], json!({}));
+        assert_eq!(capabilities["elicitation"]["url"], json!({}));
         assert_eq!(
             capabilities["extensions"]["io.modelcontextprotocol/tasks"],
             json!({})

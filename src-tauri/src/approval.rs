@@ -69,6 +69,21 @@ pub struct ApprovalRequest {
     /// Allowlist entries include this so a tool definition change re-requires approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_fingerprint: Option<String>,
+    /// A URL-mode elicitation that the desktop broker should present when the MCP client
+    /// cannot do so itself. Absent for ordinary tool approvals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_elicitation: Option<UrlElicitationRequest>,
+}
+
+/// The already-screened browser interaction carried over the local broker. The gateway
+/// validates the URL and derives `origin`; the desktop renders that origin separately so a
+/// server-controlled message cannot disguise where the link goes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UrlElicitationRequest {
+    pub url: String,
+    pub origin: String,
+    pub message: String,
 }
 
 /// The broker's answer to an [`ApprovalRequest`].
@@ -211,6 +226,7 @@ mod tests {
             reason: ApprovalReason::Destructive,
             arguments: serde_json::json!({ "table": "users" }),
             tool_fingerprint: Some("v2:abc".into()),
+            url_elicitation: None,
         };
         let round: ApprovalRequest =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();

@@ -636,7 +636,10 @@ fn modern_client_controls_native_mrtr_retry_fields() {
         .expect("spawn fixture");
     let mut server =
         DownstreamServer::connect("mock".to_string(), Box::new(transport)).expect("connect");
-    let meta = json!({ "io.modelcontextprotocol/protocolVersion": MODERN });
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": MODERN,
+        "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+    });
 
     let incomplete = server
         .call_with_cancel_and_mrtr("mrtr_confirm", json!({}), None, Some(&meta), None)

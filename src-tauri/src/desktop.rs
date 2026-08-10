@@ -1655,7 +1655,7 @@ fn decide_approval(
     scope: String,
 ) -> Result<(), String> {
     let view = broker.decide(&id, approved)?;
-    if approved && scope != "once" {
+    if approved && scope != "once" && view.url_elicitation.is_none() {
         // Persist only when we can bind the allow to the current definition
         // fingerprint. If it's unavailable (the tool is no longer resolvable),
         // the call itself already went through via `decide` above; we simply
@@ -3419,7 +3419,7 @@ fn update_tray_tooltip(app: &AppHandle) {
     if let Some(tray) = app.tray_by_id("main") {
         let tip = if pending > 0 {
             format!(
-                "Toolport - {pending} tool call{} awaiting approval",
+                "Toolport - {pending} request{} awaiting action",
                 if pending == 1 { "" } else { "s" }
             )
         } else {

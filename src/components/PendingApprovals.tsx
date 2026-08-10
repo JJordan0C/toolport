@@ -5,6 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { decideApproval, listPendingApprovals, type ApprovalScope } from "@/lib/api";
 import type { PendingApproval } from "@/lib/types";
+import { openExternal } from "@/lib/openUrl";
 import { toastError } from "@/lib/toast";
 
 /** Fail-closed window (must match approval::DEFAULT_TIMEOUT_SECS on the gateway). A
@@ -34,8 +35,8 @@ const REASON: Record<Reason, { label: string; className: string; Icon: typeof Tr
   };
 
 /**
- * The human-in-the-loop approval queue: tool calls the gateway is holding until you
- * approve or deny them. The call BLOCKS on your decision, so this is mounted globally
+ * The human-in-the-loop queue: tool calls and URL elicitations the gateway is holding
+ * until you act. The call BLOCKS on your decision, so this is mounted globally
  * (actionable from any view) and renders nothing when the queue is empty. It polls as a
  * safety net and refreshes immediately on the gateway's `approval-pending` /
  * `approval-resolved` events.
@@ -146,18 +147,18 @@ export function PendingApprovals() {
         {/* Announce count changes to screen readers without re-announcing on every countdown
          * tick (the visible timer lives elsewhere; this text only changes when the count does). */}
         <div aria-live="assertive" className="sr-only">
-          {pending.length} tool call{pending.length > 1 ? "s" : ""} awaiting your
-          approval. Press Escape to deny.
+          {pending.length} request{pending.length > 1 ? "s" : ""} awaiting your action.
+          Press Escape to cancel.
         </div>
         <header className="flex items-center gap-3 border-b border-border/60 px-4 py-3">
           <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-warning/15 text-warning">
             <ShieldAlert className="size-4" />
           </span>
           <div className="min-w-0">
-            <div className="text-sm font-semibold leading-tight">Approval required</div>
+            <div className="text-sm font-semibold leading-tight">Action required</div>
             <div className="text-xs text-muted-foreground">
-              {pending.length} tool call{pending.length > 1 ? "s" : ""} held — no decision
-              auto-denies
+              {pending.length} request{pending.length > 1 ? "s" : ""} held — no action
+              cancels it
             </div>
           </div>
         </header>
@@ -165,6 +166,7 @@ export function PendingApprovals() {
         <ul className="max-h-[70vh] divide-y divide-border/60 overflow-auto">
           {pending.map((a) => {
             const reason = REASON[a.reason];
+            const urlElicitation = a.urlElicitation;
             // Count down to the broker's authoritative deadline; fall back to
             // first-sighting + timeout only if deadlineMs is somehow absent, so the
             // timer is never blank.
@@ -183,11 +185,21 @@ export function PendingApprovals() {
                 <div className="mb-2 flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <div className="flex items-center gap-1.5 font-mono text-sm">
-                      <span className="truncate text-muted-foreground">{a.server}</span>
-                      <span className="text-muted-foreground/50">/</span>
-                      <span className="truncate font-medium text-foreground">
-                        {a.tool}
-                      </span>
+                      {urlElicitation ? (
+                        <span className="truncate font-medium text-foreground">
+                          {urlElicitation.origin}
+                        </span>
+                      ) : (
+                        <>
+                          <span className="truncate text-muted-foreground">
+                            {a.server}
+                          </span>
+                          <span className="text-muted-foreground/50">/</span>
+                          <span className="truncate font-medium text-foreground">
+                            {a.tool}
+                          </span>
+                        </>
+                      )}
                     </div>
                     {a.client && (
                       <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -196,19 +208,32 @@ export function PendingApprovals() {
                       </div>
                     )}
                   </div>
-                  <Badge className={reason.className}>
-                    <reason.Icon className="size-3" />
-                    {reason.label}
-                  </Badge>
+                  {urlElicitation ? (
+                    <Badge className="bg-warning/15 text-warning">
+                      <Globe className="size-3" />
+                      External link
+                    </Badge>
+                  ) : (
+                    <Badge className={reason.className}>
+                      <reason.Icon className="size-3" />
+                      {reason.label}
+                    </Badge>
+                  )}
                 </div>
 
                 <div className="mb-3">
                   <div className="mb-1 text-[0.7rem] font-medium uppercase tracking-wide text-muted-foreground">
-                    Arguments
+                    {urlElicitation ? "Why this is needed" : "Arguments"}
                   </div>
-                  <pre className="max-h-36 overflow-auto rounded-md border border-border/60 bg-muted/40 p-2.5 font-mono text-xs leading-relaxed">
-                    {JSON.stringify(a.arguments, null, 2)}
-                  </pre>
+                  {urlElicitation ? (
+                    <div className="rounded-md border border-border/60 bg-muted/40 p-2.5 text-sm leading-relaxed">
+                      {urlElicitation.message}
+                    </div>
+                  ) : (
+                    <pre className="max-h-36 overflow-auto rounded-md border border-border/60 bg-muted/40 p-2.5 font-mono text-xs leading-relaxed">
+                      {JSON.stringify(a.arguments, null, 2)}
+                    </pre>
+                  )}
                 </div>
 
                 <div className="flex items-center justify-between gap-3">
@@ -240,8 +265,19 @@ export function PendingApprovals() {
                       onClick={() => void decide(a.id, false)}
                     >
                       {isBusy ? <Loader2 className="animate-spin" /> : <X />}
-                      Deny
+                      {urlElicitation ? "Cancel" : "Deny"}
                     </Button>
+                    {urlElicitation && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={isBusy}
+                        onClick={() => void openExternal(urlElicitation.url)}
+                      >
+                        <Globe />
+                        Open link
+                      </Button>
+                    )}
                     <Button
                       size="sm"
                       disabled={isBusy}
@@ -249,30 +285,32 @@ export function PendingApprovals() {
                       className="bg-[color-mix(in_oklch,var(--success),black_16%)] text-white shadow-sm hover:bg-[color-mix(in_oklch,var(--success),black_26%)]"
                     >
                       {isBusy ? <Loader2 className="animate-spin" /> : <Check />}
-                      Approve
+                      {urlElicitation ? "Continue" : "Approve"}
                     </Button>
                   </div>
                 </div>
 
                 {/* Skip the prompt for this tool next time - curbs approval fatigue. */}
-                <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-muted-foreground">
-                  <span>Skip next time?</span>
-                  <button
-                    disabled={isBusy}
-                    onClick={() => void decide(a.id, true, "session")}
-                    className="font-medium text-foreground/80 underline-offset-2 hover:text-foreground hover:underline disabled:opacity-50"
-                  >
-                    Allow for this session
-                  </button>
-                  <span className="text-muted-foreground/40">·</span>
-                  <button
-                    disabled={isBusy}
-                    onClick={() => void decide(a.id, true, "always")}
-                    className="font-medium text-foreground/80 underline-offset-2 hover:text-foreground hover:underline disabled:opacity-50"
-                  >
-                    Always allow this tool
-                  </button>
-                </div>
+                {!urlElicitation && (
+                  <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-muted-foreground">
+                    <span>Skip next time?</span>
+                    <button
+                      disabled={isBusy}
+                      onClick={() => void decide(a.id, true, "session")}
+                      className="font-medium text-foreground/80 underline-offset-2 hover:text-foreground hover:underline disabled:opacity-50"
+                    >
+                      Allow for this session
+                    </button>
+                    <span className="text-muted-foreground/40">·</span>
+                    <button
+                      disabled={isBusy}
+                      onClick={() => void decide(a.id, true, "always")}
+                      className="font-medium text-foreground/80 underline-offset-2 hover:text-foreground hover:underline disabled:opacity-50"
+                    >
+                      Always allow this tool
+                    </button>
+                  </div>
+                )}
               </li>
             );
           })}

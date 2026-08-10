@@ -27,8 +27,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::approval::{
-    ApprovalDecision, ApprovalReason, ApprovalRequest, EndpointDescriptor, DEFAULT_TIMEOUT_SECS,
-    ENDPOINT_FILE,
+    ApprovalDecision, ApprovalReason, ApprovalRequest, EndpointDescriptor, UrlElicitationRequest,
+    DEFAULT_TIMEOUT_SECS, ENDPOINT_FILE,
 };
 
 /// A pending approval as the UI sees it. The auth token is deliberately NOT included.
@@ -42,6 +42,8 @@ pub struct PendingView {
     pub tool_fingerprint: Option<String>,
     pub reason: ApprovalReason,
     pub arguments: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url_elicitation: Option<UrlElicitationRequest>,
     /// Wall-clock epoch-millis when this call auto-denies (park time + the fail-closed
     /// timeout). The UI counts down to this exactly, instead of approximating from when
     /// it first saw the request. App and broker share one clock, so it's accurate.
@@ -380,16 +382,18 @@ fn handle_conn(stream: TcpStream, broker: ApprovalBroker, app: AppHandle) {
     // Auto-approve only if the current tool definition matches a fingerprint-bound allow.
     // Legacy broad `server/tool` entries are intentionally ignored: a tool definition that
     // changed since approval should re-prompt instead of inheriting a stale bypass.
-    if let Some(fp) = req.tool_fingerprint.as_deref() {
-        let key = crate::approval::fingerprint_allow_key(&req.server, &req.tool, fp);
-        if broker.session_contains(&key) || registry_allows(&app, &key) {
-            let _ = out.set_write_timeout(Some(Duration::from_secs(10)));
-            let _ = writeln!(
-                out,
-                "{}",
-                serde_json::to_string(&ApprovalDecision::Approved).unwrap_or_default()
-            );
-            return;
+    if req.url_elicitation.is_none() {
+        if let Some(fp) = req.tool_fingerprint.as_deref() {
+            let key = crate::approval::fingerprint_allow_key(&req.server, &req.tool, fp);
+            if broker.session_contains(&key) || registry_allows(&app, &key) {
+                let _ = out.set_write_timeout(Some(Duration::from_secs(10)));
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string(&ApprovalDecision::Approved).unwrap_or_default()
+                );
+                return;
+            }
         }
     }
 
@@ -401,6 +405,7 @@ fn handle_conn(stream: TcpStream, broker: ApprovalBroker, app: AppHandle) {
         tool_fingerprint: req.tool_fingerprint.clone(),
         reason: req.reason,
         arguments: req.arguments.clone(),
+        url_elicitation: req.url_elicitation.clone(),
         // Stamp the deadline now, right before we park on `recv_timeout` below.
         deadline_ms: deadline_ms_from_now(),
     };
@@ -470,12 +475,33 @@ fn registry_allows(app: &AppHandle, key: &str) -> bool {
 /// off, no window) the in-app overlay is still the source of truth. We flash rather than
 /// force-focus so we don't yank the user out of what they're doing.
 fn notify_pending(app: &AppHandle, view: &PendingView) {
-    let who = view.client.as_deref().map(|c| format!("{c} wants to run ")).unwrap_or_default();
+    let who = view
+        .client
+        .as_deref()
+        .map(|c| format!("{c} wants to run "))
+        .unwrap_or_default();
+    let (title, body) = if let Some(elicitation) = &view.url_elicitation {
+        (
+            "Toolport: browser action required",
+            format!(
+                "{} requested an external browser interaction. Review it in Toolport.",
+                elicitation.origin
+            ),
+        )
+    } else {
+        (
+            "Toolport: approval required",
+            format!(
+                "{who}{}/{} - approve or deny it in Toolport.",
+                view.server, view.tool
+            ),
+        )
+    };
     let _ = app
         .notification()
         .builder()
-        .title("Toolport: approval required")
-        .body(format!("{who}{}/{} - approve or deny it in Toolport.", view.server, view.tool))
+        .title(title)
+        .body(body)
         .show();
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.request_user_attention(Some(tauri::UserAttentionType::Critical));
@@ -506,6 +532,7 @@ mod tests {
             tool_fingerprint: Some("v2:abc".into()),
             reason: ApprovalReason::Destructive,
             arguments: serde_json::json!({}),
+            url_elicitation: None,
             deadline_ms: deadline_ms_from_now(),
         };
         b.inner

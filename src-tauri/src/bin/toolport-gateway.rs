@@ -120,6 +120,40 @@ fn modern_client_supports_server_rpc(method: &str) -> bool {
     })
 }
 
+fn elicitation_mode_supported(capability: Option<&Value>, mode: &str) -> bool {
+    let Some(capability) = capability.and_then(Value::as_object) else {
+        return false;
+    };
+    match mode {
+        "url" => capability.get("url").is_some(),
+        // The pre-SEP empty declaration remains form-only for backwards compatibility.
+        "form" => capability.is_empty() || capability.get("form").is_some(),
+        _ => false,
+    }
+}
+
+fn modern_client_supports_server_request(request: &Value) -> bool {
+    let Some(method) = request.get("method").and_then(Value::as_str) else {
+        return false;
+    };
+    if method != "elicitation/create" {
+        return modern_client_supports_server_rpc(method);
+    }
+    let mode = request
+        .get("params")
+        .and_then(|params| params.get("mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("form");
+    ACTIVE_UPSTREAM_CAPABILITIES.with(|cell| {
+        elicitation_mode_supported(
+            cell.borrow()
+                .as_ref()
+                .and_then(|caps| caps.get("elicitation")),
+            mode,
+        )
+    })
+}
+
 fn modern_client_supports_extension(identifier: &str) -> bool {
     ACTIVE_UPSTREAM_CAPABILITIES.with(|cell| {
         cell.borrow()
@@ -3787,6 +3821,7 @@ fn execute_call(
                 // the pseudonyms.
                 arguments: rehydrated_for_local_approver(reg, client, srv, &arguments),
                 tool_fingerprint: current_fp.clone(),
+                url_elicitation: None,
             };
             let mut approval_reason = reason;
             let (decision, held_ms, approved_fp, audit_approval) = if modern_direct_call {
@@ -4122,6 +4157,9 @@ fn execute_call(
                 if let Some(token) = active_modern_hitl.as_deref() {
                     update_modern_hitl_downstream(token, &mut result);
                 }
+                return result;
+            }
+            if result.get("_toolportProtocolError").is_some() {
                 return result;
             }
             finish_modern_hitl(active_modern_hitl.as_deref());
@@ -7870,7 +7908,8 @@ struct GatewayState {
 struct ClientUpstreamCaps {
     roots: ClientRootsState,
     sampling: bool,
-    elicitation: bool,
+    elicitation_form: bool,
+    elicitation_url: bool,
 }
 
 /// Roots the upstream MCP client exposed at `initialize`.
@@ -8751,7 +8790,9 @@ fn capture_client_upstream_from_init(state: &mut ClientUpstreamCaps, params: Opt
         state.roots.roots = roots.clone();
     }
     state.sampling = caps.and_then(|c| c.get("sampling")).is_some();
-    state.elicitation = caps.and_then(|c| c.get("elicitation")).is_some();
+    let elicitation = caps.and_then(|c| c.get("elicitation"));
+    state.elicitation_form = elicitation_mode_supported(elicitation, "form");
+    state.elicitation_url = elicitation_mode_supported(elicitation, "url");
 }
 
 const UPSTREAM_RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -8768,8 +8809,74 @@ fn client_supports_server_rpc(caps: &ClientUpstreamCaps, method: &str) -> bool {
     match method {
         "roots/list" => caps.roots.supported,
         "sampling/createMessage" => caps.sampling,
-        "elicitation/create" => caps.elicitation,
+        "elicitation/create" => caps.elicitation_form,
         _ => false,
+    }
+}
+
+fn client_supports_server_request(caps: &ClientUpstreamCaps, request: &Value) -> bool {
+    if request.get("method").and_then(Value::as_str) != Some("elicitation/create") {
+        return request
+            .get("method")
+            .and_then(Value::as_str)
+            .is_some_and(|method| client_supports_server_rpc(caps, method));
+    }
+    match request
+        .get("params")
+        .and_then(|params| params.get("mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("form")
+    {
+        "url" => caps.elicitation_url,
+        "form" => caps.elicitation_form,
+        _ => false,
+    }
+}
+
+fn broker_url_elicitation(
+    id: Value,
+    screened: downstream::ScreenedUrlElicitation,
+) -> ServerRequestAction {
+    let decision = request_human_decision(approval::ApprovalRequest {
+        token: String::new(),
+        id: format!("toolport-url-{}", new_correlation_id()),
+        client: None,
+        server: screened.origin.clone(),
+        tool: "browser interaction".to_string(),
+        reason: approval::ApprovalReason::UntrustedSource,
+        arguments: Value::Null,
+        tool_fingerprint: None,
+        url_elicitation: Some(approval::UrlElicitationRequest {
+            url: screened.url,
+            origin: screened.origin,
+            message: screened.message,
+        }),
+    });
+    match decision {
+        approval::ApprovalDecision::Approved => {
+            ServerRequestAction::Respond(upstream_json_rpc_response(
+                id,
+                Ok(json!({ "action": "accept" })),
+            ))
+        }
+        approval::ApprovalDecision::Denied => {
+            ServerRequestAction::Respond(upstream_json_rpc_response(
+                id,
+                Ok(json!({ "action": "decline" })),
+            ))
+        }
+        approval::ApprovalDecision::Timeout => {
+            ServerRequestAction::Respond(upstream_json_rpc_response(
+                id,
+                Ok(json!({ "action": "cancel" })),
+            ))
+        }
+        approval::ApprovalDecision::Unreachable | approval::ApprovalDecision::StaleState => {
+            ServerRequestAction::Respond(missing_modern_client_capability(
+                id,
+                "elicitation/create (url mode); Toolport's desktop broker is not running",
+            ))
+        }
     }
 }
 
@@ -9040,14 +9147,28 @@ fn make_server_request_handler(
             return None;
         }
         let id = req.get("id")?.clone();
+        let mut screened_request = req.clone();
+        let url_elicitation = match downstream::screen_url_elicitation_request(&mut screened_request)
+        {
+            Ok(value) => value,
+            Err(message) => {
+                return Some(ServerRequestAction::Respond(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32602, "message": format!("Toolport refused unsafe URL elicitation: {message}") }
+                })))
+            }
+        };
         if serving_modern_client() {
-            return Some(if modern_client_supports_server_rpc(method) {
+            return Some(if modern_client_supports_server_request(&screened_request) {
                 ServerRequestAction::InputRequired
+            } else if let Some(screened) = url_elicitation {
+                broker_url_elicitation(id, screened)
             } else {
                 ServerRequestAction::Respond(missing_modern_client_capability(id, method))
             });
         }
-        let params = upstream_rpc_params(method, req);
+        let params = upstream_rpc_params(method, &screened_request);
         let timeout = upstream_rpc_timeout(method);
         let result = if http {
             let sid = ACTIVE_MCP_SESSION.with(|cell| cell.borrow().clone())?;
@@ -9058,9 +9179,12 @@ fn make_server_request_handler(
             let supported = session
                 .client_upstream
                 .lock()
-                .map(|caps| client_supports_server_rpc(&caps, method))
+                .map(|caps| client_supports_server_request(&caps, &screened_request))
                 .unwrap_or(false);
             if !supported {
+                if let Some(screened) = url_elicitation {
+                    return Some(broker_url_elicitation(id, screened));
+                }
                 return Some(ServerRequestAction::Respond(upstream_client_unsupported(
                     id, method,
                 )));
@@ -9069,9 +9193,12 @@ fn make_server_request_handler(
         } else {
             let supported = client_upstream
                 .lock()
-                .map(|caps| client_supports_server_rpc(&caps, method))
+                .map(|caps| client_supports_server_request(&caps, &screened_request))
                 .unwrap_or(false);
             if !supported {
+                if let Some(screened) = url_elicitation {
+                    return Some(broker_url_elicitation(id, screened));
+                }
                 return Some(ServerRequestAction::Respond(upstream_client_unsupported(
                     id, method,
                 )));
@@ -13066,7 +13193,8 @@ mod tests {
         assert!(state.roots.supported);
         assert!(state.roots.list_changed);
         assert!(state.sampling);
-        assert!(state.elicitation);
+        assert!(state.elicitation_form);
+        assert!(!state.elicitation_url);
         assert_eq!(state.roots.roots.len(), 1);
         assert_eq!(state.roots.roots[0]["uri"], "file:///tmp");
     }
@@ -13075,12 +13203,14 @@ mod tests {
     fn capture_client_upstream_resets_stale_capabilities_on_reinitialize() {
         let mut state = ClientUpstreamCaps {
             sampling: true,
-            elicitation: true,
+            elicitation_form: true,
+            elicitation_url: true,
             ..Default::default()
         };
         capture_client_upstream_from_init(&mut state, Some(&json!({"capabilities": {}})));
         assert!(!state.sampling);
-        assert!(!state.elicitation);
+        assert!(!state.elicitation_form);
+        assert!(!state.elicitation_url);
     }
 
     #[test]
@@ -13091,11 +13221,26 @@ mod tests {
                 ..Default::default()
             },
             sampling: true,
-            elicitation: false,
+            elicitation_form: false,
+            elicitation_url: false,
         };
         assert!(client_supports_server_rpc(&caps, "roots/list"));
         assert!(client_supports_server_rpc(&caps, "sampling/createMessage"));
         assert!(!client_supports_server_rpc(&caps, "elicitation/create"));
+    }
+
+    #[test]
+    fn elicitation_capability_distinguishes_form_and_url_modes() {
+        assert!(elicitation_mode_supported(Some(&json!({})), "form"));
+        assert!(!elicitation_mode_supported(Some(&json!({})), "url"));
+        assert!(elicitation_mode_supported(
+            Some(&json!({ "form": {}, "url": {} })),
+            "form"
+        ));
+        assert!(elicitation_mode_supported(
+            Some(&json!({ "form": {}, "url": {} })),
+            "url"
+        ));
     }
 
     #[test]
@@ -13123,6 +13268,36 @@ mod tests {
             "params": { "message": "Continue?" }
         });
         assert_eq!(handler(&request), Some(ServerRequestAction::InputRequired));
+    }
+
+    #[test]
+    fn modern_url_elicitation_relays_only_with_url_mode_capability() {
+        let request = json!({
+            "method": "elicitation/create",
+            "params": {
+                "mode": "url",
+                "message": "Sign in",
+                "url": "https://93.184.216.34/authorize"
+            }
+        });
+        let capable = json!({
+            "params": { "_meta": {
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "elicitation": { "form": {}, "url": {} }
+                }
+            }}
+        });
+        let _caps = UpstreamCapabilitiesGuard::enter(&capable);
+        assert!(modern_client_supports_server_request(&request));
+
+        drop(_caps);
+        let form_only = json!({
+            "params": { "_meta": {
+                "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+            }}
+        });
+        let _caps = UpstreamCapabilitiesGuard::enter(&form_only);
+        assert!(!modern_client_supports_server_request(&request));
     }
 
     #[test]
@@ -13371,6 +13546,7 @@ mod tests {
             reason: approval::ApprovalReason::Destructive,
             arguments: serde_json::json!({}),
             tool_fingerprint: Some("v2:abc".into()),
+            url_elicitation: None,
         };
         // No endpoint descriptor (Toolport app not running) -> Unreachable (fail-closed),
         // distinct from a human Timeout so the caller can explain *why* it was blocked.

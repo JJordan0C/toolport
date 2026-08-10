@@ -366,6 +366,13 @@ export interface PendingApproval {
   toolFingerprint?: string | null;
   reason: "destructive" | "untrusted_source" | "destructive_and_untrusted";
   arguments: unknown;
+  /** A screened URL-mode elicitation brokered by the desktop because the MCP host
+   * did not declare URL elicitation support. */
+  urlElicitation?: {
+    url: string;
+    origin: string;
+    message: string;
+  } | null;
   /** Wall-clock epoch-ms when this call auto-denies; the overlay counts down to it. */
   deadlineMs: number;
 }
