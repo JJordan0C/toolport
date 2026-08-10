@@ -48,21 +48,42 @@ use conduit_lib::semantic;
 use conduit_lib::shaping;
 use conduit_lib::{audit, usage_report};
 
+/// Context that belongs to the request currently executing on this worker.
+///
+/// These fields used to live in three independent thread-locals. That made it
+/// possible to install an MCP session without its era/capabilities (or restore
+/// one field but not the others) as nested code-mode calls crossed worker
+/// threads. Keeping one record is the first boundary needed by the shared host
+/// daemon: a later transport can install a complete session-derived context
+/// without relying on process-wide single-client state (SBS-551).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum UpstreamTransport {
+    #[default]
+    Stdio,
+    Http,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ActiveRequestContext {
+    /// Protocol version when the active client is modern (2026-07-28+).
+    upstream_version: Option<String>,
+    /// Per-request modern client capabilities used for MRTR/server RPC gating.
+    upstream_capabilities: Option<Value>,
+    /// Legacy HTTP session or modern subscription key used for upstream routing.
+    mcp_session: Option<String>,
+    /// Transport carrying the originating request. Progress and notifications
+    /// must never infer this from process topology in a multi-client daemon.
+    upstream_transport: UpstreamTransport,
+}
+
 thread_local! {
-    /// Protocol version of the request currently being served, when the client is
-    /// modern (2026-07-28+). `None` means a legacy client.
-    ///
-    /// Request-scoped rather than connection-scoped on purpose: a modern client
-    /// declares its version on every request, so there is no connection-level
-    /// negotiation to cache. Mirrors `ACTIVE_MCP_SESSION` so [`success`] can
-    /// decorate every result without threading the era through each of the two
-    /// dozen dispatch arms - including the ones that return early (SOU-446).
-    static ACTIVE_UPSTREAM_VERSION: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
-    /// Per-request capabilities of a modern upstream client. These decide
-    /// whether a legacy downstream server request can be surfaced as MRTR.
-    static ACTIVE_UPSTREAM_CAPABILITIES: std::cell::RefCell<Option<Value>> =
-        const { std::cell::RefCell::new(None) };
+    static ACTIVE_REQUEST_CONTEXT: std::cell::RefCell<ActiveRequestContext> =
+        const { std::cell::RefCell::new(ActiveRequestContext {
+            upstream_version: None,
+            upstream_capabilities: None,
+            mcp_session: None,
+            upstream_transport: UpstreamTransport::Stdio,
+        }) };
 }
 
 /// Sets the serving era for one request and restores the previous value on drop,
@@ -71,19 +92,24 @@ struct UpstreamEraGuard(Option<String>);
 
 impl UpstreamEraGuard {
     fn enter(version: Option<String>) -> Self {
-        UpstreamEraGuard(ACTIVE_UPSTREAM_VERSION.with(|cell| cell.replace(version)))
+        let previous = ACTIVE_REQUEST_CONTEXT.with(|cell| {
+            std::mem::replace(&mut cell.borrow_mut().upstream_version, version)
+        });
+        UpstreamEraGuard(previous)
     }
 }
 
 impl Drop for UpstreamEraGuard {
     fn drop(&mut self) {
-        ACTIVE_UPSTREAM_VERSION.with(|cell| *cell.borrow_mut() = self.0.take());
+        ACTIVE_REQUEST_CONTEXT.with(|cell| {
+            cell.borrow_mut().upstream_version = self.0.take();
+        });
     }
 }
 
 /// True when the request being served came from a modern client.
 fn serving_modern_client() -> bool {
-    ACTIVE_UPSTREAM_VERSION.with(|cell| cell.borrow().is_some())
+    ACTIVE_REQUEST_CONTEXT.with(|cell| cell.borrow().upstream_version.is_some())
 }
 
 struct UpstreamCapabilitiesGuard(Option<Value>);
@@ -95,14 +121,94 @@ impl UpstreamCapabilitiesGuard {
             .and_then(|params| params.get("_meta"))
             .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"))
             .cloned();
-        Self(ACTIVE_UPSTREAM_CAPABILITIES.with(|cell| cell.replace(capabilities)))
+        let previous = ACTIVE_REQUEST_CONTEXT.with(|cell| {
+            std::mem::replace(&mut cell.borrow_mut().upstream_capabilities, capabilities)
+        });
+        Self(previous)
     }
 }
 
 impl Drop for UpstreamCapabilitiesGuard {
     fn drop(&mut self) {
-        ACTIVE_UPSTREAM_CAPABILITIES.with(|cell| *cell.borrow_mut() = self.0.take());
+        ACTIVE_REQUEST_CONTEXT.with(|cell| {
+            cell.borrow_mut().upstream_capabilities = self.0.take();
+        });
     }
+}
+
+/// Installs one upstream MCP session and restores the previous session on drop.
+/// Nested dispatch and early returns therefore cannot leak a caller into the
+/// next request served by the same worker thread.
+struct McpSessionGuard(Option<String>);
+
+impl McpSessionGuard {
+    fn enter(session: Option<String>) -> Self {
+        let previous = ACTIVE_REQUEST_CONTEXT.with(|cell| {
+            std::mem::replace(&mut cell.borrow_mut().mcp_session, session)
+        });
+        Self(previous)
+    }
+}
+
+impl Drop for McpSessionGuard {
+    fn drop(&mut self) {
+        ACTIVE_REQUEST_CONTEXT.with(|cell| {
+            cell.borrow_mut().mcp_session = self.0.take();
+        });
+    }
+}
+
+fn active_mcp_session() -> Option<String> {
+    ACTIVE_REQUEST_CONTEXT.with(|cell| cell.borrow().mcp_session.clone())
+}
+
+struct UpstreamTransportGuard(UpstreamTransport);
+
+impl UpstreamTransportGuard {
+    fn enter(transport: UpstreamTransport) -> Self {
+        let previous = ACTIVE_REQUEST_CONTEXT.with(|cell| {
+            std::mem::replace(&mut cell.borrow_mut().upstream_transport, transport)
+        });
+        Self(previous)
+    }
+}
+
+impl Drop for UpstreamTransportGuard {
+    fn drop(&mut self) {
+        ACTIVE_REQUEST_CONTEXT.with(|cell| {
+            cell.borrow_mut().upstream_transport = self.0;
+        });
+    }
+}
+
+fn active_upstream_is_stdio() -> bool {
+    ACTIVE_REQUEST_CONTEXT.with(|cell| {
+        cell.borrow().upstream_transport == UpstreamTransport::Stdio
+    })
+}
+
+/// Installs a complete request context on a worker that continues work for a
+/// request started on another thread (currently code-mode `callAsync`). Copying
+/// only the session id is insufficient: modern server-initiated RPC also needs
+/// the originating client's protocol era and capabilities.
+struct ActiveRequestContextGuard(ActiveRequestContext);
+
+impl ActiveRequestContextGuard {
+    fn enter(context: ActiveRequestContext) -> Self {
+        Self(ACTIVE_REQUEST_CONTEXT.with(|cell| cell.replace(context)))
+    }
+}
+
+impl Drop for ActiveRequestContextGuard {
+    fn drop(&mut self) {
+        ACTIVE_REQUEST_CONTEXT.with(|cell| {
+            cell.replace(std::mem::take(&mut self.0));
+        });
+    }
+}
+
+fn active_request_context() -> ActiveRequestContext {
+    ACTIVE_REQUEST_CONTEXT.with(|cell| cell.borrow().clone())
 }
 
 fn modern_client_supports_server_rpc(method: &str) -> bool {
@@ -112,8 +218,9 @@ fn modern_client_supports_server_rpc(method: &str) -> bool {
         "elicitation/create" => "elicitation",
         _ => return false,
     };
-    ACTIVE_UPSTREAM_CAPABILITIES.with(|cell| {
+    ACTIVE_REQUEST_CONTEXT.with(|cell| {
         cell.borrow()
+            .upstream_capabilities
             .as_ref()
             .and_then(|caps| caps.get(capability))
             .is_some()
@@ -144,9 +251,10 @@ fn modern_client_supports_server_request(request: &Value) -> bool {
         .and_then(|params| params.get("mode"))
         .and_then(Value::as_str)
         .unwrap_or("form");
-    ACTIVE_UPSTREAM_CAPABILITIES.with(|cell| {
+    ACTIVE_REQUEST_CONTEXT.with(|cell| {
         elicitation_mode_supported(
             cell.borrow()
+                .upstream_capabilities
                 .as_ref()
                 .and_then(|caps| caps.get("elicitation")),
             mode,
@@ -155,8 +263,9 @@ fn modern_client_supports_server_request(request: &Value) -> bool {
 }
 
 fn modern_client_supports_extension(identifier: &str) -> bool {
-    ACTIVE_UPSTREAM_CAPABILITIES.with(|cell| {
+    ACTIVE_REQUEST_CONTEXT.with(|cell| {
         cell.borrow()
+            .upstream_capabilities
             .as_ref()
             .and_then(|caps| caps.get("extensions"))
             .and_then(|extensions| extensions.get(identifier))
@@ -172,8 +281,9 @@ fn mcp_app_html_settings(settings: &Value) -> bool {
 }
 
 fn active_client_supports_mcp_app_html() -> bool {
-    ACTIVE_UPSTREAM_CAPABILITIES.with(|cell| {
+    ACTIVE_REQUEST_CONTEXT.with(|cell| {
         cell.borrow()
+            .upstream_capabilities
             .as_ref()
             .and_then(|caps| caps.get("extensions"))
             .and_then(|extensions| extensions.get(MCP_APPS_EXTENSION))
@@ -845,74 +955,10 @@ static PROGRESS_DISPATCH: std::sync::OnceLock<ProgressDispatch> = std::sync::Onc
 static PROGRESS_ROUTES: std::sync::OnceLock<Arc<Mutex<ProgressRoutes>>> =
     std::sync::OnceLock::new();
 
-/// Whether this process serves a stdio MCP client, i.e. whether writing a
-/// server-to-client message to stdout reaches anybody.
-///
-/// False in HTTP bridge mode. Defaults to true when unset so direct unit-test
-/// callers keep the stdio behaviour they were written against.
-///
-/// Tri-state (`0` unset, `1` no stdio client, `2` stdio client) rather than a
-/// `OnceLock`: a write-once cell cannot be set by a test without pinning the
-/// value for every other test in the binary, so no test ever set it and every
-/// one of them silently resolved to the stdio branch - including the ones whose
-/// whole point was an HTTP gateway (SOU-474 #9).
-static HAS_STDIO_CLIENT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 /// Once this stdio peer sends a 2026-07-28 request, unsolicited legacy
 /// notifications must stop. Modern notifications travel only through its
 /// explicit `subscriptions/listen` filter.
 static MODERN_STDIO_UPSTREAM: AtomicBool = AtomicBool::new(false);
-
-fn set_has_stdio_client(present: bool) {
-    HAS_STDIO_CLIENT.store(
-        if present { 2 } else { 1 },
-        std::sync::atomic::Ordering::SeqCst,
-    );
-}
-
-fn has_stdio_client() -> bool {
-    // Unset resolves to true: see the note above.
-    HAS_STDIO_CLIENT.load(std::sync::atomic::Ordering::SeqCst) != 1
-}
-
-/// Serializes tests that override [`HAS_STDIO_CLIENT`], which is process-global.
-///
-/// Only tests that take this lock are serialized. libtest runs tests on parallel
-/// threads, so a test that reaches `progress_target()` WITHOUT overriding can
-/// still observe another test's value. That is latent rather than live today
-/// (only the override-taking tests touch that path), but a new test on the
-/// progress path needs this guard even when it does not care about the value.
-#[cfg(test)]
-static STDIO_CLIENT_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-/// Sets [`HAS_STDIO_CLIENT`] for the duration of a test and restores it on drop,
-/// holding the lock above for as long as the override is in effect.
-#[cfg(test)]
-struct StdioClientOverride {
-    _guard: std::sync::MutexGuard<'static, ()>,
-    previous: u8,
-}
-
-#[cfg(test)]
-impl StdioClientOverride {
-    fn set(present: bool) -> Self {
-        let guard = STDIO_CLIENT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = HAS_STDIO_CLIENT.load(std::sync::atomic::Ordering::SeqCst);
-        set_has_stdio_client(present);
-        Self {
-            _guard: guard,
-            previous,
-        }
-    }
-}
-
-#[cfg(test)]
-impl Drop for StdioClientOverride {
-    fn drop(&mut self) {
-        HAS_STDIO_CLIENT.store(self.previous, std::sync::atomic::Ordering::SeqCst);
-    }
-}
 
 /// Where progress for the request being served should be delivered, or `None`
 /// when there is no channel to deliver it on.
@@ -924,10 +970,7 @@ impl Drop for StdioClientOverride {
 /// traffic nobody is reading, so it returns `None` and the caller declines to ask
 /// the server for progress at all (SOU-447).
 fn progress_target() -> Option<String> {
-    progress_target_for(
-        ACTIVE_MCP_SESSION.with(|cell| cell.borrow().clone()),
-        has_stdio_client(),
-    )
+    progress_target_for(active_mcp_session(), active_upstream_is_stdio())
 }
 
 /// The decision behind [`progress_target`], separated from the globals it reads
@@ -4876,11 +4919,12 @@ fn run_script_dispatch(
     let allowed_owned = allowed.cloned();
     let cancel_owned = cancel;
 
-    // Capture the active MCP session id (if any) so callAsync workers on other
-    // threads reinstall it for the duration of each host call (WS2-3). Without
-    // this, HTTP-mode server-initiated RPC (sampling/elicitation/roots) during
-    // a fanned-out callAsync cannot resolve the upstream client.
-    let active_session = ACTIVE_MCP_SESSION.with(|cell| cell.borrow().clone());
+    // Capture the complete request context so callAsync workers on other threads
+    // reinstall the originating session, protocol era, and capabilities for the
+    // duration of each host call. Installing only the session id lets a modern
+    // request reach its HTTP client but then misclassifies it as legacy when a
+    // downstream asks for sampling/elicitation/roots (SBS-551, extending WS2-3).
+    let request_context = active_request_context();
 
     // Arc + Send + Sync so independent callAsync work can run on a small host thread pool.
     // shape=false: intermediate results stay full-sized in the sandbox (never enter model
@@ -4909,16 +4953,8 @@ fn run_script_dispatch(
                 live_owned.as_ref(),
             )
         };
-        match active_session.as_ref() {
-            Some(sid) => ACTIVE_MCP_SESSION.with(|cell| {
-                let previous = cell.borrow().clone();
-                *cell.borrow_mut() = Some(sid.clone());
-                let out = run();
-                *cell.borrow_mut() = previous;
-                out
-            }),
-            None => run(),
-        }
+        let _context = ActiveRequestContextGuard::enter(request_context.clone());
+        run()
     });
 
     // Cursor handoff for any already-shaped result (prior turn, or external cursor in data).
@@ -6836,11 +6872,7 @@ fn make_resource_updated_sink(
 /// Active MCP session key for resource subscription bookkeeping: real HTTP
 /// session id when set, otherwise the stdio sentinel.
 fn active_resource_session_id() -> String {
-    ACTIVE_MCP_SESSION.with(|cell| {
-        cell.borrow()
-            .clone()
-            .unwrap_or_else(|| RESOURCE_SUB_STDIO.to_string())
-    })
+    active_mcp_session().unwrap_or_else(|| RESOURCE_SUB_STDIO.to_string())
 }
 
 /// Handle `resources/subscribe` / `resources/unsubscribe` with ownership routing,
@@ -8006,10 +8038,6 @@ impl StdioUpstream {
     }
 }
 
-thread_local! {
-    static ACTIVE_MCP_SESSION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-}
-
 fn should_write_legacy_stdio_resource_update(need_stdio: bool, modern_stdio: bool) -> bool {
     need_stdio && !modern_stdio
 }
@@ -8149,10 +8177,9 @@ fn register_modern_subscription(
             "method": "resources/subscribe",
             "params": { "uri": uri }
         });
-        ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = Some(key.clone()));
+        let _session = McpSessionGuard::enter(Some(key.clone()));
         let response =
             handle_resource_subscription(state, router, &subscribe, allowed, "resources/subscribe");
-        ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = None);
         if response
             .as_ref()
             .is_some_and(|response| response.get("result").is_some())
@@ -9180,7 +9207,7 @@ fn make_server_request_handler(
         let params = upstream_rpc_params(method, &screened_request);
         let timeout = upstream_rpc_timeout(method);
         let result = if http {
-            let sid = ACTIVE_MCP_SESSION.with(|cell| cell.borrow().clone())?;
+            let sid = active_mcp_session()?;
             let session = {
                 let sessions = mcp_sessions.lock().ok()?;
                 sessions.get(&sid).cloned()?
@@ -9441,6 +9468,11 @@ fn process_request(
     cancel: Option<downstream::CancelContext>,
     client: Option<&str>,
 ) -> Option<Value> {
+    let _transport = UpstreamTransportGuard::enter(if state.http {
+        UpstreamTransport::Http
+    } else {
+        UpstreamTransport::Stdio
+    });
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     if !state.http && upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
         MODERN_STDIO_UPSTREAM.store(true, Ordering::SeqCst);
@@ -10538,9 +10570,8 @@ fn handle_mcp_http(
 
             // Notifications / JSON-RPC responses: 202 with empty body.
             if !has_id {
-                ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = session_id.clone());
+                let _session = McpSessionGuard::enter(session_id.clone());
                 let _ = process_request(state, &req, guard, confirm, allowed, None, client);
-                ACTIVE_MCP_SESSION.with(|cell| *cell.borrow_mut() = None);
                 let out = HttpOut::new(202, "text/plain", String::new());
                 return match session_id.as_deref() {
                     Some(sid) => out.with_header("Mcp-Session-Id", sid),
@@ -10548,12 +10579,8 @@ fn handle_mcp_http(
                 };
             }
 
-            let resp = ACTIVE_MCP_SESSION.with(|cell| {
-                *cell.borrow_mut() = session_id.clone();
-                let out = process_request(state, &req, guard, confirm, allowed, None, client);
-                *cell.borrow_mut() = None;
-                out
-            });
+            let _session = McpSessionGuard::enter(session_id.clone());
+            let resp = process_request(state, &req, guard, confirm, allowed, None, client);
             match resp {
                 Some(resp) => {
                     let status = if is_modern {
@@ -12117,9 +12144,6 @@ fn main() {
         Arc::clone(&mcp_sessions),
         Arc::clone(progress_routes()),
     ));
-    // In HTTP bridge mode nothing reads this process's stdout, so it is not a
-    // delivery channel for server-to-client messages (SOU-447).
-    set_has_stdio_client(!http_mode);
     // Single-flight for every router build/swap (startup, watcher self-heal, and
     // ${ROOT} rebuilds). Created up front so the startup build can share it.
     let rebuild_lock = Arc::new(Mutex::new(()));
@@ -18731,7 +18755,8 @@ mod tests {
         // Code mode re-enters dispatch while an outer request is being served, so
         // an inner modern request must restore the outer era on the way out
         // rather than leaving it set.
-        let outer_is_modern = ACTIVE_UPSTREAM_VERSION.with(|cell| cell.borrow().is_some());
+        let outer_is_modern =
+            ACTIVE_REQUEST_CONTEXT.with(|cell| cell.borrow().upstream_version.is_some());
         assert!(!outer_is_modern, "test starts with no era installed");
 
         // Simulate the outer legacy request holding the thread-local, then a
@@ -18756,6 +18781,86 @@ mod tests {
     }
 
     #[test]
+    fn mcp_session_guard_restores_nested_session_context() {
+        assert!(
+            active_mcp_session().is_none(),
+            "test starts without an installed session"
+        );
+        {
+            let _outer = McpSessionGuard::enter(Some("session-a".to_string()));
+            assert_eq!(active_mcp_session().as_deref(), Some("session-a"));
+            {
+                let _inner = McpSessionGuard::enter(Some("session-b".to_string()));
+                assert_eq!(active_mcp_session().as_deref(), Some("session-b"));
+            }
+            assert_eq!(
+                active_mcp_session().as_deref(),
+                Some("session-a"),
+                "dropping a nested guard restores its caller"
+            );
+        }
+        assert!(
+            active_mcp_session().is_none(),
+            "dropping the outer guard restores the worker default"
+        );
+    }
+
+    #[test]
+    fn active_request_context_is_isolated_between_worker_threads() {
+        assert_eq!(
+            ACTIVE_REQUEST_CONTEXT.with(|cell| cell.borrow().clone()),
+            ActiveRequestContext::default(),
+            "test starts with a clean worker context"
+        );
+        let _era = UpstreamEraGuard::enter(Some(MODERN_PROTOCOL_VERSION.to_string()));
+        let _session = McpSessionGuard::enter(Some("parent-session".to_string()));
+        let parent_caps = json!({
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "roots": {}
+                    }
+                }
+            }
+        });
+        let _capabilities = UpstreamCapabilitiesGuard::enter(&parent_caps);
+
+        let captured = active_request_context();
+        let child = std::thread::spawn(move || {
+            assert_eq!(
+                active_request_context(),
+                ActiveRequestContext::default(),
+                "a fresh worker must not inherit another request's context"
+            );
+            let installed = {
+                let _context = ActiveRequestContextGuard::enter(captured);
+                assert_eq!(active_mcp_session().as_deref(), Some("parent-session"));
+                assert!(serving_modern_client());
+                assert!(modern_client_supports_server_rpc("roots/list"));
+                active_request_context()
+            };
+            assert_eq!(
+                active_request_context(),
+                ActiveRequestContext::default(),
+                "dropping the cross-thread guard restores the worker default"
+            );
+            installed
+        })
+        .join()
+        .expect("worker completes");
+
+        assert_eq!(child.mcp_session.as_deref(), Some("parent-session"));
+        assert_eq!(
+            child.upstream_version.as_deref(),
+            Some(MODERN_PROTOCOL_VERSION)
+        );
+        assert!(child.upstream_capabilities.is_some());
+        assert_eq!(active_mcp_session().as_deref(), Some("parent-session"));
+        assert!(serving_modern_client());
+        assert!(modern_client_supports_server_rpc("roots/list"));
+    }
+
+    #[test]
     fn prepare_progress_withholds_the_token_when_nothing_can_deliver_it() {
         // The shipping function, not its pure helpers. `progress_target_for` was
         // unit-tested in every combination while `prepare_progress` - which reads
@@ -18765,11 +18870,13 @@ mod tests {
 
         // A modern HTTP client: no session, no stdio. Nothing can carry progress,
         // so the server must not be asked to produce it.
-        let _no_stdio = StdioClientOverride::set(false);
+        let _http = UpstreamTransportGuard::enter(UpstreamTransport::Http);
         // Thread-local, and libtest may reuse this thread for another test, so
         // assert the default rather than assuming it and leaving it changed.
-        ACTIVE_MCP_SESSION
-            .with(|cell| assert!(cell.borrow().is_none(), "no session on this thread"));
+        assert!(
+            active_mcp_session().is_none(),
+            "no session on this thread"
+        );
         assert_eq!(
             progress_target(),
             None,
@@ -18794,11 +18901,13 @@ mod tests {
     fn prepare_progress_registers_a_route_for_a_stdio_client() {
         // The other side of the same decision: a stdio client IS a delivery
         // channel, so the token is registered and rewritten rather than dropped.
-        let _stdio = StdioClientOverride::set(true);
+        let _stdio = UpstreamTransportGuard::enter(UpstreamTransport::Stdio);
         // Thread-local, and libtest may reuse this thread for another test, so
         // assert the default rather than assuming it and leaving it changed.
-        ACTIVE_MCP_SESSION
-            .with(|cell| assert!(cell.borrow().is_none(), "no session on this thread"));
+        assert!(
+            active_mcp_session().is_none(),
+            "no session on this thread"
+        );
         assert_eq!(
             progress_target().as_deref(),
             Some(RESOURCE_SUB_STDIO),
