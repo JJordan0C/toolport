@@ -372,7 +372,8 @@ export interface PendingApproval {
   server: string;
   tool: string;
   toolFingerprint?: string | null;
-  reason: "destructive" | "untrusted_source" | "destructive_and_untrusted";
+  reason:
+    "destructive" | "untrusted_source" | "destructive_and_untrusted" | "pii_cross_server";
   arguments: unknown;
   /** A screened URL-mode elicitation brokered by the desktop because the MCP host
    * did not declare URL elicitation support. */
@@ -380,6 +381,16 @@ export interface PendingApproval {
     url: string;
     origin: string;
     message: string;
+  } | null;
+  /** Pseudonymized values this call would send to a server that never produced them.
+   * Present only for `reason: "pii_cross_server"`.
+   *
+   * `value` is REAL, un-pseudonymized PII. It reaches this window and nowhere else —
+   * a person cannot judge the release without seeing what is being released. It must
+   * never be logged, persisted, or echoed anywhere the model can read. */
+  piiRelease?: {
+    server: string;
+    values: { token: string; value: string; origins: string[] }[];
   } | null;
   /** Wall-clock epoch-ms when this call auto-denies; the overlay counts down to it. */
   deadlineMs: number;

