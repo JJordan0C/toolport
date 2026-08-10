@@ -1919,7 +1919,7 @@ fn load_from_inner(path: &Path) -> Result<Registry, String> {
 /// read/recovery path. Recovery can rewrite the primary from a backup, so even a caller
 /// that only intends to read must serialize with writers (SOU-330).
 pub fn load_from(path: &Path) -> Result<Registry, String> {
-    let lock = lock_for(path)?;
+    let lock = lock_for(path, REGISTRY_LOCK_TIMEOUT)?;
     load_from_locked(path, &lock)
 }
 
@@ -2020,7 +2020,9 @@ fn lock_path(path: &Path) -> PathBuf {
 /// Acquire the exclusive registry lock, retrying briefly under contention. Registry writes
 /// are sub-millisecond, so a real conflict clears at once; a holder stuck past the deadline
 /// surfaces as an error rather than hanging the caller indefinitely.
-fn lock_for(path: &Path) -> Result<FileLock, String> {
+const REGISTRY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn lock_for(path: &Path, timeout: std::time::Duration) -> Result<FileLock, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -2029,7 +2031,7 @@ fn lock_for(path: &Path) -> Result<FileLock, String> {
         .write(true)
         .open(lock_path(path))
         .map_err(|e| format!("Could not open the registry lock: {e}"))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(FileLock(file)),
@@ -2056,7 +2058,7 @@ fn lock_for(path: &Path) -> Result<FileLock, String> {
 /// through this or [`update_at`] — that is what makes the lock effective.
 pub fn update<T>(f: impl FnOnce(&mut Registry) -> Result<T, String>) -> Result<(Registry, T), String> {
     let path = resolved_path().ok_or("Could not resolve registry path")?;
-    let lock = lock_for(&path)?;
+    let lock = lock_for(&path, REGISTRY_LOCK_TIMEOUT)?;
     let mut reg = load_from_locked(&path, &lock)?;
     let out = f(&mut reg)?;
     // Save to the exact path we locked and loaded. Re-resolving after `f` would let a
@@ -2070,7 +2072,17 @@ pub fn update<T>(f: impl FnOnce(&mut Registry) -> Result<T, String>) -> Result<(
 /// agent toggle (which interleaves audit + early returns), and the integrity pins/quarantine
 /// stores (SOU-165). Hold the returned guard across the entire read-decide-write.
 pub fn lock_at(path: &Path) -> Result<FileLock, String> {
-    lock_for(path)
+    lock_for(path, REGISTRY_LOCK_TIMEOUT)
+}
+
+/// Acquire an explicit-path lock with a caller-appropriate contention deadline.
+/// Registry operations use the short default above; operations that deliberately
+/// hold a lock across network I/O need to cover that I/O's timeout instead.
+pub(crate) fn lock_at_for(
+    path: &Path,
+    timeout: std::time::Duration,
+) -> Result<FileLock, String> {
+    lock_for(path, timeout)
 }
 
 /// Like [`update`] but for a caller that already resolved an explicit path (the gateway
@@ -2079,7 +2091,7 @@ pub fn update_at<T>(
     path: &Path,
     f: impl FnOnce(&mut Registry) -> Result<T, String>,
 ) -> Result<(Registry, T), String> {
-    let lock = lock_for(path)?;
+    let lock = lock_for(path, REGISTRY_LOCK_TIMEOUT)?;
     let mut reg = load_from_locked(path, &lock)?;
     let out = f(&mut reg)?;
     save_to(path, &reg)?;

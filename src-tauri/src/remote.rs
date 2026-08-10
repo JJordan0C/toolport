@@ -351,16 +351,36 @@ fn uses_client_credentials(server: &ServerEntry) -> bool {
 /// covers only the interactive browser flow.
 ///
 /// Best-effort by design: with no resolvable data dir there is nowhere to put a lock, and
-/// refusing to refresh at all would be worse than the race it prevents. `lock_at` is
-/// bounded-blocking (retries for a few seconds), so a slow winner delays the loser rather
-/// than failing it.
-fn lock_oauth_refresh(server_id: &str) -> Option<crate::registry::FileLock> {
-    let dir = crate::registry::conduit_dir()?;
+/// refusing to refresh at all would be worse than the race it prevents. Contention waits long
+/// enough to cover the OAuth client's 30-second request timeout and metadata refresh before
+/// failing open visibly rather than silently dropping back to the original race (SBS-705).
+const OAUTH_REFRESH_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(65);
+
+fn lock_oauth_refresh_for(
+    server_id: &str,
+    timeout: std::time::Duration,
+) -> Result<Option<crate::registry::FileLock>, String> {
+    let Some(dir) = crate::registry::conduit_dir() else {
+        return Ok(None);
+    };
     let leaf = format!(
         "oauth-refresh-{}.lock",
         crate::router::sanitize_segment(server_id)
     );
-    crate::registry::lock_at(&dir.join(leaf)).ok()
+    crate::registry::lock_at_for(&dir.join(leaf), timeout).map(Some)
+}
+
+fn lock_oauth_refresh(server_id: &str) -> Option<crate::registry::FileLock> {
+    match lock_oauth_refresh_for(server_id, OAUTH_REFRESH_LOCK_TIMEOUT) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!(
+                "toolport: OAuth refresh for {server_id:?} is proceeding without the cross-process lock after waiting {}s: {error}",
+                OAUTH_REFRESH_LOCK_TIMEOUT.as_secs()
+            );
+            None
+        }
+    }
 }
 
 /// After winning the refresh lock, decide whether another process already did the work.
@@ -1042,6 +1062,18 @@ mod tests {
 
         let a = lock_oauth_refresh("server-a").expect("a data dir is set, so a lock exists");
         let b = lock_oauth_refresh("server-b").expect("a different server must not block");
+        let contention = match lock_oauth_refresh_for(
+            "server-a",
+            std::time::Duration::from_millis(40),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("contention must remain distinguishable from a missing data dir"),
+        };
+        assert!(contention.contains("locked by another Toolport process"));
+        assert!(
+            OAUTH_REFRESH_LOCK_TIMEOUT >= std::time::Duration::from_secs(30),
+            "the production wait must cover the token client's request timeout"
+        );
         drop((a, b));
 
         assert!(
