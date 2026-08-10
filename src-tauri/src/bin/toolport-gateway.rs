@@ -8645,6 +8645,7 @@ impl Drop for McpSseReader {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&key);
             cleanup_resource_subs_for_session(&state, &key);
+            clear_pii_session(self.session.owner.as_ref().map(|owner| owner.identity.as_str()));
         }
     }
 }
@@ -8666,6 +8667,33 @@ fn new_mcp_session_id() -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Remove expired/closed MCP sessions and all conversation-scoped state they own.
+fn reap_stale_mcp_sessions(state: &GatewayState) {
+    // Collect first so we do not hold the sessions lock across cleanup that may
+    // call the router.
+    let stale: Vec<(String, Arc<McpSession>)> = {
+        let mut sessions = state
+            .mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stale: Vec<(String, Arc<McpSession>)> = sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.is_expired() || session.closed.load(Ordering::SeqCst)
+            })
+            .map(|(id, session)| (id.clone(), Arc::clone(session)))
+            .collect();
+        for (id, _) in &stale {
+            sessions.remove(id);
+        }
+        stale
+    };
+    for (id, session) in stale {
+        cleanup_resource_subs_for_session(state, &id);
+        clear_pii_session(session.owner.as_ref().map(|owner| owner.identity.as_str()));
+    }
+}
+
 /// Mint a new MCP session after TTL cleanup. Returns 503 when at capacity.
 ///
 /// Expired/closed sessions are removed and their resource subscriptions cleaned
@@ -8678,26 +8706,7 @@ fn mint_mcp_session(
 ) -> Result<String, HttpOut> {
     let sid = new_mcp_session_id();
     let session = Arc::new(McpSession::new(owner.cloned()));
-    // Collect first so we do not hold the sessions lock across cleanup that may
-    // call the router (same ordering as resolve_mcp_session).
-    let stale: Vec<String> = {
-        let mut sessions = state
-            .mcp_sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stale: Vec<String> = sessions
-            .iter()
-            .filter(|(_, s)| s.is_expired() || s.closed.load(Ordering::SeqCst))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in &stale {
-            sessions.remove(id);
-        }
-        stale
-    };
-    for id in &stale {
-        cleanup_resource_subs_for_session(state, id);
-    }
+    reap_stale_mcp_sessions(state);
     let mut sessions = state
         .mcp_sessions
         .lock()
@@ -10114,25 +10123,9 @@ fn mcp_require_session(
     if !valid_mcp_session_id(sid) {
         return Err(HttpOut::json_err(400, "invalid Mcp-Session-Id"));
     }
-    let mut sessions = state
-        .mcp_sessions
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Drop expired/closed sessions and release any last-holder resource subs
-    // they held (SOU-394). Collect first so we do not hold the sessions lock
-    // across cleanup that may call the router.
-    let stale: Vec<String> = sessions
-        .iter()
-        .filter(|(_, s)| s.is_expired() || s.closed.load(Ordering::SeqCst))
-        .map(|(id, _)| id.clone())
-        .collect();
-    for id in &stale {
-        sessions.remove(id);
-    }
-    drop(sessions);
-    for id in &stale {
-        cleanup_resource_subs_for_session(state, id);
-    }
+    // they held (SOU-394), plus their conversation-scoped PII maps (SBS-704).
+    reap_stale_mcp_sessions(state);
     let sessions = state
         .mcp_sessions
         .lock()
@@ -16899,6 +16892,11 @@ mod tests {
             44
         );
 
+        let pii_client = Some(caller.session_owner.identity.as_str());
+        with_pii_session(pii_client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
         let listen = out.mcp_listen.take().unwrap();
         let (cleanup_state, cleanup_key) = listen.cleanup.unwrap();
         let reader = McpSseReader::with_cleanup(listen.session, cleanup_state, cleanup_key);
@@ -16906,6 +16904,10 @@ mod tests {
         assert!(
             state.mcp_sessions.lock().unwrap().is_empty(),
             "closing the POST response removes the listener"
+        );
+        assert!(
+            !with_pii_session(pii_client, |map| !map.is_empty()),
+            "closing the SSE conversation must drop its PII map"
         );
     }
 
@@ -17596,10 +17598,19 @@ mod tests {
     #[test]
     fn mint_mcp_session_cleans_resource_subs_of_closed_sessions() {
         let state = http_state(false);
-        let s1 = match mint_mcp_session(&state, None) {
+        let owner = McpSessionOwner {
+            identity: "client:reaped-pii".into(),
+            scope: None,
+        };
+        let pii_client = Some(owner.identity.as_str());
+        let s1 = match mint_mcp_session(&state, Some(&owner)) {
             Ok(s) => s,
             Err(_) => panic!("mint s1 failed"),
         };
+        with_pii_session(pii_client, |map| {
+            *map = pii::SessionMap::new();
+            map.pseudonymize("crm", "ada@example.com");
+        });
         {
             let mut table = state.resource_subs.lock().unwrap();
             table.add(&s1, "file://orphan", "srv").unwrap();
@@ -17628,6 +17639,10 @@ mod tests {
             "reaped session must not leave subscription orphans"
         );
         assert!(table.sessions_for_uri("file://orphan").is_empty());
+        assert!(
+            !with_pii_session(pii_client, |map| !map.is_empty()),
+            "reaped session must not leave its PII map behind"
+        );
     }
 
     #[test]
