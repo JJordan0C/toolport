@@ -18517,7 +18517,12 @@ mod tests {
         let request_id = "cancelled-listen-request".to_string();
         assert!(cancellations.begin_client_request(request_id.clone()));
         let cancel = cancellations.context(request_id.clone());
-        assert!(cancellations.cancel(&request_id, Some("client went away")));
+        let cancel_registry = cancellations.clone();
+        let cancel_id = request_id.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(cancel_registry.cancel(&cancel_id, Some("client went away")));
+        });
         let req = modern_req(
             77,
             "subscriptions/listen",
@@ -18540,6 +18545,7 @@ mod tests {
             Err(response) => response,
             Ok(_) => panic!("cancelled registration must fail"),
         };
+        canceller.join().unwrap();
         assert!(response["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("cancelled")));
