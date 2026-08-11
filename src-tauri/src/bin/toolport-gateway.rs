@@ -590,16 +590,35 @@ const OPEN_GATE_MARGIN: Duration = Duration::from_secs(30);
 /// hardcoded, so raising the launcher budget can never silently make waiters give
 /// up before the leader they are waiting on (SOU-434).
 ///
-/// Note this is longer than any client request timeout, so a waiter can outlive the
-/// caller that queued it; bounding parked waiters is the remaining half of SOU-434.
+/// This can outlive a caller's deadline because MCP does not carry a portable deadline.
+/// Followers therefore also honor explicit cancellation and are bounded per gate (SBS-434).
 const OPEN_GATE_WAIT: Duration =
     Duration::from_secs(downstream::LEADER_OPEN_BUDGET.as_secs() + OPEN_GATE_MARGIN.as_secs());
+/// Maximum followers allowed to park behind one in-flight downstream subscribe. A real client
+/// needs one waiter; a storm must not turn a single slow server into an unbounded pile of blocked
+/// request workers (SBS-434).
+const MAX_OPEN_GATE_WAITERS_PER_URI: usize = 32;
+/// Cancellation has no Condvar notification, so a cancel-aware waiter checks at this cadence.
+const OPEN_GATE_CANCEL_POLL: Duration = Duration::from_millis(100);
 
 /// Coordinates concurrent first-subscriber races for one URI.
 struct OpenGate {
     /// `None` while the leader's downstream subscribe is in flight.
     result: Mutex<Option<Result<(), String>>>,
     cv: Condvar,
+    waiters: AtomicUsize,
+}
+
+/// One bounded follower slot. Releasing it in `Drop` covers success, timeout, cancellation, and
+/// unwinding without a second cleanup path.
+struct OpenGateWaiter<'a> {
+    gate: &'a OpenGate,
+}
+
+impl Drop for OpenGateWaiter<'_> {
+    fn drop(&mut self) {
+        self.gate.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl OpenGate {
@@ -607,6 +626,7 @@ impl OpenGate {
         Arc::new(Self {
             result: Mutex::new(None),
             cv: Condvar::new(),
+            waiters: AtomicUsize::new(0),
         })
     }
 
@@ -619,30 +639,71 @@ impl OpenGate {
         self.cv.notify_all();
     }
 
-    fn wait(&self) -> Result<(), String> {
-        self.wait_for(OPEN_GATE_WAIT)
+    fn acquire_waiter(&self) -> Result<OpenGateWaiter<'_>, String> {
+        self.waiters
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < MAX_OPEN_GATE_WAITERS_PER_URI).then_some(current + 1)
+            })
+            .map_err(|_| {
+                format!(
+                    "too many clients are waiting for this resource subscription (limit {MAX_OPEN_GATE_WAITERS_PER_URI})"
+                )
+            })?;
+        Ok(OpenGateWaiter { gate: self })
+    }
+
+    fn wait(&self, cancel: Option<&downstream::CancelContext>) -> Result<(), String> {
+        self.wait_for_cancelable(OPEN_GATE_WAIT, cancel)
     }
 
     /// Wait for the leader with an explicit timeout (unit tests use a short one).
+    #[cfg(test)]
     fn wait_for(&self, timeout: Duration) -> Result<(), String> {
+        self.wait_for_cancelable(timeout, None)
+    }
+
+    fn wait_for_cancelable(
+        &self,
+        timeout: Duration,
+        cancel: Option<&downstream::CancelContext>,
+    ) -> Result<(), String> {
         let mut guard = self
             .result
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(outcome) = guard.as_ref() {
+            return outcome.clone();
+        }
+        // Count only callers that will actually park. A follower can observe the gate in the
+        // table just before the leader finishes; by the time it gets here the result may already
+        // be ready, and that fast path must neither consume a slot nor fail at the cap.
+        let _waiter = self.acquire_waiter()?;
         let deadline = Instant::now() + timeout;
         while guard.is_none() {
+            if cancel.is_some_and(downstream::CancelContext::is_cancelled) {
+                return Err(
+                    "resource subscription request was cancelled while waiting for another client"
+                        .into(),
+                );
+            }
             let now = Instant::now();
             if now >= deadline {
                 return Err(
                     "timed out waiting for another client to open the resource subscription".into(),
                 );
             }
+            let remaining = deadline.saturating_duration_since(now);
+            let wait_for = if cancel.is_some() {
+                remaining.min(OPEN_GATE_CANCEL_POLL)
+            } else {
+                remaining
+            };
             let (next, wait_result) = self
                 .cv
-                .wait_timeout(guard, deadline.saturating_duration_since(now))
+                .wait_timeout(guard, wait_for)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard = next;
-            if wait_result.timed_out() && guard.is_none() {
+            if wait_result.timed_out() && guard.is_none() && Instant::now() >= deadline {
                 return Err(
                     "timed out waiting for another client to open the resource subscription".into(),
                 );
@@ -7113,6 +7174,7 @@ fn handle_resource_subscription(
     router: &Router,
     req: &Value,
     allowed: Option<&std::collections::HashSet<String>>,
+    cancel: Option<&downstream::CancelContext>,
     method: &str,
 ) -> Option<Value> {
     let id = match req.get("id") {
@@ -7208,7 +7270,7 @@ fn handle_resource_subscription(
                         }
                     }
                 }
-                BeginSubscribe::Wait(gate) => match gate.wait() {
+                BeginSubscribe::Wait(gate) => match gate.wait(cancel) {
                     Ok(()) => {
                         let mut table = state
                             .resource_subs
@@ -8350,6 +8412,7 @@ fn register_modern_subscription(
     router: &Router,
     req: &Value,
     allowed: Option<&std::collections::HashSet<String>>,
+    cancel: Option<&downstream::CancelContext>,
     owner: Option<&McpSessionOwner>,
     transport: ModernSubscriptionTransport,
 ) -> Result<(String, Arc<McpSession>), Value> {
@@ -8407,8 +8470,14 @@ fn register_modern_subscription(
             "params": { "uri": uri }
         });
         let _session = McpSessionGuard::enter(Some(key.clone()));
-        let response =
-            handle_resource_subscription(state, router, &subscribe, allowed, "resources/subscribe");
+        let response = handle_resource_subscription(
+            state,
+            router,
+            &subscribe,
+            allowed,
+            cancel,
+            "resources/subscribe",
+        );
         if response
             .as_ref()
             .is_some_and(|response| response.get("result").is_some())
@@ -9862,6 +9931,7 @@ fn process_request(
             &router,
             req,
             allowed,
+            cancel.as_ref(),
             None,
             ModernSubscriptionTransport::Stdio,
         ) {
@@ -9896,7 +9966,7 @@ fn process_request(
         }
         let _era =
             UpstreamEraGuard::enter(declared.filter(|v| v.as_str() == MODERN_PROTOCOL_VERSION));
-        return handle_resource_subscription(state, &router, req, allowed, method);
+        return handle_resource_subscription(state, &router, req, allowed, cancel.as_ref(), method);
     }
     handle_request_with_cancel(
         req,
@@ -10727,6 +10797,7 @@ fn handle_mcp_http(
                     &router,
                     &req,
                     allowed,
+                    None,
                     session_owner,
                     ModernSubscriptionTransport::Http,
                 ) {
@@ -18276,7 +18347,12 @@ mod tests {
         };
         table2.finish_open_err("file://y", &lead2, "downstream refused".into());
         assert!(table2.sessions_for_uri("file://y").is_empty());
-        assert_eq!(wait_gate.wait().unwrap_err(), "downstream refused");
+        assert_eq!(wait_gate.wait(None).unwrap_err(), "downstream refused");
+        assert_eq!(
+            wait_gate.waiters.load(Ordering::Acquire),
+            0,
+            "a completed gate returns immediately without consuming a waiter slot"
+        );
     }
 
     /// WS1-4: waiters must not park forever when the leader never finishes.
@@ -18287,6 +18363,54 @@ mod tests {
             .wait_for(Duration::from_millis(40))
             .expect_err("must time out");
         assert!(err.contains("timed out"), "got: {err}");
+    }
+
+    #[test]
+    fn open_gate_bounds_concurrent_waiters_per_uri() {
+        let gate = OpenGate::new();
+        let slots = (0..MAX_OPEN_GATE_WAITERS_PER_URI)
+            .map(|_| gate.acquire_waiter().expect("within the waiter limit"))
+            .collect::<Vec<_>>();
+
+        let err = match gate.acquire_waiter() {
+            Ok(_) => panic!("one gate must reject followers beyond its bounded capacity"),
+            Err(err) => err,
+        };
+        assert!(err.contains("too many clients"), "got: {err}");
+
+        drop(slots);
+        assert_eq!(
+            gate.waiters.load(Ordering::Acquire),
+            0,
+            "every exit path must return its waiter slot"
+        );
+    }
+
+    #[test]
+    fn open_gate_stops_waiting_when_the_upstream_request_is_cancelled() {
+        let gate = OpenGate::new();
+        let cancellations = downstream::CancelRegistry::new();
+        let request_id = "resource-sub-waiter".to_string();
+        assert!(cancellations.begin_client_request(request_id.clone()));
+        let cancel = cancellations.context(request_id.clone());
+        let cancel_registry = cancellations.clone();
+        let cancel_id = request_id.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(cancel_registry.cancel(&cancel_id, Some("client deadline elapsed")));
+        });
+
+        let started = Instant::now();
+        let err = gate
+            .wait_for_cancelable(Duration::from_secs(1), Some(&cancel))
+            .expect_err("a cancelled caller must stop waiting");
+        canceller.join().unwrap();
+        assert!(err.contains("cancelled"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "a cancelled request should not park for the one-second leader timeout"
+        );
+        assert_eq!(gate.waiters.load(Ordering::Acquire), 0);
     }
 
     /// WS1-1: mint_mcp_session must release resource subs held by reaped sessions.

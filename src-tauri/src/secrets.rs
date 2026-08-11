@@ -1152,6 +1152,29 @@ mod tests {
     /// failures under the default multi-threaded test runner.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Deletes a real keychain credential even when a test assertion unwinds.
+    ///
+    /// The Windows integration tests intentionally exercise Credential Manager rather than a
+    /// mock. A trailing `delete_secret` is skipped when an assertion panics, and accumulated
+    /// chunk credentials eventually make later test setup fail. Keep cleanup in `Drop` so every
+    /// exit path removes the base credential and all generation chunks (SBS-711).
+    struct SecretCleanupGuard<'a> {
+        server_id: &'a str,
+        key: &'a str,
+    }
+
+    impl<'a> SecretCleanupGuard<'a> {
+        fn new(server_id: &'a str, key: &'a str) -> Self {
+            Self { server_id, key }
+        }
+    }
+
+    impl Drop for SecretCleanupGuard<'_> {
+        fn drop(&mut self) {
+            let _ = delete_secret(self.server_id, self.key);
+        }
+    }
+
     #[test]
     fn macos_secret_replacement_never_deletes_before_writing() {
         // This source-contract test runs on Windows/Linux CI even though the
@@ -1213,6 +1236,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let sid = "conduit-test-server";
         let key = "CONDUIT_TEST_KEY";
+        let _cleanup = SecretCleanupGuard::new(sid, key);
         set_secret(sid, key, "s3cr3t").unwrap();
         assert_eq!(get_secret(sid, key).as_deref(), Some("s3cr3t"));
         delete_secret(sid, key).unwrap();
@@ -1229,6 +1253,7 @@ mod tests {
             .unwrap_or(0);
         let sid = format!("toolport-windows-large-secret-{unique}");
         let key = "OAUTH_TOKEN";
+        let _cleanup = SecretCleanupGuard::new(&sid, key);
         let first = format!("{}{}", "a".repeat(3_500), "🔒".repeat(300));
         let second = format!("{}{}", "b".repeat(6_100), "🚀".repeat(100));
 
@@ -1269,6 +1294,7 @@ mod tests {
             .unwrap_or(0);
         let sid = format!("toolport-windows-concurrent-secret-{unique}");
         let key = "OAUTH_TOKEN";
+        let _cleanup = SecretCleanupGuard::new(&sid, key);
         let first = "a".repeat(4_000);
         let second = "b".repeat(4_000);
         set_secret(&sid, key, &first).unwrap();
@@ -1340,6 +1366,7 @@ mod tests {
             .unwrap_or(0);
         let sid = format!("toolport-windows-absent-base-{unique}");
         let key = "OAUTH_TOKEN";
+        let _cleanup = SecretCleanupGuard::new(&sid, key);
         let value = "a-live-oauth-token";
         set_secret(&sid, key, value).unwrap();
 
@@ -1378,6 +1405,7 @@ mod tests {
             .unwrap_or(0);
         let sid = format!("toolport-windows-chunk-error-{unique}");
         let key = "OAUTH_TOKEN";
+        let _cleanup = SecretCleanupGuard::new(&sid, key);
         let missing_chunk_manifest = concat!(
             "toolport-chunked-v1:0123456789abcdef0123456789abcdef:1:",
             "0000000000000000000000000000000000000000000000000000000000000000"
@@ -1396,6 +1424,31 @@ mod tests {
         );
 
         delete_secret(&sid, key).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_secret_cleanup_guard_deletes_on_unwind() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let sid = format!("toolport-windows-cleanup-unwind-{unique}");
+        let key = "OAUTH_TOKEN";
+
+        let unwound = std::panic::catch_unwind(|| {
+            let _cleanup = SecretCleanupGuard::new(&sid, key);
+            set_secret(&sid, key, &"x".repeat(5_000)).unwrap();
+            panic!("exercise panic-safe credential cleanup");
+        });
+
+        assert!(unwound.is_err(), "the fixture must actually unwind");
+        assert_eq!(
+            get_secret_result(&sid, key).unwrap(),
+            None,
+            "the drop guard must remove the credential and its chunks during unwind"
+        );
     }
 
     /// Cross-platform: setting `CONDUIT_SECRET_KEY` activates the file backend.
