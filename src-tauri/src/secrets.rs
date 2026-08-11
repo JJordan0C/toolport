@@ -1344,7 +1344,7 @@ mod tests {
         set_secret(&sid, key, value).unwrap();
 
         // Every read but the last reports absent: the value must still come back.
-        platform::force_absent_base_reads(platform::READ_ATTEMPTS - 1);
+        platform::script_base_reads(&[true; platform::READ_ATTEMPTS - 1]);
         assert_eq!(
             get_secret_result(&sid, key).unwrap().as_deref(),
             Some(value),
@@ -1353,7 +1353,7 @@ mod tests {
 
         // Absent for every attempt: only now is it conclusively gone. This pins the
         // retry as BOUNDED — without it the loop could spin on a deleted secret.
-        platform::force_absent_base_reads(platform::READ_ATTEMPTS);
+        platform::script_base_reads(&[true; platform::READ_ATTEMPTS]);
         assert_eq!(
             get_secret_result(&sid, key).unwrap(),
             None,
@@ -1364,6 +1364,38 @@ mod tests {
         assert_eq!(get_secret_result(&sid, key).unwrap().as_deref(), Some(value));
         delete_secret(&sid, key).unwrap();
         assert_eq!(get_secret_result(&sid, key).unwrap(), None);
+    }
+
+    /// An integrity failure must not decay into "no secret" when later base reads
+    /// land in the transient `CredWriteW` absence window.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_chunk_error_survives_trailing_absent_base_reads() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let sid = format!("toolport-windows-chunk-error-{unique}");
+        let key = "OAUTH_TOKEN";
+        let missing_chunk_manifest = concat!(
+            "toolport-chunked-v1:0123456789abcdef0123456789abcdef:1:",
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        platform::set_raw_for_test(&sid, key, missing_chunk_manifest).unwrap();
+
+        // Read the broken manifest once, then report the base absent for every
+        // remaining attempt. The earlier integrity error must win over absence.
+        let mut read_script = vec![true; platform::READ_ATTEMPTS];
+        read_script[0] = false;
+        platform::script_base_reads(&read_script);
+        let error = get_secret_result(&sid, key).unwrap_err();
+        assert!(
+            error.contains("chunk 0 is missing"),
+            "expected the missing-chunk error, got: {error}"
+        );
+
+        delete_secret(&sid, key).unwrap();
     }
 
     /// Cross-platform: setting `CONDUIT_SECRET_KEY` activates the file backend.

@@ -31,21 +31,27 @@ fn read_entry(account: &str) -> Result<Option<String>, String> {
     }
 }
 
-/// Test-only: report the base credential as absent for the next `count` reads,
-/// standing in for the window in which a concurrent `CredWriteW` replace makes
-/// Windows report a live credential as missing.
+/// Test-only: script the next base-credential reads. `true` reports the target as
+/// absent, standing in for the window in which a concurrent `CredWriteW` replace
+/// makes Windows report a live credential as missing; `false` reads the real store.
+/// Reads past the end of the script go to the real store too.
 ///
-/// Thread-local so parallel tests cannot consume each other's injections, and
-/// consumed one read at a time so a test can pick the exact number of absences
-/// [`get_secret_result`] should survive.
+/// A script rather than a count because the interesting cases are not all-absent:
+/// a chunk failure FOLLOWED by absences has to stay an error rather than decay
+/// into `Ok(None)`.
+///
+/// Thread-local, so tests running in parallel cannot consume each other's script.
 #[cfg(test)]
-pub(super) fn force_absent_base_reads(count: usize) {
-    ABSENT_BASE_READS.with(|cell| cell.set(count));
+pub(super) fn script_base_reads(absent: &[bool]) {
+    BASE_READ_SCRIPT.with(|queue| {
+        *queue.borrow_mut() = absent.iter().copied().collect();
+    });
 }
 
 #[cfg(test)]
 thread_local! {
-    static ABSENT_BASE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BASE_READ_SCRIPT: std::cell::RefCell<std::collections::VecDeque<bool>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
 /// Pause between read attempts, escalating so the three attempts span ~5ms — far
@@ -76,26 +82,19 @@ thread_local! {
 /// real, but it is bounded, off the per-call path, and cheap next to reporting a
 /// live credential as missing.
 fn read_backoff(attempt: usize) {
-    let micros = match attempt {
-        0 => 1_000,
-        1 => 4_000,
-        _ => 16_000,
-    };
+    const BACKOFF_MICROS: [u64; READ_ATTEMPTS - 1] = [1_000, 4_000];
+    let micros = BACKOFF_MICROS[attempt];
     std::thread::sleep(std::time::Duration::from_micros(micros));
 }
 
 /// Read the base credential. Identical to [`read_entry`] outside tests; under
-/// `cfg(test)` it honours [`force_absent_base_reads`] so the retry below can be
-/// driven deterministically instead of by racing a writer thread.
+/// `cfg(test)` it honours [`script_base_reads`] so the retry below can be driven
+/// deterministically instead of by racing a writer thread.
 fn read_base(account: &str) -> Result<Option<String>, String> {
     #[cfg(test)]
     {
-        let remaining = ABSENT_BASE_READS.with(|cell| {
-            let remaining = cell.get();
-            cell.set(remaining.saturating_sub(1));
-            remaining
-        });
-        if remaining > 0 {
+        let scripted = BASE_READ_SCRIPT.with(|queue| queue.borrow_mut().pop_front());
+        if scripted == Some(true) {
             return Ok(None);
         }
     }
@@ -293,10 +292,9 @@ pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String>
 
 pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
     let base = account(server_id, key);
-    // What the most recent attempt saw, when it did not produce a value:
-    // `Some(error)` is a base credential we could read but could not assemble a
-    // value from; `None` is no base credential at all. Neither is conclusive until
-    // the attempts run out — see the `None` arm below for why absence is retried.
+    // Keep the most recent integrity error. A later transient absence must not
+    // erase evidence that we read a base credential but could not assemble it.
+    // `None` therefore means every attempt saw no base credential at all.
     let mut last_error = None;
     for attempt in 0..READ_ATTEMPTS {
         match read_base(&base)? {
@@ -335,7 +333,7 @@ pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, S
             // So absence only counts once it survives the same retries a chunk race
             // gets. See `read_backoff` for the measured effect and the cost this
             // puts on genuinely-absent secrets.
-            None => last_error = None,
+            None => {}
         }
         if attempt + 1 < READ_ATTEMPTS {
             read_backoff(attempt);
