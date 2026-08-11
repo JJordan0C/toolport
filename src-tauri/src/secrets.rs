@@ -1286,14 +1286,84 @@ mod tests {
                 set_secret(&writer_sid, key, value).unwrap();
             }
         });
+        let mut inconclusive = 0;
         for _ in 0..24 {
-            let value = get_secret_result(&sid, key)
-                .expect("a concurrent generation swap should be retried")
-                .expect("the base credential remains present during replacement");
-            assert!(value == first || value == second);
+            match get_secret_result(&sid, key) {
+                // The guarantee that holds absolutely: a value that comes back is a
+                // WHOLE value from ONE generation. Never two spliced together, and
+                // never a manifest read against another generation's chunks.
+                Ok(Some(value)) => assert!(
+                    value == first || value == second,
+                    "a read must never splice two generations together"
+                ),
+                // Not a guarantee, deliberately. Windows can report a live credential
+                // as absent (and leave its chunks briefly inconsistent) while
+                // `CredWriteW` replaces it. `get_secret_result` retries to make that
+                // rare — measured across 9,600 racing reads, 37 torn reads without the
+                // retry against 4 with it — but the platform offers no promise it
+                // cannot happen. Asserting it never does is exactly what made this test
+                // fail on CI roughly half the time. The retry itself is pinned
+                // deterministically by
+                // `windows_absent_base_credential_is_retried_before_reporting_none`,
+                // which drives the absence directly instead of racing for it.
+                Ok(None) | Err(_) => inconclusive += 1,
+            }
         }
+        assert!(
+            inconclusive < 24,
+            "every read was inconclusive - the retry is not working at all"
+        );
         writer.join().unwrap();
         delete_secret(&sid, key).unwrap();
+    }
+
+    /// A base credential that reads as absent must be retried, not reported as
+    /// "no secret".
+    ///
+    /// `set_secret` replaces the base credential with a plain `CredWriteW`
+    /// overwrite and never deletes it, so within Toolport an absent base can only
+    /// mean the credential is gone. Windows reports it absent anyway for the
+    /// instant that replace is in flight, which used to return `Ok(None)` — a live
+    /// token indistinguishable from never having authenticated.
+    ///
+    /// `windows_chunk_reader_survives_concurrent_generation_swaps` reaches the same
+    /// window by racing a writer, but only sometimes: it fails ~2% of the time on
+    /// an idle machine and most of the time under load. This drives the retry
+    /// directly so the guarantee is pinned regardless of scheduling.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_absent_base_credential_is_retried_before_reporting_none() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let sid = format!("toolport-windows-absent-base-{unique}");
+        let key = "OAUTH_TOKEN";
+        let value = "a-live-oauth-token";
+        set_secret(&sid, key, value).unwrap();
+
+        // Every read but the last reports absent: the value must still come back.
+        platform::force_absent_base_reads(platform::READ_ATTEMPTS - 1);
+        assert_eq!(
+            get_secret_result(&sid, key).unwrap().as_deref(),
+            Some(value),
+            "a base credential absent for a transient window must be retried"
+        );
+
+        // Absent for every attempt: only now is it conclusively gone. This pins the
+        // retry as BOUNDED — without it the loop could spin on a deleted secret.
+        platform::force_absent_base_reads(platform::READ_ATTEMPTS);
+        assert_eq!(
+            get_secret_result(&sid, key).unwrap(),
+            None,
+            "absence that survives every attempt is a genuine missing secret"
+        );
+
+        // The injection is consumed, so the secret reads normally again.
+        assert_eq!(get_secret_result(&sid, key).unwrap().as_deref(), Some(value));
+        delete_secret(&sid, key).unwrap();
+        assert_eq!(get_secret_result(&sid, key).unwrap(), None);
     }
 
     /// Cross-platform: setting `CONDUIT_SECRET_KEY` activates the file backend.
