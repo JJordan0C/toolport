@@ -671,6 +671,12 @@ impl OpenGate {
             .result
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cancel.is_some_and(downstream::CancelContext::is_cancelled) {
+            return Err(
+                "resource subscription request was cancelled while waiting for another client"
+                    .into(),
+            );
+        }
         if let Some(outcome) = guard.as_ref() {
             return outcome.clone();
         }
@@ -708,6 +714,15 @@ impl OpenGate {
                     "timed out waiting for another client to open the resource subscription".into(),
                 );
             }
+        }
+        // Cancellation wins the finish/cancel race. A caller that stopped caring
+        // must not join the just-opened subscription merely because the leader
+        // published its result between our final poll and this wake-up.
+        if cancel.is_some_and(downstream::CancelContext::is_cancelled) {
+            return Err(
+                "resource subscription request was cancelled while waiting for another client"
+                    .into(),
+            );
         }
         match guard.as_ref() {
             Some(Ok(())) => Ok(()),
@@ -8478,6 +8493,17 @@ fn register_modern_subscription(
             cancel,
             "resources/subscribe",
         );
+        if cancel.is_some_and(downstream::CancelContext::is_cancelled) {
+            // Earlier URIs in this same listen request may already have joined
+            // downstream subscriptions. Roll them all back before returning so a
+            // cancelled request cannot leave holders behind or publish a session.
+            cleanup_resource_subs_for_session(state, &key);
+            return Err(error(
+                response_id,
+                -32602,
+                "Toolport: resource subscription request was cancelled",
+            ));
+        }
         if response
             .as_ref()
             .is_some_and(|response| response.get("result").is_some())
@@ -10797,6 +10823,10 @@ fn handle_mcp_http(
                     &router,
                     &req,
                     allowed,
+                    // The blocking HTTP parser has no request-lifetime cancellation
+                    // token: client disconnect becomes observable only when the
+                    // returned response body is written/read. Stdio requests do
+                    // carry their CancelContext through this same helper.
                     None,
                     session_owner,
                     ModernSubscriptionTransport::Http,
@@ -18411,6 +18441,124 @@ mod tests {
             "a cancelled request should not park for the one-second leader timeout"
         );
         assert_eq!(gate.waiters.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn open_gate_rejects_an_already_cancelled_waiter_without_taking_a_slot() {
+        let gate = OpenGate::new();
+        let cancellations = downstream::CancelRegistry::new();
+        let request_id = "resource-sub-already-cancelled".to_string();
+        assert!(cancellations.begin_client_request(request_id.clone()));
+        let cancel = cancellations.context(request_id.clone());
+        assert!(cancellations.cancel(&request_id, Some("client went away")));
+
+        let err = gate
+            .wait_for_cancelable(Duration::from_secs(1), Some(&cancel))
+            .expect_err("an already-cancelled caller must not park");
+        assert!(err.contains("cancelled"), "got: {err}");
+        assert_eq!(
+            gate.waiters.load(Ordering::Acquire),
+            0,
+            "an already-cancelled caller must not consume waiter capacity"
+        );
+    }
+
+    #[test]
+    fn open_gate_cancellation_wins_a_completed_leader_race() {
+        let gate = OpenGate::new();
+        let cancellations = downstream::CancelRegistry::new();
+        let request_id = "resource-sub-finish-cancel-race".to_string();
+        assert!(cancellations.begin_client_request(request_id.clone()));
+        let cancel = cancellations.context(request_id.clone());
+        gate.finish(Ok(()));
+        assert!(cancellations.cancel(&request_id, Some("client went away")));
+
+        let err = gate
+            .wait_for_cancelable(Duration::from_secs(1), Some(&cancel))
+            .expect_err("cancellation must win even when the leader just finished");
+        assert!(err.contains("cancelled"), "got: {err}");
+        assert_eq!(gate.waiters.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cancelled_modern_registration_rolls_back_earlier_resource_joins() {
+        let state = http_state(false);
+        let router = cache_router();
+        let id = json!(77);
+        let key = modern_subscription_key(None, &id, ModernSubscriptionTransport::Stdio);
+
+        // The first URI is already held by this request. The second is opening for
+        // another session, which forces register_modern_subscription through the
+        // cancellation-aware waiter path after one successful URI.
+        state
+            .resource_subs
+            .lock()
+            .unwrap()
+            .add("anchor", "fixture://cached", "cache")
+            .unwrap();
+        state
+            .resource_subs
+            .lock()
+            .unwrap()
+            .add(&key, "fixture://cached", "cache")
+            .unwrap();
+        let opening = {
+            let mut table = state.resource_subs.lock().unwrap();
+            match table
+                .begin_subscribe("leader", "fixture://waiting", "cache")
+                .unwrap()
+            {
+                BeginSubscribe::Lead(gate) => gate,
+                _ => panic!("fixture must own the opening subscription"),
+            }
+        };
+
+        let cancellations = downstream::CancelRegistry::new();
+        let request_id = "cancelled-listen-request".to_string();
+        assert!(cancellations.begin_client_request(request_id.clone()));
+        let cancel = cancellations.context(request_id.clone());
+        assert!(cancellations.cancel(&request_id, Some("client went away")));
+        let req = modern_req(
+            77,
+            "subscriptions/listen",
+            json!({
+                "notifications": {
+                    "resourceSubscriptions": ["fixture://cached", "fixture://waiting"]
+                }
+            }),
+        );
+
+        let response = match register_modern_subscription(
+            &state,
+            &router,
+            &req,
+            None,
+            Some(&cancel),
+            None,
+            ModernSubscriptionTransport::Stdio,
+        ) {
+            Err(response) => response,
+            Ok(_) => panic!("cancelled registration must fail"),
+        };
+        assert!(response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("cancelled")));
+        assert!(state.mcp_sessions.lock().unwrap().is_empty());
+        assert_eq!(
+            state
+                .resource_subs
+                .lock()
+                .unwrap()
+                .sessions_for_uri("fixture://cached"),
+            vec!["anchor".to_string()],
+            "the earlier successful URI must be rolled back without disturbing other holders"
+        );
+
+        state.resource_subs.lock().unwrap().finish_open_err(
+            "fixture://waiting",
+            &opening,
+            "fixture cleanup".into(),
+        );
     }
 
     /// WS1-1: mint_mcp_session must release resource subs held by reaped sessions.
