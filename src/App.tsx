@@ -276,6 +276,20 @@ function App() {
     };
   }, []);
 
+  // The tray remains available while the window is hidden. Its approvals entry
+  // should reveal the app at the exact place where the waiting calls can be
+  // inspected, rather than merely opening whichever screen was last visible.
+  useEffect(() => {
+    const unlisten = listen("tray-open-approvals", () => {
+      setSelectedClientId(null);
+      setView("activity");
+      setActivityKey((key) => key + 1);
+    });
+    return () => {
+      void unlisten.then((remove) => remove());
+    };
+  }, []);
+
   // The backend signals an authoritative removal from a team (a 401/403 on the
   // membership heartbeat) so we can tell the member plainly rather than leaving them
   // to wonder why the team's servers vanished. The registry (team already cleared) is
