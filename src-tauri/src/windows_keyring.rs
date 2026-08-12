@@ -365,3 +365,23 @@ pub fn set_raw_for_test(server_id: &str, key: &str, value: &str) -> Result<(), S
         .set_password(value)
         .map_err(|error| error.to_string())
 }
+
+#[cfg(test)]
+pub fn raw_entries_for_test(server_id: &str, key: &str) -> Result<Vec<String>, String> {
+    let base = account(server_id, key);
+    let mut accounts = vec![base.clone()];
+    if let Some(raw) = read_entry(&base)? {
+        if let Some(manifest) = parse_manifest(&raw)? {
+            accounts.extend(
+                (0..manifest.count)
+                    .map(|index| chunk_account(&base, &manifest.generation, index)),
+            );
+        }
+    }
+    Ok(accounts)
+}
+
+#[cfg(test)]
+pub fn raw_entry_exists_for_test(account: &str) -> Result<bool, String> {
+    Ok(read_entry(account)?.is_some())
+}
