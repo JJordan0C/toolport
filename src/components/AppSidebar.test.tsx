@@ -11,7 +11,15 @@ const getSavingsSummary = vi.fn();
 const listQuarantined = vi.fn();
 const checkForUpdate = vi.fn();
 const installUpdate = vi.fn();
+const toastInfo = vi.fn();
 const eventListeners = new Map<string, (event: { payload: unknown }) => void>();
+
+vi.mock("sonner", () => ({
+  toast: {
+    info: (...args: unknown[]) => toastInfo(...args),
+    success: vi.fn(),
+  },
+}));
 
 vi.mock("@/lib/api", () => ({
   gatherDiagnostics: vi.fn(),
@@ -62,6 +70,7 @@ beforeEach(() => {
   listQuarantined.mockReset();
   checkForUpdate.mockReset();
   installUpdate.mockReset();
+  toastInfo.mockReset();
   eventListeners.clear();
   checkForUpdate.mockResolvedValue({ kind: "current" });
   getSavingsSummary.mockResolvedValue({
@@ -153,6 +162,33 @@ describe("AppSidebar accessibility", () => {
     await waitFor(() => expect(checkForUpdate).toHaveBeenCalledTimes(2));
   });
 
+  it("retries a quiet update check after a transient error", async () => {
+    checkForUpdate
+      .mockResolvedValueOnce({ kind: "error", message: "offline" })
+      .mockResolvedValueOnce({ kind: "current" });
+
+    render(
+      <TooltipProvider>
+        <AppSidebar
+          clients={[client()]}
+          registry={null}
+          onRegistryChange={vi.fn()}
+          selectedClientId={null}
+          onSelectClient={vi.fn()}
+          view="servers"
+          onSelectView={vi.fn()}
+          onReplayOnboarding={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+
+    await waitFor(() => expect(checkForUpdate).toHaveBeenCalledTimes(1));
+    act(() => {
+      eventListeners.get("team-window-visible")?.({ payload: true });
+    });
+    await waitFor(() => expect(checkForUpdate).toHaveBeenCalledTimes(2));
+  });
+
   it("shows byte-based download progress while installing", async () => {
     const update = { version: "1.1.0", body: "Release notes" };
     checkForUpdate.mockResolvedValue({ kind: "update", update });
@@ -225,5 +261,37 @@ describe("AppSidebar accessibility", () => {
     expect(
       await screen.findByRole("heading", { name: "Update available: v1.1.0" }),
     ).toBeInTheDocument();
+  });
+
+  it("acknowledges an explicit tray check while an update is installing", async () => {
+    const update = { version: "1.1.0", body: "Release notes" };
+    checkForUpdate.mockResolvedValue({ kind: "update", update });
+    installUpdate.mockReturnValue(new Promise(() => {}));
+
+    render(
+      <TooltipProvider>
+        <AppSidebar
+          clients={[client()]}
+          registry={null}
+          onRegistryChange={vi.fn()}
+          selectedClientId={null}
+          onSelectClient={vi.fn()}
+          view="servers"
+          onSelectView={vi.fn()}
+          onReplayOnboarding={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: /update to v1.1.0/i }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: /install and restart/i }));
+    act(() => {
+      eventListeners.get("tray-check-updates")?.({ payload: undefined });
+    });
+
+    expect(toastInfo).toHaveBeenCalledWith("An update is already in progress");
+    expect(checkForUpdate).toHaveBeenCalledTimes(1);
   });
 });

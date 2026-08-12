@@ -99,6 +99,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { useTheme } from "@/lib/theme";
 import { fmtTs } from "@/lib/utils";
 import { resolveShortcut, shortcutHelp } from "@/lib/shortcuts";
+import { subscribeToTrayApprovals } from "@/lib/trayApprovals";
 
 /** Above this many servers, "Disable all" asks for confirmation first. */
 const BULK_DISABLE_CONFIRM_MIN = 3;
@@ -280,13 +281,23 @@ function App() {
   // should reveal the app at the exact place where the waiting calls can be
   // inspected, rather than merely opening whichever screen was last visible.
   useEffect(() => {
-    const unlisten = listen("tray-open-approvals", () => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    const openApprovals = () => {
+      if (cancelled) return;
       setSelectedClientId(null);
       setView("activity");
       setActivityKey((key) => key + 1);
-    });
+    };
+    subscribeToTrayApprovals(openApprovals)
+      .then((remove) => {
+        if (cancelled) remove();
+        else unlisten = remove;
+      })
+      .catch(() => {});
     return () => {
-      void unlisten.then((remove) => remove());
+      cancelled = true;
+      unlisten?.();
     };
   }, []);
 

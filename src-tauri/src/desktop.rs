@@ -2833,6 +2833,26 @@ async fn share_stack(setup_json: String) -> Result<String, String> {
 /// that arrived before the UI was ready (cold start). The frontend claims it on mount.
 type PendingShare = Mutex<Option<String>>;
 
+/// Remembers an approvals tray request that arrived before the frontend listener.
+#[derive(Default)]
+struct PendingTrayApprovals(Mutex<bool>);
+
+fn mark_pending_tray_approvals(state: &PendingTrayApprovals) {
+    *state
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+}
+
+fn claim_pending_tray_approvals(state: &PendingTrayApprovals) -> bool {
+    std::mem::take(
+        &mut *state
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
 /// Parse a `toolport://import?s=<id>` (or legacy `conduit://…`) deep link into its
 /// share id. Tolerates an optional trailing slash after the host; the id must look
 /// like a share id.
@@ -2885,6 +2905,12 @@ fn take_pending_shared(state: State<PendingShare>) -> Option<String> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
+}
+
+/// Claim an approvals tray request captured before the UI was listening.
+#[tauri::command]
+fn take_pending_tray_approvals(state: State<PendingTrayApprovals>) -> bool {
+    claim_pending_tray_approvals(state.inner())
 }
 
 /// Deliver a shared-stack id from a deep link to the UI: stash it so a cold start
@@ -3586,6 +3612,9 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "tray_open" => show_main_window(app),
             "tray_approvals" => {
+                if let Some(state) = app.try_state::<PendingTrayApprovals>() {
+                    mark_pending_tray_approvals(state.inner());
+                }
                 show_main_window(app);
                 let _ = app.emit("tray-open-approvals", ());
             }
@@ -3726,6 +3755,7 @@ pub fn run() {
         .manage(Mutex::new(registry))
         .manage(Mutex::new(HttpBridge::default()))
         .manage(PendingShare::default())
+        .manage(PendingTrayApprovals::default())
         .manage(RestartAdvice::default())
         .invoke_handler(tauri::generate_handler![
             detect_clients,
@@ -3820,6 +3850,7 @@ pub fn run() {
             share_stack,
             fetch_shared_setup,
             take_pending_shared,
+            take_pending_tray_approvals,
             import_config,
             read_setup_file,
             preview_import,
@@ -4117,6 +4148,16 @@ mod tests {
     use super::*;
     use crate::{arg_looks_secret, redact_url_userinfo};
     use registry::EnvVar;
+
+    #[test]
+    fn pending_tray_approvals_request_is_claimed_once() {
+        let pending = PendingTrayApprovals::default();
+        assert!(!claim_pending_tray_approvals(&pending));
+
+        mark_pending_tray_approvals(&pending);
+        assert!(claim_pending_tray_approvals(&pending));
+        assert!(!claim_pending_tray_approvals(&pending));
+    }
 
     #[test]
     fn registry_startup_failure_is_blocking_and_preserves_the_real_path_and_error() {

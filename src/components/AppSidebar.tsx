@@ -114,11 +114,14 @@ function VersionFooter({
       if (announce) announceCheckRef.current = true;
       return;
     }
+    if (installingRef.current) {
+      if (announce) toast.info("An update is already in progress");
+      return;
+    }
     if (
-      installingRef.current ||
-      (!force &&
-        lastCheckRef.current !== 0 &&
-        now - lastCheckRef.current < UPDATE_CHECK_INTERVAL_MS)
+      !force &&
+      lastCheckRef.current !== 0 &&
+      now - lastCheckRef.current < UPDATE_CHECK_INTERVAL_MS
     ) {
       return;
     }
@@ -126,7 +129,7 @@ function VersionFooter({
     if (mountedRef.current) setChecking(true);
     try {
       const result = await checkForUpdate();
-      lastCheckRef.current = Date.now();
+      if (result.kind !== "error") lastCheckRef.current = Date.now();
       if (!mountedRef.current) return;
       const shouldAnnounce = announce || announceCheckRef.current;
       announceCheckRef.current = false;

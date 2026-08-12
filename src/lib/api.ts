@@ -700,6 +700,11 @@ export function takePendingShared(): Promise<string | null> {
   return invoke<string | null>("take_pending_shared");
 }
 
+/** Claim a tray approvals request captured before the frontend was listening. */
+export function takePendingTrayApprovals(): Promise<boolean> {
+  return invoke<boolean>("take_pending_tray_approvals");
+}
+
 /** Import a shared setup, adding servers not already present. */
 export function importConfig(json: string): Promise<Registry> {
   return invoke<Registry>("import_config", { json });
