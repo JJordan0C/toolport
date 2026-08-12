@@ -37,4 +37,19 @@ describe("tray approvals navigation", () => {
     );
     expect(openApprovals).toHaveBeenCalledTimes(1);
   });
+
+  it("opens once when a ready frontend receives the live event", async () => {
+    let handler!: () => void;
+    mocks.listen.mockImplementation(async (_event: string, callback: () => void) => {
+      handler = callback;
+      return vi.fn();
+    });
+    const openApprovals = vi.fn();
+
+    await subscribeToTrayApprovals(openApprovals);
+    handler();
+
+    expect(mocks.takePendingTrayApprovals).toHaveBeenCalledTimes(1);
+    expect(openApprovals).toHaveBeenCalledTimes(1);
+  });
 });

@@ -2835,22 +2835,36 @@ type PendingShare = Mutex<Option<String>>;
 
 /// Remembers an approvals tray request that arrived before the frontend listener.
 #[derive(Default)]
-struct PendingTrayApprovals(Mutex<bool>);
+struct PendingTrayApprovals(Mutex<TrayApprovalsDelivery>);
 
-fn mark_pending_tray_approvals(state: &PendingTrayApprovals) {
-    *state
+#[derive(Default)]
+struct TrayApprovalsDelivery {
+    frontend_ready: bool,
+    pending: bool,
+}
+
+/// Queue a request until the frontend is ready, or tell the caller it is safe
+/// to emit live. The decision and state change are atomic with the readiness claim.
+fn should_emit_tray_approvals(state: &PendingTrayApprovals) -> bool {
+    let mut delivery = state
         .0
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if delivery.frontend_ready {
+        true
+    } else {
+        delivery.pending = true;
+        false
+    }
 }
 
 fn claim_pending_tray_approvals(state: &PendingTrayApprovals) -> bool {
-    std::mem::take(
-        &mut *state
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
+    let mut delivery = state
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    delivery.frontend_ready = true;
+    std::mem::take(&mut delivery.pending)
 }
 
 /// Parse a `toolport://import?s=<id>` (or legacy `conduit://…`) deep link into its
@@ -3612,11 +3626,13 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "tray_open" => show_main_window(app),
             "tray_approvals" => {
-                if let Some(state) = app.try_state::<PendingTrayApprovals>() {
-                    mark_pending_tray_approvals(state.inner());
-                }
+                let should_emit = app
+                    .try_state::<PendingTrayApprovals>()
+                    .is_none_or(|state| should_emit_tray_approvals(state.inner()));
                 show_main_window(app);
-                let _ = app.emit("tray-open-approvals", ());
+                if should_emit {
+                    let _ = app.emit("tray-open-approvals", ());
+                }
             }
             "tray_check_updates" => {
                 show_main_window(app);
@@ -4150,12 +4166,16 @@ mod tests {
     use registry::EnvVar;
 
     #[test]
-    fn pending_tray_approvals_request_is_claimed_once() {
+    fn tray_approvals_requests_choose_exactly_one_delivery_mode() {
         let pending = PendingTrayApprovals::default();
+
+        // Before the frontend claims readiness, queue without emitting.
+        assert!(!should_emit_tray_approvals(&pending));
+        assert!(claim_pending_tray_approvals(&pending));
         assert!(!claim_pending_tray_approvals(&pending));
 
-        mark_pending_tray_approvals(&pending);
-        assert!(claim_pending_tray_approvals(&pending));
+        // Once ready, deliver live without leaving a queued duplicate.
+        assert!(should_emit_tray_approvals(&pending));
         assert!(!claim_pending_tray_approvals(&pending));
     }
 
