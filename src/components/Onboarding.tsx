@@ -1013,21 +1013,25 @@ export function VerifyCall({
         </div>
       ) : (
         <>
-          <p className="text-xs text-muted-foreground">
-            In {client.name}, ask your agent to run this. It's read-only, it just lists
-            your tools through Toolport.
-          </p>
-          <div className="flex items-center gap-2 rounded border bg-background px-2 py-1.5">
-            <code className="min-w-0 flex-1 truncate text-xs">{prompt}</code>
-            <button
-              type="button"
-              onClick={() => void copyPrompt()}
-              aria-label="Copy the prompt"
-              className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-            >
-              <Copy className="size-3.5" />
-            </button>
-          </div>
+          {status === "waiting" && (
+            <>
+              <p className="text-xs text-muted-foreground">
+                In {client.name}, ask your agent to run this. It's read-only, it just
+                lists your tools through Toolport.
+              </p>
+              <div className="flex items-center gap-2 rounded border bg-background px-2 py-1.5">
+                <code className="min-w-0 flex-1 truncate text-xs">{prompt}</code>
+                <button
+                  type="button"
+                  onClick={() => void copyPrompt()}
+                  aria-label="Copy the prompt"
+                  className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                >
+                  <Copy className="size-3.5" />
+                </button>
+              </div>
+            </>
+          )}
 
           {status === "snapshot" || status === "waiting" ? (
             <div className="flex items-start gap-2 text-xs text-muted-foreground">

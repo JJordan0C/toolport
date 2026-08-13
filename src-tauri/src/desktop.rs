@@ -1231,7 +1231,7 @@ fn set_client_credentials(
     // require re-entering the credential. Resolve it here but do not write yet.
     let secret_to_store = supplied_secret(client_secret);
     if secret_to_store.is_none()
-        && secrets::get_secret(&server_id, secrets::CLIENT_SECRET_KEY).is_none()
+        && secrets::get_secret_result(&server_id, secrets::CLIENT_SECRET_KEY)?.is_none()
     {
         return Err("no client secret is stored for this server yet; enter one".into());
     }
@@ -1304,8 +1304,8 @@ fn clear_client_credentials(
 /// Whether a client secret is vaulted for this server, so the UI can show
 /// "configured" without ever reading the value back.
 #[tauri::command]
-fn has_client_secret(server_id: String) -> bool {
-    secrets::get_secret(&server_id, secrets::CLIENT_SECRET_KEY).is_some()
+fn has_client_secret(server_id: String) -> Result<bool, String> {
+    Ok(secrets::get_secret_result(&server_id, secrets::CLIENT_SECRET_KEY)?.is_some())
 }
 
 /// The most recent tool-call audit entries (newest first).

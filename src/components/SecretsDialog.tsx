@@ -148,6 +148,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       setCcMethod(cc?.tokenEndpointAuthMethod ?? "");
       setCcSecret("");
       setCcOpen(cc != null);
+      setCcSecretSet(false);
       setCcSecretKnown(false);
       setCcSecretProbeError(false);
       hasClientSecret(server.id)
@@ -169,6 +170,23 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
         .then((v) => fresh() && setAuthInfo(v))
         .catch(() => {})
         .finally(() => fresh() && setProbing(false));
+    }
+  }
+
+  async function retrySecretProbe() {
+    const runId = ++runIdRef.current;
+    setCcSecretKnown(false);
+    setCcSecretProbeError(false);
+    try {
+      const present = await hasClientSecret(server.id);
+      if (runId !== runIdRef.current) return;
+      setCcSecretSet(present);
+      setCcSecretKnown(true);
+    } catch {
+      if (runId !== runIdRef.current) return;
+      setCcSecretSet(false);
+      setCcSecretKnown(false);
+      setCcSecretProbeError(true);
     }
   }
 
@@ -233,6 +251,8 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
         ),
       );
       setCcSecretSet(true);
+      setCcSecretKnown(true);
+      setCcSecretProbeError(false);
       setCcSecret("");
       toast.success("Saved client credentials", {
         description: "The next connection will request a token. No browser needed.",
@@ -250,6 +270,8 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
     try {
       onSaved(await clearClientCredentials(server.id));
       setCcSecretSet(false);
+      setCcSecretKnown(true);
+      setCcSecretProbeError(false);
       setCcClientId("");
       setCcSecret("");
       setCcScope("");
@@ -569,7 +591,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                           <button
                             type="button"
                             className="text-[11px] font-medium text-primary hover:underline"
-                            onClick={() => void refreshStatus()}
+                            onClick={() => void retrySecretProbe()}
                           >
                             Retry the secret check
                           </button>

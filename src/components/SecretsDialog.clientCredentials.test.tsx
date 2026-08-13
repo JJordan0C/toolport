@@ -190,6 +190,30 @@ describe("SecretsDialog client credentials (SBS-524)", () => {
     expect(toastError).not.toHaveBeenCalledWith(
       "Enter the client secret issued by your authorization server.",
     );
+    await waitFor(() => expect(screen.getByText(/secret stored/i)).toBeInTheDocument());
+    expect(
+      screen.queryByText(/Couldn't check the stored secret/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("retries the secret probe without wiping typed fields", async () => {
+    hasClientSecret
+      .mockRejectedValueOnce(new Error("keychain unavailable"))
+      .mockResolvedValueOnce(false);
+    const user = await openDialog(server());
+    await user.click(
+      screen.getByText(/No browser available\? Use a client id and secret/i),
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/Couldn't check the stored secret/)).toBeInTheDocument(),
+    );
+    await user.type(screen.getByPlaceholderText("Client ID"), "typed-id");
+    await user.click(screen.getByRole("button", { name: "Retry the secret check" }));
+    await waitFor(() => expect(hasClientSecret).toHaveBeenCalledTimes(2));
+    expect(screen.getByPlaceholderText("Client ID")).toHaveValue("typed-id");
+    expect(
+      screen.queryByText(/Couldn't check the stored secret/),
+    ).not.toBeInTheDocument();
   });
 
   it("refuses to save without a client id instead of calling the backend", async () => {

@@ -57,6 +57,9 @@ describe("VerifyCall", () => {
     );
     expect(screen.queryByText(/It works/)).not.toBeInTheDocument();
     expect(screen.queryByText("old")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("List the tools you can use through Toolport."),
+    ).not.toBeInTheDocument();
   });
 
   it("ignores unrelated traffic that is not newer than the baseline", async () => {
