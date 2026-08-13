@@ -190,8 +190,17 @@ function VersionFooter({
       installingRef.current = false;
       setInstalling(false);
       setInstallProgress(null);
-      toastError(`Update failed: ${e}`, {
-        description: "You can download it manually from the releases page.",
+      const message = e instanceof Error ? e.message : String(e);
+      const recoveryAdvice =
+        e &&
+        typeof e === "object" &&
+        "recoveryAdvice" in e &&
+        typeof e.recoveryAdvice === "string"
+          ? e.recoveryAdvice
+          : null;
+      toastError(`Update failed: ${message}`, {
+        description:
+          recoveryAdvice || "You can download it manually from the releases page.",
         action: {
           label: "Open",
           onClick: () =>

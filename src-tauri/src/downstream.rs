@@ -851,6 +851,16 @@ pub(crate) const HTTP_MAX_RETRIES: u32 = 2;
 /// Base backoff between retries; doubles each attempt, capped at HTTP_RETRY_CAP.
 pub(crate) const HTTP_RETRY_BASE: Duration = Duration::from_millis(250);
 pub(crate) const HTTP_RETRY_CAP: Duration = Duration::from_secs(10);
+/// Cancellation is observed at this cadence while a blocking HTTP attempt drains on
+/// its bounded worker. The router slot is released within one tick; the wire attempt
+/// remains owned by that single worker until ureq's 30s request timeout closes it.
+const HTTP_CANCEL_POLL: Duration = Duration::from_millis(25);
+/// A cancellation notification is best-effort and must never replace one blocked
+/// request with another. Its independent connection has this much total time.
+const HTTP_CANCEL_FORWARD_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_HTTP_CANCEL_THREADS: usize = 64;
+static HTTP_CANCEL_THREADS_INFLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Error from a single transport request attempt. The caller (Router) owns the
 /// retry loop so it can release the per-server Mutex during the backoff sleep,
@@ -879,6 +889,12 @@ pub enum TransportError {
         retry_after: Option<Duration>,
         message: String,
     },
+    /// The upstream caller abandoned this operation. It is deliberately not a
+    /// health failure: pressing Stop says nothing about the downstream server.
+    Cancelled(String),
+    /// A prior cancelled HTTP wire attempt is still draining on its one bounded
+    /// worker. Followers fail promptly instead of spawning more request threads.
+    Busy(String),
 }
 
 /// Tracks client-side JSON-RPC request ids that are currently proxied to a
@@ -924,6 +940,16 @@ impl CancelContext {
     /// normal forwarding path still sends `notifications/cancelled` to that server.
     pub fn is_cancelled(&self) -> bool {
         self.registry.is_cancelled(&self.client_request_id)
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.registry
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancelled
+            .get(&self.client_request_id)
+            .and_then(|cancelled| cancelled.reason.clone())
     }
 }
 
@@ -1182,6 +1208,9 @@ impl std::fmt::Display for TransportError {
             TransportError::Rpc(err) => write!(f, "{err}"),
             TransportError::Unavailable(msg) => write!(f, "{msg}"),
             TransportError::Retry { message, .. } => write!(f, "{message}"),
+            TransportError::Cancelled(message) | TransportError::Busy(message) => {
+                write!(f, "{message}")
+            }
         }
     }
 }
@@ -1825,6 +1854,18 @@ pub trait Transport: Send {
             ));
         }
         self.request(method, params)
+    }
+    /// Cancel and retire a server request suspended for this exact multi-round
+    /// continuation. Implementations must validate the requestState/method/base
+    /// params before touching pending state; an unrelated cancelled request may
+    /// share the same downstream server.
+    fn cancel_matching_pending_request(
+        &mut self,
+        _method: &str,
+        _params: &Value,
+        _cancel: &CancelContext,
+    ) -> bool {
+        false
     }
     /// Send a request with transport-level routing headers. Only modern
     /// Streamable HTTP consumes these; stdio and legacy transports deliberately
@@ -3125,6 +3166,16 @@ impl Transport for StdioTransport {
         params: Value,
         cancel: Option<CancelContext>,
     ) -> Result<Value, TransportError> {
+        if self.pending_mrtr.is_some()
+            && cancel.as_ref().is_some_and(CancelContext::is_cancelled)
+        {
+            if let Some(cancel) = cancel.as_ref() {
+                self.cancel_matching_pending_request(method, &params, cancel);
+            }
+            return Err(TransportError::Cancelled(
+                "request cancelled before it reached the downstream server".to_string(),
+            ));
+        }
         let mut params = params;
         if let Some(protocol) = &self.protocol_meta {
             merge_protocol_meta(&mut params, protocol);
@@ -3273,6 +3324,27 @@ impl Transport for StdioTransport {
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
         }
+    }
+
+    fn cancel_matching_pending_request(
+        &mut self,
+        method: &str,
+        params: &Value,
+        cancel: &CancelContext,
+    ) -> bool {
+        let Some(pending) = self.pending_mrtr.as_ref() else {
+            return false;
+        };
+        if pending.response_for_retry(method, params).is_err() {
+            return false;
+        }
+        let pending = self.pending_mrtr.take().expect("matching pending request exists");
+        CancelEntry {
+            stdin: Arc::clone(&self.stdin),
+            downstream_id: pending.downstream_request_id,
+        }
+        .send_cancel_async(cancel.reason());
+        true
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
@@ -3606,6 +3678,80 @@ pub struct HttpTransport {
     /// `protocol_meta` because that is replaced wholesale after version
     /// negotiation; see `merge_declared_extensions`.
     declared_extensions: serde_json::Map<String, Value>,
+    /// Retained so a cancellation notification can use an independent guarded
+    /// connection with the same SSRF policy as the request it is cancelling.
+    block_private: bool,
+    /// The temporary draining shell shares the live generation but must not stop
+    /// the listener when it is replaced by the worker-owned transport.
+    owns_listener_generation: bool,
+    /// Set only after the caller cancels a blocking ureq attempt. The receiver
+    /// owns the sole route back to that attempt's transport state; until it is
+    /// ready, followers fail fast and no second worker can be started.
+    draining: Option<Receiver<HttpAttemptOutcome>>,
+}
+
+struct HttpAttemptOutcome {
+    transport: HttpTransport,
+    result: Result<Value, TransportError>,
+}
+
+/// Per-wire-attempt cancellation state. Unlike CancelRegistry, this survives the
+/// gateway finishing the upstream request immediately after returning Cancelled.
+/// State: 0 = no POST started, 1 = POST started, 2 = durably cancelled.
+#[derive(Clone)]
+struct HttpCancelSignal {
+    context: CancelContext,
+    state: Arc<AtomicU8>,
+}
+
+impl HttpCancelSignal {
+    fn new(context: CancelContext, request_already_live: bool) -> Self {
+        Self {
+            context,
+            state: Arc::new(AtomicU8::new(u8::from(request_already_live))),
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == 2 || self.context.is_cancelled()
+    }
+
+    /// Atomically claim the right to send. If cancellation wins from state 0,
+    /// the worker never emits the first POST. Once any POST started, subsequent
+    /// auth retries retain state 1 but still observe a later state 2.
+    fn mark_sending(&self) -> bool {
+        loop {
+            if self.context.is_cancelled() {
+                // State 1 can mean this connection already has a live MRTR
+                // request even though this continuation POST has not started.
+                // Preserve that fact so the caller can still claim and forward
+                // notifications/cancelled for the original downstream id.
+                if self
+                    .state
+                    .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    // A concurrent outer cancellation may already have moved
+                    // state 1 to 2 and forwarded it; either way, do not send.
+                }
+                return false;
+            }
+            match self
+                .state
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) | Err(1) => return true,
+                Err(2) => return false,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Latch cancellation independently of CancelRegistry teardown. Returns true
+    /// only when a POST had already started and needs a downstream notification.
+    fn cancel(&self) -> bool {
+        self.state.swap(2, Ordering::SeqCst) == 1
+    }
 }
 
 struct PendingHttpMrtr {
@@ -3666,6 +3812,9 @@ impl HttpTransport {
             listener_generation: Arc::new(AtomicU64::new(0)),
             subscription_listener_id: None,
             declared_extensions: serde_json::Map::new(),
+            block_private,
+            owns_listener_generation: true,
+            draining: None,
         }
     }
 
@@ -3728,12 +3877,142 @@ impl HttpTransport {
         self.protocol_meta.is_some()
     }
 
+    fn draining_shell(&self, receiver: Receiver<HttpAttemptOutcome>) -> Self {
+        Self {
+            url: self.url.clone(),
+            agent: self.agent.clone(),
+            inline_agent: self.inline_agent.clone(),
+            session_id: self.session_id.clone(),
+            next_id: self.next_id,
+            auth: Arc::clone(&self.auth),
+            refresh: self.refresh.clone(),
+            scope_reauthorize: self.scope_reauthorize.clone(),
+            scope_upgrade_attempts: Arc::clone(&self.scope_upgrade_attempts),
+            forced_refresh_token: self.forced_refresh_token.clone(),
+            server_handler: self.server_handler.clone(),
+            pending_mrtr: None,
+            resource_updated: self.resource_updated.clone(),
+            progress: self.progress.clone(),
+            protocol_meta: self.protocol_meta.clone(),
+            change_dirty: self.change_dirty.clone(),
+            listener_generation: Arc::clone(&self.listener_generation),
+            subscription_listener_id: self.subscription_listener_id,
+            declared_extensions: self.declared_extensions.clone(),
+            block_private: self.block_private,
+            owns_listener_generation: false,
+            draining: Some(receiver),
+        }
+    }
+
+    /// Restore transport-owned protocol/session state after a cancelled wire attempt
+    /// finishes. A pending attempt is a prompt non-health failure: this keeps the
+    /// per-server slot available without permitting another worker to pile up.
+    fn restore_drained(&mut self) -> Result<(), TransportError> {
+        let Some(receiver) = self.draining.take() else {
+            return Ok(());
+        };
+        match receiver.try_recv() {
+            Ok(outcome) => {
+                *self = outcome.transport;
+                // The abandoned response is intentionally ignored. Its state updates
+                // (session/token/request id) survive in the restored transport.
+                let _ = outcome.result;
+                Ok(())
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.draining = Some(receiver);
+                Err(TransportError::Busy(
+                    "previous cancelled HTTP request is still draining".to_string(),
+                ))
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(TransportError::Fatal(
+                "cancelled HTTP request worker exited before restoring transport state".to_string(),
+            )),
+        }
+    }
+
+    fn downstream_request_id(&self) -> Value {
+        self.pending_mrtr
+            .as_ref()
+            .map(|pending| pending.common.downstream_request_id.clone())
+            .unwrap_or_else(|| json!(self.next_id))
+    }
+
+    fn forward_cancel_async(&self, downstream_id: Value, cancel: &CancelContext) {
+        if HTTP_CANCEL_THREADS_INFLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_HTTP_CANCEL_THREADS {
+            HTTP_CANCEL_THREADS_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+            downstream_trace("dropping HTTP cancellation forward: worker cap reached");
+            return;
+        }
+        let agent = guarded_agent_with_timeout(self.block_private, HTTP_CANCEL_FORWARD_TIMEOUT);
+        let url = self.url.clone();
+        let auth = Arc::clone(&self.auth);
+        let session_id = self.session_id.clone();
+        let protocol_meta = self.protocol_meta.clone();
+        let wire_version = self.wire_protocol_version();
+        let reason = cancel.reason();
+        std::thread::spawn(move || {
+            let mut params = json!({ "requestId": downstream_id });
+            if let Some(reason) = reason {
+                params["reason"] = json!(reason);
+            }
+            if let Some(protocol) = &protocol_meta {
+                merge_protocol_meta(&mut params, protocol);
+            }
+            let body = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": params,
+            });
+            let mut request = agent
+                .post(&url)
+                .set("Content-Type", "application/json")
+                .set("Accept", "application/json, text/event-stream")
+                .set("MCP-Protocol-Version", &wire_version);
+            if protocol_meta.is_none() {
+                if let Some(session_id) = session_id.as_deref() {
+                    request = request.set("Mcp-Session-Id", session_id);
+                }
+            } else if let Ok(headers) = modern_standard_headers(&body) {
+                for (name, value) in headers {
+                    request = request.set(&name, &value);
+                }
+            }
+            let token = auth
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(token) = token.as_deref() {
+                request = request.set("Authorization", &bearer_header(token));
+            }
+            if let Err(error) = request.send_string(&body.to_string()) {
+                downstream_trace(&format!("HTTP cancellation forward failed: {error}"));
+            }
+            HTTP_CANCEL_THREADS_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+
     fn request_inner(
         &mut self,
         method: &str,
         params: Value,
         headers: &[(String, String)],
     ) -> Result<Value, TransportError> {
+        self.request_inner_with_cancel(method, params, headers, None)
+    }
+
+    fn request_inner_with_cancel(
+        &mut self,
+        method: &str,
+        params: Value,
+        headers: &[(String, String)],
+        cancel: Option<&HttpCancelSignal>,
+    ) -> Result<Value, TransportError> {
+        if cancel.is_some_and(HttpCancelSignal::is_cancelled) {
+            return Err(TransportError::Cancelled(
+                "request cancelled before it reached the HTTP server".to_string(),
+            ));
+        }
         let mut params = params;
         if let Some(protocol) = &self.protocol_meta {
             merge_protocol_meta(&mut params, protocol);
@@ -3751,7 +4030,16 @@ impl HttpTransport {
                     return Ok(input_required);
                 }
             };
-            self.send_post_no_response(&response)?;
+            if cancel.is_some_and(HttpCancelSignal::is_cancelled) {
+                self.pending_mrtr = Some(pending);
+                return Err(TransportError::Cancelled(
+                    "request cancelled before it reached the HTTP server".to_string(),
+                ));
+            }
+            // This inline response resumes an already-live downstream request.
+            // Mark it as sent before the blocking POST so outer cancellation
+            // forwards notifications/cancelled with that original request id.
+            self.send_post_no_response_cancel(&response, cancel)?;
             let resp = self.read_sse_stream(
                 pending.reader,
                 pending.common.downstream_request_id.clone(),
@@ -3771,7 +4059,7 @@ impl HttpTransport {
         self.next_id += 1;
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         let resp = self
-            .post_with_headers(&body, true, headers)?
+            .post_with_headers_cancel(&body, true, headers, cancel)?
             .ok_or_else(|| TransportError::Fatal("empty response".to_string()))?;
         if let Some(err) = resp.get("error") {
             return Err(TransportError::Rpc(err.clone()));
@@ -3893,11 +4181,24 @@ impl HttpTransport {
 
     /// POST JSON-RPC without waiting for a response body (inline replies mid-SSE).
     fn send_post_no_response(&mut self, body: &Value) -> Result<(), TransportError> {
+        self.send_post_no_response_cancel(body, None)
+    }
+
+    fn send_post_no_response_cancel(
+        &mut self,
+        body: &Value,
+        cancel: Option<&HttpCancelSignal>,
+    ) -> Result<(), TransportError> {
         let payload = body.to_string();
         self.refresh_before_send();
         let mut refreshed = self.forced_refresh_spent();
         let wire_version = self.wire_protocol_version();
         let resp = loop {
+            if cancel.is_some_and(HttpCancelSignal::is_cancelled) {
+                return Err(TransportError::Cancelled(
+                    "HTTP request cancelled by upstream client".to_string(),
+                ));
+            }
             let mut req = self
                 .inline_agent
                 .post(&self.url)
@@ -3922,7 +4223,18 @@ impl HttpTransport {
             if let Some(token) = auth.as_deref() {
                 req = req.set("Authorization", &bearer_header(token));
             }
-            match req.send_string(&payload) {
+            if cancel.is_some_and(|signal| !signal.mark_sending()) {
+                return Err(TransportError::Cancelled(
+                    "HTTP request cancelled by upstream client".to_string(),
+                ));
+            }
+            let response = req.send_string(&payload);
+            if cancel.is_some_and(HttpCancelSignal::is_cancelled) {
+                return Err(TransportError::Cancelled(
+                    "HTTP request cancelled by upstream client".to_string(),
+                ));
+            }
+            match response {
                 Ok(resp) => break resp,
                 Err(ureq::Error::Status(code, resp))
                     if (code == 401 || code == 403)
@@ -4076,6 +4388,16 @@ impl HttpTransport {
         expect_response: bool,
         extra_headers: &[(String, String)],
     ) -> Result<Option<Value>, TransportError> {
+        self.post_with_headers_cancel(body, expect_response, extra_headers, None)
+    }
+
+    fn post_with_headers_cancel(
+        &mut self,
+        body: &Value,
+        expect_response: bool,
+        extra_headers: &[(String, String)],
+        cancel: Option<&HttpCancelSignal>,
+    ) -> Result<Option<Value>, TransportError> {
         let payload = body.to_string();
 
         // Refresh shortly before the known expiry, including before initialize.
@@ -4092,6 +4414,11 @@ impl HttpTransport {
         let mut refreshed = self.forced_refresh_spent();
         let wire_version = self.wire_protocol_version();
         let resp = loop {
+            if cancel.is_some_and(HttpCancelSignal::is_cancelled) {
+                return Err(TransportError::Cancelled(
+                    "request cancelled before it reached the HTTP server".to_string(),
+                ));
+            }
             let mut req = self
                 .agent
                 .post(&self.url)
@@ -4120,7 +4447,21 @@ impl HttpTransport {
                 req = req.set("Authorization", &bearer_header(token));
             }
 
-            match req.send_string(&payload) {
+            if cancel.is_some_and(|signal| !signal.mark_sending()) {
+                return Err(TransportError::Cancelled(
+                    "request cancelled before it reached the HTTP server".to_string(),
+                ));
+            }
+            let response = req.send_string(&payload);
+            // Cancellation wins even when the socket becomes readable at the same
+            // instant. In particular, never launch scope reauthorization or rotate
+            // an OAuth token for a request whose caller already abandoned it.
+            if cancel.is_some_and(HttpCancelSignal::is_cancelled) {
+                return Err(TransportError::Cancelled(
+                    "HTTP request cancelled by upstream client".to_string(),
+                ));
+            }
+            match response {
                 Ok(r) => break r,
                 // Rate limited: return a Retry signal so the Router sleeps
                 // *outside* the per-server Mutex.
@@ -4218,7 +4559,17 @@ impl HttpTransport {
 
 impl Transport for HttpTransport {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
+        self.restore_drained()?;
         self.request_inner(method, params, &[])
+    }
+
+    fn request_with_cancel(
+        &mut self,
+        method: &str,
+        params: Value,
+        cancel: Option<CancelContext>,
+    ) -> Result<Value, TransportError> {
+        self.request_with_cancel_and_headers(method, params, cancel, &[])
     }
 
     fn request_with_cancel_and_headers(
@@ -4228,12 +4579,95 @@ impl Transport for HttpTransport {
         cancel: Option<CancelContext>,
         headers: &[(String, String)],
     ) -> Result<Value, TransportError> {
-        if cancel.is_some() {
-            downstream_trace(&format!(
-                "cancellation closes the modern HTTP response stream for method {method}"
+        self.restore_drained()?;
+        let Some(cancel) = cancel else {
+            return self.request_inner(method, params, headers);
+        };
+        if cancel.is_cancelled() {
+            self.cancel_matching_pending_request(method, &params, &cancel);
+            return Err(TransportError::Cancelled(
+                "request cancelled before it reached the HTTP server".to_string(),
             ));
         }
-        self.request_inner(method, params, headers)
+
+        // ureq 2.x has no request abort handle. Move the complete mutable transport
+        // state to exactly one bounded wire worker, leaving this slot with only a
+        // receiver and immutable cancellation context. On cancellation the caller
+        // returns within HTTP_CANCEL_POLL; the worker owns no Router/ServerSlot borrow
+        // and drains for at most the agent's 30s request timeout.
+        let downstream_id = self.downstream_request_id();
+        let request_already_live = self.pending_mrtr.is_some();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let shell = self.draining_shell(receiver);
+        let mut owned = std::mem::replace(self, shell);
+        let method = method.to_string();
+        let headers = headers.to_vec();
+        let cancel_signal = HttpCancelSignal::new(cancel.clone(), request_already_live);
+        let worker_cancel = cancel_signal.clone();
+        std::thread::spawn(move || {
+            let result =
+                owned.request_inner_with_cancel(&method, params, &headers, Some(&worker_cancel));
+            owned.draining = None;
+            let _ = sender.send(HttpAttemptOutcome {
+                transport: owned,
+                result,
+            });
+        });
+
+        loop {
+            let result = self
+                .draining
+                .as_ref()
+                .expect("draining receiver installed before HTTP worker started")
+                .recv_timeout(HTTP_CANCEL_POLL);
+            match result {
+                Ok(outcome) => {
+                    let result = outcome.result;
+                    *self = outcome.transport;
+                    if cancel.is_cancelled() {
+                        if cancel_signal.cancel() {
+                            self.forward_cancel_async(downstream_id, &cancel);
+                        }
+                        return Err(TransportError::Cancelled(
+                            "HTTP request cancelled by upstream client".to_string(),
+                        ));
+                    }
+                    return result;
+                }
+                Err(RecvTimeoutError::Timeout) if cancel.is_cancelled() => {
+                    if cancel_signal.cancel() {
+                        self.forward_cancel_async(downstream_id, &cancel);
+                    }
+                    return Err(TransportError::Cancelled(
+                        "HTTP request cancelled by upstream client".to_string(),
+                    ));
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.draining = None;
+                    return Err(TransportError::Fatal(
+                        "HTTP request worker exited without returning transport state".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn cancel_matching_pending_request(
+        &mut self,
+        method: &str,
+        params: &Value,
+        cancel: &CancelContext,
+    ) -> bool {
+        let Some(pending) = self.pending_mrtr.as_ref() else {
+            return false;
+        };
+        if pending.common.response_for_retry(method, params).is_err() {
+            return false;
+        }
+        let pending = self.pending_mrtr.take().expect("matching pending request exists");
+        self.forward_cancel_async(pending.common.downstream_request_id, cancel);
+        true
     }
 
     fn supports_request_headers(&self) -> bool {
@@ -4241,6 +4675,7 @@ impl Transport for HttpTransport {
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
+        self.restore_drained()?;
         // Notifications carry the connection's protocol metadata too, so a modern
         // server sees a consistent story on every message rather than only on
         // requests. (The revision leaves notification headers undefined, so this
@@ -4272,6 +4707,7 @@ impl Transport for HttpTransport {
         &mut self,
         filter: SubscriptionFilter,
     ) -> Result<(), TransportError> {
+        self.restore_drained()?;
         let id = self.next_id;
         self.next_id += 1;
         let mut params = filter.params();
@@ -4504,7 +4940,9 @@ impl Transport for HttpTransport {
 
 impl Drop for HttpTransport {
     fn drop(&mut self) {
-        self.listener_generation.fetch_add(1, Ordering::SeqCst);
+        if self.owns_listener_generation {
+            self.listener_generation.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -10440,6 +10878,351 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 2);
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn stalled_http_cancellation_returns_promptly_and_forwards_exact_request_id() {
+        use super::{CancelRegistry, HttpTransport, Transport, TransportError};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let (stalled_tx, stalled_rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut stalled = server.recv().expect("receive original HTTP request");
+            let mut original_body = String::new();
+            stalled
+                .as_reader()
+                .read_to_string(&mut original_body)
+                .unwrap();
+            let original: Value = serde_json::from_str(&original_body).unwrap();
+            stalled_tx.send(original["id"].clone()).unwrap();
+
+            let mut cancellation = server.recv().expect("receive cancellation POST");
+            let mut cancel_body = String::new();
+            cancellation
+                .as_reader()
+                .read_to_string(&mut cancel_body)
+                .unwrap();
+            let cancel: Value = serde_json::from_str(&cancel_body).unwrap();
+            cancel_tx.send(cancel).unwrap();
+            let _ = cancellation.respond(tiny_http::Response::empty(202));
+
+            // Keep the original request genuinely stalled until the caller has
+            // proved a follower cannot create a second wire attempt.
+            release_rx.recv().expect("test releases stalled response");
+
+            let ct = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                .unwrap();
+            let id = original["id"].clone();
+            let body = json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } });
+            let _ =
+                stalled.respond(tiny_http::Response::from_string(body.to_string()).with_header(ct));
+        });
+
+        let cancellations = CancelRegistry::new();
+        assert!(cancellations.begin_client_request("http-stall".to_string()));
+        let cancel_context = cancellations.context("http-stall".to_string());
+        let url = format!("http://127.0.0.1:{port}/");
+        let worker = std::thread::spawn(move || {
+            let mut transport = HttpTransport::new(&url);
+            let started = Instant::now();
+            // Exercise the headerless trait path used by completion/complete too;
+            // HttpTransport must override it rather than inheriting the default
+            // cancellation-ignoring implementation.
+            let result = transport.request_with_cancel(
+                "completion/complete",
+                json!({ "name": "slow" }),
+                Some(cancel_context),
+            );
+            (transport, result, started.elapsed())
+        });
+
+        let original_id = stalled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(cancellations.cancel("http-stall", Some("user pressed stop")));
+        let (mut transport, result, elapsed) = worker.join().unwrap();
+        assert!(matches!(result, Err(TransportError::Cancelled(_))));
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "the caller/slot must be released within the 25ms poll bound, got {elapsed:?}"
+        );
+
+        let cancel = cancel_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(cancel["method"], "notifications/cancelled");
+        assert_eq!(cancel["params"]["requestId"], original_id);
+        assert_eq!(cancel["params"]["reason"], "user pressed stop");
+
+        // A follower is not queued behind the dead wire request: it fails promptly
+        // while the sole worker drains, and cannot spawn a second attempt.
+        let follower_started = Instant::now();
+        let follower = transport.request("tools/call", json!({ "name": "other" }));
+        assert!(matches!(follower, Err(TransportError::Busy(_))));
+        assert!(follower_started.elapsed() < Duration::from_millis(100));
+
+        release_tx.send(()).unwrap();
+        cancellations.finish_client_request("http-stall");
+        handle.join().unwrap();
+
+        // Once the sole worker has drained, its full protocol state is restored
+        // and the transport can accept a fresh request instead of staying Busy.
+        let recovery_server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let recovery_port = recovery_server.server_addr().to_ip().unwrap().port();
+        let recovery_handle = std::thread::spawn(move || {
+            let mut request = recovery_server.recv().expect("receive recovery request");
+            let mut raw = String::new();
+            request.as_reader().read_to_string(&mut raw).unwrap();
+            let body: Value = serde_json::from_str(&raw).unwrap();
+            let response = json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": { "recovered": true }
+            });
+            let content_type = tiny_http::Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"application/json"[..],
+            )
+            .unwrap();
+            request
+                .respond(
+                    tiny_http::Response::from_string(response.to_string())
+                        .with_header(content_type),
+                )
+                .unwrap();
+        });
+        // Wait only for the bounded worker to hand its owned protocol state back.
+        // No second wire request is allowed while the shell reports Busy.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match transport.restore_drained() {
+                Err(TransportError::Busy(_)) if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                result => break result.unwrap(),
+            }
+        }
+        transport.url = format!("http://127.0.0.1:{recovery_port}/");
+        transport.agent = super::guarded_agent(false);
+        transport.inline_agent = super::guarded_agent(false);
+        let result = transport
+            .request("tools/call", json!({ "name": "after-cancel" }))
+            .expect("restored transport accepts a fresh request");
+        assert_eq!(result["recovered"], true);
+        recovery_handle.join().unwrap();
+    }
+
+    #[test]
+    fn pending_mrtr_cancellation_forwards_the_original_request_id() {
+        use super::{
+            CancelRegistry, HttpTransport, PendingHttpMrtr, PendingLegacyMrtr, Transport,
+            TransportError,
+        };
+        use std::io::Cursor;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let (inline_tx, inline_rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut inline = server.recv().expect("receive MRTR inline response");
+            let mut inline_body = String::new();
+            inline.as_reader().read_to_string(&mut inline_body).unwrap();
+            inline_tx.send(inline_body).unwrap();
+
+            let mut cancellation = server.recv().expect("receive MRTR cancellation");
+            let mut cancel_body = String::new();
+            cancellation.as_reader().read_to_string(&mut cancel_body).unwrap();
+            cancel_tx
+                .send(serde_json::from_str::<Value>(&cancel_body).unwrap())
+                .unwrap();
+            cancellation
+                .respond(tiny_http::Response::empty(202))
+                .unwrap();
+
+            release_rx.recv().expect("release MRTR inline response");
+            inline.respond(tiny_http::Response::empty(202)).unwrap();
+        });
+
+        let base_params = json!({ "name": "interactive", "arguments": {} });
+        let common = PendingLegacyMrtr::new(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "elicitation/create",
+                "params": { "message": "Continue?" }
+            }),
+            json!(41),
+            "tools/call",
+            &base_params,
+        )
+        .unwrap();
+        let mut retry_params = base_params;
+        retry_params["requestState"] = json!(common.token.clone());
+        retry_params["inputResponses"] = json!({
+            common.input_key.clone(): { "action": "accept" }
+        });
+        let final_frame = b"data: {\"jsonrpc\":\"2.0\",\"id\":41,\"result\":{\"ok\":true}}\n\n";
+        let mut transport = HttpTransport::new(&format!("http://127.0.0.1:{port}/"));
+        transport.pending_mrtr = Some(PendingHttpMrtr {
+            common,
+            reader: Box::new(Cursor::new(final_frame.to_vec())),
+            bytes_read: 0,
+        });
+
+        let cancellations = CancelRegistry::new();
+        assert!(cancellations.begin_client_request("mrtr-cancel".to_string()));
+        let cancel_context = cancellations.context("mrtr-cancel".to_string());
+        let worker = std::thread::spawn(move || {
+            transport.request_with_cancel("tools/call", retry_params, Some(cancel_context))
+        });
+
+        let inline_body = inline_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(inline_body.contains("\"id\":99"));
+        assert!(cancellations.cancel("mrtr-cancel", Some("user pressed stop")));
+        let result = worker.join().unwrap();
+        assert!(matches!(result, Err(TransportError::Cancelled(_))));
+        let cancel = cancel_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(cancel["method"], "notifications/cancelled");
+        assert_eq!(cancel["params"]["requestId"], 41);
+
+        release_tx.send(()).unwrap();
+        cancellations.finish_client_request("mrtr-cancel");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn pending_mrtr_cancelled_before_inline_send_retains_forward_claim() {
+        use super::{CancelRegistry, HttpCancelSignal};
+
+        let cancellations = CancelRegistry::new();
+        assert!(cancellations.begin_client_request("mrtr-pre-send".to_string()));
+        let context = cancellations.context("mrtr-pre-send".to_string());
+        let signal = HttpCancelSignal::new(context, true);
+
+        assert!(cancellations.cancel("mrtr-pre-send", Some("user pressed stop")));
+        assert!(
+            !signal.mark_sending(),
+            "the continuation POST must not start after cancellation"
+        );
+        assert!(
+            signal.cancel(),
+            "the already-live original MRTR request still needs cancellation forwarded"
+        );
+        assert!(
+            !signal.cancel(),
+            "only one caller may claim the cancellation notification"
+        );
+        cancellations.finish_client_request("mrtr-pre-send");
+    }
+
+    #[test]
+    fn precancelled_pending_mrtr_forwards_original_id_without_continuation_post() {
+        use super::{
+            CancelRegistry, HttpTransport, PendingHttpMrtr, PendingLegacyMrtr, Transport,
+            TransportError,
+        };
+        use std::io::Cursor;
+        use std::time::Duration;
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut request = server.recv().expect("receive cancellation");
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body).unwrap();
+            request.respond(tiny_http::Response::empty(202)).unwrap();
+            let value: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(value["method"], "notifications/cancelled");
+            assert_eq!(value["params"]["requestId"], 41);
+            assert!(
+                server.recv_timeout(Duration::from_millis(150)).unwrap().is_none(),
+                "pre-cancellation must not send the inline continuation POST"
+            );
+        });
+
+        let base_params = json!({ "name": "interactive", "arguments": {} });
+        let common = PendingLegacyMrtr::new(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "elicitation/create",
+                "params": { "message": "Continue?" }
+            }),
+            json!(41),
+            "tools/call",
+            &base_params,
+        )
+        .unwrap();
+        let mut retry_params = base_params.clone();
+        retry_params["requestState"] = json!(common.token.clone());
+        retry_params["inputResponses"] = json!({
+            common.input_key.clone(): { "action": "accept" }
+        });
+        let mut transport = HttpTransport::new(&format!("http://127.0.0.1:{port}/"));
+        transport.pending_mrtr = Some(PendingHttpMrtr {
+            common,
+            reader: Box::new(Cursor::new(Vec::<u8>::new())),
+            bytes_read: 0,
+        });
+        let cancellations = CancelRegistry::new();
+        assert!(cancellations.begin_client_request("already-cancelled".to_string()));
+        let context = cancellations.context("already-cancelled".to_string());
+        assert!(cancellations.cancel("already-cancelled", Some("user pressed stop")));
+
+        let result = transport.request_with_cancel("tools/call", retry_params, Some(context));
+        assert!(matches!(result, Err(TransportError::Cancelled(_))));
+        assert!(transport.pending_mrtr.is_none());
+        handle.join().unwrap();
+        cancellations.finish_client_request("already-cancelled");
+    }
+
+    #[test]
+    fn unrelated_precancelled_request_cannot_retire_pending_mrtr() {
+        use super::{
+            CancelRegistry, HttpTransport, PendingHttpMrtr, PendingLegacyMrtr, Transport,
+            TransportError,
+        };
+        use std::io::Cursor;
+
+        let base_params = json!({ "name": "interactive", "arguments": {} });
+        let common = PendingLegacyMrtr::new(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "elicitation/create",
+                "params": { "message": "Continue?" }
+            }),
+            json!(41),
+            "tools/call",
+            &base_params,
+        )
+        .unwrap();
+        let mut unrelated = base_params.clone();
+        unrelated["requestState"] = json!("another-request-token");
+        unrelated["inputResponses"] = json!({ "other": { "action": "accept" } });
+        let mut transport = HttpTransport::new("http://127.0.0.1:9/");
+        transport.pending_mrtr = Some(PendingHttpMrtr {
+            common,
+            reader: Box::new(Cursor::new(Vec::<u8>::new())),
+            bytes_read: 0,
+        });
+        let cancellations = CancelRegistry::new();
+        assert!(cancellations.begin_client_request("unrelated-cancel".to_string()));
+        let context = cancellations.context("unrelated-cancel".to_string());
+        assert!(cancellations.cancel("unrelated-cancel", Some("user pressed stop")));
+
+        let result = transport.request_with_cancel("tools/call", unrelated, Some(context));
+        assert!(matches!(result, Err(TransportError::Cancelled(_))));
+        assert!(
+            transport.pending_mrtr.is_some(),
+            "an unrelated requestState must not consume another request's pending MRTR"
+        );
+        cancellations.finish_client_request("unrelated-cancel");
     }
 
     #[test]
