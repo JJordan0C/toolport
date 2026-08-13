@@ -926,23 +926,32 @@ export function VerifyCall({
   timeoutMs?: number;
 }) {
   const prompt = "List the tools you can use through Toolport.";
-  const [status, setStatus] = useState<"waiting" | "success" | "timeout">("waiting");
+  const [status, setStatus] = useState<
+    "snapshot" | "waiting" | "success" | "timeout" | "snapshot-failed"
+  >("snapshot");
   const [hit, setHit] = useState<AuditEntry | null>(null);
+  const [snapshotAttempt, setSnapshotAttempt] = useState(0);
 
   useEffect(() => {
     let alive = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = Date.now() + timeoutMs;
+    setHit(null);
+    setStatus("snapshot");
     void (async () => {
-      // Snapshot the newest existing call so only a call made from here on counts. Compare
-      // audit ts to audit ts (unit-agnostic); the deadline uses wall-clock independently.
+      // Snapshot must succeed before anything can count. A failed read used to
+      // leave since=0, so the next poll could celebrate retained history.
       let since = 0;
       try {
         const recent = await getAuditLog(1);
+        if (!alive) return;
         if (recent[0]) since = recent[0].ts;
       } catch {
-        // No log yet is fine: `since` stays 0, so the first-ever call still counts.
+        if (alive) setStatus("snapshot-failed");
+        return;
       }
+      if (!alive) return;
+      setStatus("waiting");
       const poll = async () => {
         if (!alive) return;
         try {
@@ -954,7 +963,7 @@ export function VerifyCall({
             return;
           }
         } catch {
-          // Transient read error: keep polling until the deadline.
+          // Transient read error after a good baseline: keep polling.
         }
         if (Date.now() > deadline) {
           setStatus("timeout");
@@ -968,7 +977,7 @@ export function VerifyCall({
       alive = false;
       if (timer) clearTimeout(timer);
     };
-  }, [pollMs, timeoutMs]);
+  }, [pollMs, timeoutMs, snapshotAttempt]);
 
   async function copyPrompt() {
     try {
@@ -990,15 +999,16 @@ export function VerifyCall({
         <div className="flex items-start gap-2 rounded-md bg-success/10 px-3 py-2 text-sm">
           <Check className="mt-0.5 size-4 shrink-0 text-success" />
           <span>
-            <span className="font-medium text-success">It works.</span> A call just
-            reached Toolport: <code className="text-xs">{hit.tool}</code>
+            <span className="font-medium text-success">It works.</span> A call reached
+            Toolport after this check started: <code className="text-xs">{hit.tool}</code>
             {hit.server ? (
               <>
                 {" "}
                 on <code className="text-xs">{hit.server}</code>
               </>
             ) : null}
-            .
+            . Local stdio calls are not tagged with a client, so this is not proof it came
+            from {client.name}.
           </span>
         </div>
       ) : (
@@ -1019,13 +1029,31 @@ export function VerifyCall({
             </button>
           </div>
 
-          {status === "waiting" ? (
+          {status === "snapshot" || status === "waiting" ? (
             <div className="flex items-start gap-2 text-xs text-muted-foreground">
               <Loader2 className="mt-0.5 size-3.5 shrink-0 animate-spin" />
               <span>
-                Waiting for the first call from {client.name}. Just connected it?{" "}
-                {clientRestartHint(client.name, client.id)}
+                {status === "snapshot"
+                  ? "Reading the audit log so older calls cannot count as proof."
+                  : `Waiting for a new call after this check started. Just connected ${client.name}? ${clientRestartHint(client.name, client.id)}`}
               </span>
+            </div>
+          ) : status === "snapshot-failed" ? (
+            <div className="flex flex-col gap-1.5 rounded-md bg-warning/10 px-3 py-2 text-xs">
+              <span className="font-medium text-warning">
+                Couldn&apos;t read the audit log, so this check did not start.
+              </span>
+              <span className="text-muted-foreground">
+                An older or unrelated call will not be treated as proof. Retry when the
+                log is available, or use the Playground.
+              </span>
+              <button
+                type="button"
+                onClick={() => setSnapshotAttempt((n) => n + 1)}
+                className="self-start font-medium text-primary hover:underline"
+              >
+                Retry the check
+              </button>
             </div>
           ) : (
             <div className="flex flex-col gap-1.5 rounded-md bg-warning/10 px-3 py-2 text-xs">

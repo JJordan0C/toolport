@@ -38,9 +38,42 @@ describe("VerifyCall", () => {
     render(<VerifyCall client={client} onOpenPlayground={vi.fn()} pollMs={5} />);
 
     await waitFor(() => expect(screen.getByText(/It works/)).toBeInTheDocument());
-    // Names the tool + server that succeeded.
+    // Names the tool + server that succeeded, without claiming Cursor sent it.
     expect(screen.getByText("get_me")).toBeInTheDocument();
     expect(screen.getByText("GitHub")).toBeInTheDocument();
+    expect(screen.getByText(/after this check started/)).toBeInTheDocument();
+    expect(screen.getByText(/not proof it came from Cursor/)).toBeInTheDocument();
+  });
+
+  it("does not celebrate historical traffic when the baseline read fails", async () => {
+    getAuditLog
+      .mockRejectedValueOnce(new Error("audit unavailable"))
+      .mockResolvedValue([{ ts: 50, server: "GitHub", tool: "old", ok: true }]);
+
+    render(<VerifyCall client={client} onOpenPlayground={vi.fn()} pollMs={5} />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/Couldn't read the audit log/)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/It works/)).not.toBeInTheDocument();
+    expect(screen.queryByText("old")).not.toBeInTheDocument();
+  });
+
+  it("ignores unrelated traffic that is not newer than the baseline", async () => {
+    getAuditLog
+      .mockResolvedValueOnce([{ ts: 100, server: "GitHub", tool: "baseline", ok: true }])
+      .mockResolvedValue([
+        { ts: 100, server: "GitHub", tool: "baseline", ok: true },
+        { ts: 40, server: "Other", tool: "older", ok: true },
+      ]);
+
+    render(
+      <VerifyCall client={client} onOpenPlayground={vi.fn()} pollMs={5} timeoutMs={40} />,
+    );
+
+    await waitFor(() => expect(screen.getByText(/No call yet/)).toBeInTheDocument());
+    expect(screen.queryByText(/It works/)).not.toBeInTheDocument();
+    expect(screen.queryByText("older")).not.toBeInTheDocument();
   });
 
   it("shows recovery guidance when no call arrives before the deadline", async () => {
