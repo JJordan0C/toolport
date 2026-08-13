@@ -16057,8 +16057,11 @@ mod tests {
             response.starts_with("HTTP/1.1 408 Request Timeout"),
             "slow header response was: {response}"
         );
+        // Absolute deadline is 180ms. A per-read reset would take ~560ms
+        // (14 dripped bytes * 40ms). macOS CI can land just over 350ms
+        // from scheduling; 500ms still fails a reset-on-drip implementation.
         assert!(
-            elapsed < Duration::from_millis(350),
+            elapsed < Duration::from_millis(500),
             "header timeout reset after each drip ({elapsed:?}) instead of enforcing an absolute deadline"
         );
 
