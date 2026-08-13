@@ -216,6 +216,40 @@ describe("SecretsDialog client credentials (SBS-524)", () => {
     ).not.toBeInTheDocument();
   });
 
+  /// Reopening the dialog for a different server must not show the previous
+  /// server's "secret stored" badge while the new probe is still in flight.
+  it("does not carry the stored badge across servers while the probe is pending", async () => {
+    hasClientSecret.mockResolvedValueOnce(true);
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <SecretsDialog
+        server={server({ clientCredentials: { clientId: "a-id" } })}
+        onSaved={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button"));
+    await waitFor(() => expect(screen.getByText(/secret stored/i)).toBeInTheDocument());
+    await user.keyboard("{Escape}");
+
+    // Server B's probe never settles inside this test.
+    hasClientSecret.mockImplementation(() => new Promise(() => {}));
+    rerender(
+      <SecretsDialog
+        server={server({
+          id: "srv-2",
+          name: "Other MCP",
+          clientCredentials: { clientId: "b-id" },
+        })}
+        onSaved={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /Other MCP/ }));
+    await waitFor(() =>
+      expect(screen.getByPlaceholderText("Client ID")).toHaveValue("b-id"),
+    );
+    expect(screen.queryByText(/secret stored/i)).not.toBeInTheDocument();
+  });
+
   it("refuses to save without a client id instead of calling the backend", async () => {
     const user = await openDialog(server());
     await user.click(

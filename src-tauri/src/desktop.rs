@@ -4208,6 +4208,21 @@ mod tests {
         assert!(message.contains("Your registry was not replaced"));
     }
 
+    /// A failed keychain read must surface as an error, never as "no secret
+    /// stored": `Ok(false)` sends the UI down the first-time path and blocks a
+    /// user whose secret really is vaulted (SBS-722). The reserved internal
+    /// namespace is the one deterministic way to make `get_secret_result` fail
+    /// on every platform, and `secrets::get_secret` swallows exactly that error
+    /// into `None` -- which is the regression this pins against.
+    #[test]
+    fn has_client_secret_reports_a_failed_read_as_an_error_not_missing() {
+        let result = has_client_secret("__toolport_internal__".to_string());
+        assert!(
+            result.is_err(),
+            "a failed secret read must propagate, not resolve to a boolean: {result:?}"
+        );
+    }
+
     fn github_with_secret() -> ServerEntry {
         ServerEntry {
             id: "gh".into(),

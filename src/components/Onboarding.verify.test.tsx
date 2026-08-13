@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import type { DetectedClient } from "@/lib/types";
 
 // Poll target: watch the local audit log for the first new call.
@@ -60,6 +61,42 @@ describe("VerifyCall", () => {
     expect(
       screen.queryByText("List the tools you can use through Toolport."),
     ).not.toBeInTheDocument();
+  });
+
+  /// The prompt is hidden until a baseline exists, so a user cannot paste it
+  /// early and have Retry's snapshot absorb that very call as the baseline with
+  /// nothing newer ever arriving. After Retry, only calls newer than the fresh
+  /// baseline count.
+  it("retries the snapshot and celebrates only calls newer than the retry baseline", async () => {
+    getAuditLog
+      .mockRejectedValueOnce(new Error("audit unavailable"))
+      // Retry's snapshot: the newest row is an interim call (e.g. the prompt
+      // pasted while the check was down). It becomes the baseline, not proof.
+      .mockResolvedValueOnce([{ ts: 150, server: "GitHub", tool: "interim", ok: true }])
+      .mockResolvedValueOnce([{ ts: 150, server: "GitHub", tool: "interim", ok: true }])
+      .mockResolvedValue([
+        { ts: 200, server: "GitHub", tool: "fresh", ok: true },
+        { ts: 150, server: "GitHub", tool: "interim", ok: true },
+      ]);
+    const user = userEvent.setup();
+
+    render(<VerifyCall client={client} onOpenPlayground={vi.fn()} pollMs={5} />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/Couldn't read the audit log/)).toBeInTheDocument(),
+    );
+    await user.click(screen.getByRole("button", { name: /Retry the check/ }));
+
+    // A working baseline brings the copy-paste prompt back.
+    await waitFor(() =>
+      expect(
+        screen.getByText("List the tools you can use through Toolport."),
+      ).toBeInTheDocument(),
+    );
+    await waitFor(() => expect(screen.getByText(/It works/)).toBeInTheDocument());
+    // The celebrated call is the one after the retry baseline, not the interim row.
+    expect(screen.getByText("fresh")).toBeInTheDocument();
+    expect(screen.queryByText("interim")).not.toBeInTheDocument();
   });
 
   it("ignores unrelated traffic that is not newer than the baseline", async () => {
