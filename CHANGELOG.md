@@ -16,7 +16,19 @@ Entries before the rename below shipped under the project's former name, Conduit
 - **winget package.** `winget install Toolport.Toolport` on Windows once the manifest is
   published, and each release submits its own update.
 
-## [1.13.0] - 2026-08-13
+### Fixed
+
+- **A second Claude Code profile no longer gets stuck on an old gateway.**
+  `CLAUDE_CONFIG_DIR` is usually set per shell or per launcher rather than exported, so a
+  machine often has several Claude configs (a personal `~/.claude` beside a work
+  `~/.claude-work`). Toolport resolved exactly one of them, and every other one it had
+  written kept pinning whichever gateway binary was current the day it was written.
+  Because pruning deliberately keeps recent binaries, that profile went on launching
+  superseded gateway code indefinitely and the reaper could not win: it stopped the
+  process and the config Toolport never updated started it again. Every Claude config is
+  now re-pointed on launch, and each one's gateway binary counts as referenced so pruning
+  cannot delete it. Strictly a repair: a profile with no Toolport entry does not get one,
+  and a hand-customized entry is still left alone.
 
 Toolport installs two new ways: as an agent plugin any conformant client can pick up,
 and on Windows through a one-line command instead of a trip to the Releases page.

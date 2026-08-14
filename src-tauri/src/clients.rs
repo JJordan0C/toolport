@@ -387,6 +387,73 @@ fn claude_code_config_path(config_dir: &std::path::Path) -> PathBuf {
     config_dir.join(".claude.json")
 }
 
+/// Every `.claude.json` on this machine that some Claude Code process may read.
+///
+/// [`claude_config_dir_override`] resolves the ONE config Toolport reads and writes,
+/// which is correct for connecting a client but wrong for maintaining one. A machine
+/// routinely has several: `CLAUDE_CONFIG_DIR` is usually exported per-shell or set by
+/// a launcher for one profile (a personal `~/.claude` beside a work `~/.claude-work`),
+/// so whichever one Toolport did not resolve today keeps pinning whatever gateway
+/// binary was current the day it was written. Pruning deliberately keeps recent
+/// binaries, so that client goes on respawning superseded gateway code indefinitely,
+/// and the reaper cannot win: it stops the process and the config Toolport never
+/// updated starts it again. That is the failure this list exists to close.
+///
+/// Discovery is deliberately narrow: the documented default, the override, and
+/// `.claude*` siblings directly under home. No recursion, nothing outside home.
+fn claude_code_config_paths() -> Vec<PathBuf> {
+    let Some(home) = home() else {
+        return Vec::new();
+    };
+    let dirs: Vec<String> = std::fs::read_dir(&home)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    claude_code_config_paths_from(&home, claude_config_dir_override().as_deref(), &dirs)
+        .into_iter()
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+/// The env- and filesystem-free half of [`claude_code_config_paths`], so ordering and
+/// de-duplication are testable without a home directory full of fixtures.
+///
+/// `home_dirs` is the set of directory names directly under `home`. Order matters: the
+/// resolved config comes first so a caller that only wants "the one we manage" can take
+/// the head, and the rest follow in a stable order.
+fn claude_code_config_paths_from(
+    home: &std::path::Path,
+    override_dir: Option<&std::path::Path>,
+    home_dirs: &[String],
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let push = |path: PathBuf, out: &mut Vec<PathBuf>| {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    };
+    if let Some(dir) = override_dir {
+        push(claude_code_config_path(dir), &mut out);
+    }
+    // The documented default is a FILE at the home root, not `.claude/.claude.json`.
+    push(home.join(".claude.json"), &mut out);
+    let mut siblings: Vec<&String> = home_dirs
+        .iter()
+        .filter(|name| *name == ".claude" || name.starts_with(".claude-"))
+        .collect();
+    // read_dir order is unspecified; sort so the log and any diagnostics are stable.
+    siblings.sort();
+    for name in siblings {
+        push(claude_code_config_path(&home.join(name)), &mut out);
+    }
+    out
+}
+
 fn client_config_path(client_id: &str) -> Option<PathBuf> {
     let home = home()?;
     if client_id == "claude-code" {
@@ -2652,6 +2719,14 @@ pub struct RepointOutcome {
     /// UI. Six clients on this developer's machine sat on a superseded gateway
     /// for days with nothing anywhere recording why.
     pub failed: Vec<(String, String)>,
+    /// Claude Code configs other than the one Toolport resolves, repaired by
+    /// [`repoint_other_claude_configs`]. Paths rather than client ids, because they
+    /// all belong to the same `claude-code` client and carry no ownership record of
+    /// their own - the registry keys ownership by client id, and a sibling must not
+    /// overwrite the resolved config's snapshot.
+    pub extra_claude_repointed: Vec<PathBuf>,
+    /// Sibling Claude configs that needed a repair and could not be written.
+    pub extra_claude_failed: Vec<(PathBuf, String)>,
 }
 
 fn find_def(client_id: &str) -> Option<ClientDef> {
@@ -4673,7 +4748,45 @@ fn read_gateway_profile(client_id: &str) -> Option<String> {
 /// never be re-pointed onto a current binary. Deleting one out from under a plugin
 /// entry leaves a reference nothing will ever repair.
 pub fn referenced_gateway_paths() -> Option<Vec<PathBuf>> {
-    referenced_gateway_paths_in(&detect_clients())
+    let mut out = referenced_gateway_paths_in(&detect_clients())?;
+    // Secondary Claude Code configs are invisible to detect_clients(), which probes
+    // one path per client. Their gateway commands are still live references: pruning
+    // a binary one of them names is what strands that profile on a missing gateway.
+    // Keep-paths must be a superset of what any config can spawn, not of what we
+    // happen to resolve today.
+    for path in extra_claude_gateway_references() {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    Some(out)
+}
+
+/// Gateway binaries named by Claude Code configs other than the resolved one.
+///
+/// Unreadable or unparseable files yield nothing rather than failing the whole scan:
+/// [`referenced_gateway_paths`] already fails closed on a client it could not probe,
+/// and these are best-effort extras discovered by directory scan, so one unreadable
+/// sibling must not suppress pruning across the machine forever.
+fn extra_claude_gateway_references() -> Vec<PathBuf> {
+    let primary = client_config_path("claude-code");
+    let mut out = Vec::new();
+    for path in claude_code_config_paths() {
+        if primary.as_deref() == Some(path.as_path()) {
+            continue;
+        }
+        let Ok(text) = read_config_file(&path) else {
+            continue;
+        };
+        let Some((_, command)) = claude_gateway_entry_in(&text) else {
+            continue;
+        };
+        let command = command.trim();
+        if !command.is_empty() {
+            out.push(PathBuf::from(command));
+        }
+    }
+    out
 }
 
 /// The pure half of [`referenced_gateway_paths`], over an already-probed client list so
@@ -4780,8 +4893,117 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
             }
         }
     }
+    repoint_other_claude_configs(&current, &mut outcome);
     log_repoint_outcome(&current, &outcome);
     outcome
+}
+
+/// Repair Toolport's entry in every Claude Code config EXCEPT the one
+/// [`client_config_path`] resolves, which the pass above already handled.
+///
+/// Strictly a repair, never an install. A file is touched only when it already holds
+/// an entry of ours whose command is one of our gateway binaries
+/// ([`gateway_entry_needs_rewrite`] gates on [`command_is_gateway_binary`]). A Claude
+/// profile that deliberately has no Toolport keeps not having one, and a hand-written
+/// entry under our name stays the user's. That distinction is why this is separate
+/// from the connect path rather than folded into it: connecting is a decision the user
+/// makes per profile, but a config we already wrote going stale is our bug to fix.
+///
+/// The registry ownership record is deliberately not written here. It is keyed by
+/// client id, and all of these files are `claude-code`, so recording a sibling would
+/// overwrite the resolved config's snapshot and make the next pass read that one as
+/// Customized - i.e. we would stop maintaining the config we actually manage.
+fn repoint_other_claude_configs(current: &str, outcome: &mut RepointOutcome) {
+    let primary = client_config_path("claude-code");
+    let others: Vec<PathBuf> = claude_code_config_paths()
+        .into_iter()
+        .filter(|path| primary.as_deref() != Some(path.as_path()))
+        .collect();
+    for repair in claude_configs_needing_repair(&others, current) {
+        let ClaudeRepair {
+            path,
+            profile,
+            stored,
+        } = repair;
+        let write = gateway_entry(profile.as_deref(), "claude-code").and_then(|entry| {
+            backup_file("claude-code", &path)?;
+            edit_json_gateway(&path, "mcpServers", Some(&entry), true)
+        });
+        match write {
+            Ok(()) => {
+                let msg = format!(
+                    "toolport: re-pointed a secondary Claude Code config at {} from {stored} to {current}",
+                    path.display(),
+                );
+                eprintln!("{msg}");
+                crate::gatewaylog::append(&msg);
+                outcome.extra_claude_repointed.push(path);
+            }
+            Err(error) => {
+                let msg = format!(
+                    "toolport: could not re-point the secondary Claude Code config at {}: {error}",
+                    path.display(),
+                );
+                eprintln!("{msg}");
+                crate::gatewaylog::append(&msg);
+                outcome.extra_claude_failed.push((path, error));
+            }
+        }
+    }
+}
+
+/// One secondary Claude config that needs its gateway entry repaired.
+#[derive(Debug, PartialEq, Eq)]
+struct ClaudeRepair {
+    path: PathBuf,
+    /// This file's own `TOOLPORT_PROFILE`. These configs are scoped independently, so
+    /// the resolved config's profile is not necessarily this one's, and a repair that
+    /// dropped it would silently unscope a client.
+    profile: Option<String>,
+    /// What the entry pointed at before, for the log.
+    stored: String,
+}
+
+/// Decide which of `paths` need repair, reading but never writing.
+///
+/// Split out from [`repoint_other_claude_configs`] so the rules are testable against
+/// real files without a home directory, a `CLAUDE_CONFIG_DIR`, or an installed gateway
+/// binary to resolve. The caller does the writing.
+fn claude_configs_needing_repair(paths: &[PathBuf], current: &str) -> Vec<ClaudeRepair> {
+    let mut out = Vec::new();
+    for path in paths {
+        let Ok(text) = read_config_file(path) else {
+            continue;
+        };
+        let Some((entry_name, stored)) = claude_gateway_entry_in(&text) else {
+            continue;
+        };
+        if !gateway_entry_needs_rewrite(&entry_name, &stored, current, Some(&text)) {
+            continue;
+        }
+        out.push(ClaudeRepair {
+            path: path.clone(),
+            profile: profile_from_config_text(&text),
+            stored,
+        });
+    }
+    out
+}
+
+/// Our gateway entry's `(name, command)` in a `.claude.json`, by identity rather than
+/// by exact name, so a pre-rename `conduit` entry is found too.
+///
+/// Returns None on unparseable text rather than treating it as "no entry": these files
+/// hold Claude Code's entire application state, and a transient parse failure must not
+/// be read as an invitation to write.
+fn claude_gateway_entry_in(text: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let servers = value.get("mcpServers")?.as_object()?;
+    servers.iter().find_map(|(name, entry)| {
+        let command = entry.get("command").and_then(|c| c.as_str());
+        gateway_identity_matches(name, name, command)
+            .then(|| (name.clone(), command.unwrap_or_default().to_string()))
+    })
 }
 
 /// Record a re-point pass in the gateway log.
@@ -4792,7 +5014,12 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
 /// what `gather_diagnostics` bundles, so a stale-gateway report can be answered
 /// from it instead of reconstructed from file mtimes.
 fn log_repoint_outcome(current: &str, outcome: &RepointOutcome) {
-    if outcome.repointed.is_empty() && outcome.customized.is_empty() && outcome.failed.is_empty() {
+    if outcome.repointed.is_empty()
+        && outcome.customized.is_empty()
+        && outcome.failed.is_empty()
+        && outcome.extra_claude_repointed.is_empty()
+        && outcome.extra_claude_failed.is_empty()
+    {
         return;
     }
     let ids = |pairs: &[(String, ManagedEntry)]| {
@@ -4802,8 +5029,15 @@ fn log_repoint_outcome(current: &str, outcome: &RepointOutcome) {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let paths = |items: &[PathBuf]| {
+        items
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     crate::gatewaylog::append(&format!(
-        "toolport: re-point pass against {current}: {} re-pointed [{}], {} customized [{}], {} failed [{}]",
+        "toolport: re-point pass against {current}: {} re-pointed [{}], {} customized [{}], {} failed [{}], {} secondary Claude configs re-pointed [{}], {} secondary failed [{}]",
         outcome.repointed.len(),
         ids(&outcome.repointed),
         outcome.customized.len(),
@@ -4813,6 +5047,15 @@ fn log_repoint_outcome(current: &str, outcome: &RepointOutcome) {
             .failed
             .iter()
             .map(|(id, why)| format!("{id}: {why}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+        outcome.extra_claude_repointed.len(),
+        paths(&outcome.extra_claude_repointed),
+        outcome.extra_claude_failed.len(),
+        outcome
+            .extra_claude_failed
+            .iter()
+            .map(|(p, why)| format!("{}: {why}", p.display()))
             .collect::<Vec<_>>()
             .join("; "),
     ));
@@ -4842,6 +5085,205 @@ mod tests {
             claude_code_config_path(&relocated),
             relocated.join(".claude.json")
         );
+    }
+
+    #[test]
+    fn every_claude_profile_on_the_machine_is_discovered() {
+        // The resolved config is one of several. A personal `.claude` beside a work
+        // `.claude-work` is the ordinary shape, and the one Toolport did not resolve
+        // is exactly the one that rots.
+        let home = PathBuf::from(if cfg!(windows) {
+            r"C:\Users\someone"
+        } else {
+            "/home/someone"
+        });
+        let dirs = [
+            ".claude-work".to_string(),
+            ".claude".to_string(),
+            // These share the `.claude` prefix but are not profiles. A plain
+            // starts_with(".claude") would sweep them in and write a gateway entry
+            // into a backup directory or another tool's state.
+            ".claude.bak".to_string(),
+            ".claudesync".to_string(),
+            "Documents".to_string(),
+        ];
+        let paths = claude_code_config_paths_from(&home, Some(&home.join(".claude-work")), &dirs);
+        assert_eq!(
+            paths,
+            vec![
+                // The resolved config leads, so callers can take the head.
+                home.join(".claude-work").join(".claude.json"),
+                // The documented default is a file at the home root.
+                home.join(".claude.json"),
+                home.join(".claude").join(".claude.json"),
+            ],
+            "expected the override first, then the default, then sorted siblings"
+        );
+        for impostor in [".claude.bak", ".claudesync"] {
+            assert!(
+                !paths.iter().any(|p| p.starts_with(home.join(impostor))),
+                "{impostor} is not a Claude Code profile and must not be written"
+            );
+        }
+    }
+
+    #[test]
+    fn the_resolved_claude_config_is_never_listed_twice() {
+        // The override commonly IS one of the siblings. Listing it twice would make
+        // the repair pass rewrite the same file, and the resolved config is handled
+        // by the main loop, so a duplicate is a double write, not a harmless extra.
+        let home = PathBuf::from(if cfg!(windows) {
+            r"C:\Users\someone"
+        } else {
+            "/home/someone"
+        });
+        let dirs = [".claude".to_string()];
+        let paths = claude_code_config_paths_from(&home, Some(&home.join(".claude")), &dirs);
+        assert_eq!(
+            paths,
+            vec![
+                home.join(".claude").join(".claude.json"),
+                home.join(".claude.json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_secondary_claude_config_yields_its_gateway_entry() {
+        // Found by identity, so the pre-rename `conduit` entry is repaired too.
+        let text = r#"{
+            "mcpServers": {
+                "conduit": {
+                    "type": "stdio",
+                    "command": "/opt/Toolport/bin/conduit-gateway-1.11.0",
+                    "env": { "CONDUIT_PROFILE": "work" }
+                }
+            },
+            "projects": {}
+        }"#;
+        assert_eq!(
+            claude_gateway_entry_in(text),
+            Some((
+                "conduit".to_string(),
+                "/opt/Toolport/bin/conduit-gateway-1.11.0".to_string()
+            ))
+        );
+        // Per-file profile: a sibling is scoped independently of the resolved config.
+        assert_eq!(profile_from_config_text(text).as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn an_unreadable_secondary_config_is_not_read_as_having_no_entry() {
+        // `.claude.json` holds Claude Code's entire application state. Treating a
+        // parse failure as "no gateway entry here" is how a transient failure turns
+        // into a write that flattens the user's whole config.
+        assert_eq!(claude_gateway_entry_in("{ not json"), None);
+        assert_eq!(claude_gateway_entry_in("{}"), None);
+        assert_eq!(claude_gateway_entry_in(r#"{"mcpServers":{}}"#), None);
+        // A server that isn't ours is not ours, whatever it is called.
+        assert_eq!(
+            claude_gateway_entry_in(r#"{"mcpServers":{"sentry":{"command":"npx"}}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn a_secondary_config_is_repaired_only_when_the_entry_is_one_of_ours() {
+        // The repair pass gates on gateway_entry_needs_rewrite, whose provenance
+        // check is what keeps this a repair rather than a takeover: a hand-written
+        // entry under our name belongs to the user even in a config we also write.
+        let current = if cfg!(windows) {
+            r"C:\Users\someone\AppData\Roaming\Toolport\bin\toolport-gateway-1.13.0.exe"
+        } else {
+            "/home/someone/.config/Toolport/bin/toolport-gateway-1.13.0"
+        };
+        let stale = if cfg!(windows) {
+            r"C:\Users\someone\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0.exe"
+        } else {
+            "/home/someone/.config/Toolport/bin/toolport-gateway-1.12.0"
+        };
+        assert!(
+            gateway_entry_needs_rewrite("toolport", stale, current, None),
+            "a superseded gateway binary is exactly what this pass exists to fix"
+        );
+        assert!(
+            !gateway_entry_needs_rewrite("toolport", "npx", current, None),
+            "a custom command must survive a pass over a secondary config"
+        );
+        assert!(
+            !gateway_entry_needs_rewrite("toolport", "", current, None),
+            "an entry with no command is not ours to rewrite"
+        );
+        assert!(
+            !gateway_entry_needs_rewrite("toolport", current, current, None),
+            "an already-current entry must not be rewritten on every launch"
+        );
+    }
+
+    #[test]
+    fn only_the_stale_secondary_claude_configs_are_selected_for_repair() {
+        // The wiring, against real files: which of several Claude profiles actually
+        // get rewritten, and with which profile preserved. This is the step that was
+        // missing before - the resolved config was maintained and every other one
+        // silently kept respawning whatever gateway was current the day it was
+        // written.
+        let dir = temp_path("claude-secondary-repair");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let current = dir.join("toolport-gateway-1.13.0").to_string_lossy().into_owned();
+        std::fs::write(&current, b"binary").unwrap();
+
+        let write = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+        let stale_command = dir.join("toolport-gateway-1.12.0");
+        let stale = write(
+            "stale.json",
+            &format!(
+                r#"{{"mcpServers":{{"toolport":{{"command":{},"env":{{"TOOLPORT_PROFILE":"work"}}}}}},"projects":{{}}}}"#,
+                serde_json::to_string(&stale_command.to_string_lossy().into_owned()).unwrap()
+            ),
+        );
+        let already_current = write(
+            "current.json",
+            &format!(
+                r#"{{"mcpServers":{{"toolport":{{"command":{}}}}}}}"#,
+                serde_json::to_string(&current).unwrap()
+            ),
+        );
+        let customized = write(
+            "custom.json",
+            r#"{"mcpServers":{"toolport":{"command":"npx","args":["-y","something"]}}}"#,
+        );
+        let no_gateway = write("none.json", r#"{"mcpServers":{"sentry":{"command":"npx"}}}"#);
+        let unparseable = write("broken.json", "{ this is not json");
+        let missing = dir.join("does-not-exist.json");
+
+        let repairs = claude_configs_needing_repair(
+            &[
+                stale.clone(),
+                already_current,
+                customized,
+                no_gateway,
+                unparseable,
+                missing,
+            ],
+            &current,
+        );
+
+        assert_eq!(
+            repairs,
+            vec![ClaudeRepair {
+                path: stale,
+                // Preserved per file: dropping it would silently unscope this client.
+                profile: Some("work".to_string()),
+                stored: stale_command.to_string_lossy().into_owned(),
+            }],
+            "only the config pinned to a superseded gateway of ours should be repaired"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
