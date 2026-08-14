@@ -30,6 +30,8 @@ Entries before the rename below shipped under the project's former name, Conduit
   cannot delete it. Strictly a repair: a profile with no Toolport entry does not get one,
   and a hand-customized entry is still left alone.
 
+## [1.13.0] - 2026-08-13
+
 Toolport installs two new ways: as an agent plugin any conformant client can pick up,
 and on Windows through a one-line command instead of a trip to the Releases page.
 Pseudonymization gains the piece it was missing, a way for a human to release one

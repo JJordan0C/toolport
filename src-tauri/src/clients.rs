@@ -405,19 +405,34 @@ fn claude_code_config_paths() -> Vec<PathBuf> {
     let Some(home) = home() else {
         return Vec::new();
     };
-    let dirs: Vec<String> = std::fs::read_dir(&home)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
+    let dirs = match claude_profile_dirs(&home) {
+        Ok(dirs) => dirs,
+        Err(error) => {
+            let msg = format!(
+                "toolport: could not scan {} for secondary Claude Code configs: {error}",
+                home.display()
+            );
+            eprintln!("{msg}");
+            crate::gatewaylog::append(&msg);
+            Vec::new()
+        }
+    };
     claude_code_config_paths_from(&home, claude_config_dir_override().as_deref(), &dirs)
         .into_iter()
         .filter(|p| p.is_file())
         .collect()
+}
+
+/// Directory names directly under home that may hold Claude Code profiles. `Path::is_dir`
+/// deliberately follows symlinks: keeping a work profile on another volume via
+/// `~/.claude-work -> /volume/work-claude` is a supported filesystem shape.
+fn claude_profile_dirs(home: &Path) -> Result<Vec<String>, String> {
+    let entries = std::fs::read_dir(home).map_err(|e| e.to_string())?;
+    Ok(entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect())
 }
 
 /// The env- and filesystem-free half of [`claude_code_config_paths`], so ordering and
@@ -2791,6 +2806,18 @@ fn read_config_file(path: &Path) -> Result<String, String> {
 /// exist yet, or if it isn't a regular file / is over the size cap (we won't copy
 /// a device or a huge file into the backup dir).
 fn backup_file(client_id: &str, path: &Path) -> Result<Option<PathBuf>, String> {
+    let name = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("config");
+    backup_file_named(client_id, path, name)
+}
+
+fn backup_file_named(
+    client_id: &str,
+    path: &Path,
+    backup_name: &str,
+) -> Result<Option<PathBuf>, String> {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() && meta.len() <= MAX_CONFIG_BYTES => {}
         // Missing, special file, or oversized: nothing safe to back up.
@@ -2798,14 +2825,29 @@ fn backup_file(client_id: &str, path: &Path) -> Result<Option<PathBuf>, String> 
     }
     let dir = backup_dir(client_id).ok_or("Could not resolve backup dir")?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let name = path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("config");
-    let dest = dir.join(format!("{}-{}", epoch_millis(), name));
+    let mut stamp = epoch_millis();
+    let dest = loop {
+        let candidate = dir.join(format!("{stamp}-{backup_name}"));
+        if !candidate.exists() {
+            break candidate;
+        }
+        stamp += 1;
+    };
     std::fs::copy(path, &dest).map_err(|e| e.to_string())?;
-    prune_backups(&dir, name);
+    prune_backups(&dir, backup_name);
     Ok(Some(dest))
+}
+
+/// Secondary Claude configs all share the `.claude.json` basename and client id.
+/// Give each full path a stable backup identity so profiles cannot overwrite or prune
+/// one another's recovery copies.
+fn backup_secondary_claude_file(path: &Path) -> Result<Option<PathBuf>, String> {
+    backup_file_named("claude-code", path, &secondary_claude_backup_name(path))
+}
+
+fn secondary_claude_backup_name(path: &Path) -> String {
+    let digest = crate::registry::sha256_hex(&path.to_string_lossy());
+    format!("claude-{}.json", &digest[..16])
 }
 
 /// How many backup generations to keep per client config file. Matches the
@@ -4175,6 +4217,15 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
     })
 }
 
+/// A secondary Claude config has no distinct registry client id. Preserve its frozen
+/// profile and omit `TOOLPORT_CLIENT_ID`; otherwise every secondary resolves through
+/// the primary `claude-code` client scope and silently changes tool sets on repair.
+fn secondary_claude_gateway_entry(profile: Option<&str>) -> Result<ServerEntry, String> {
+    let mut entry = gateway_entry(profile, "claude-code")?;
+    entry.env.retain(|var| var.key != crate::brand::CLIENT_ID);
+    Ok(entry)
+}
+
 /// Parameters for installing a shared-HTTP gateway entry (SOU-407).
 #[derive(Debug, Clone)]
 pub struct SharedHttpSpec {
@@ -4925,8 +4976,8 @@ fn repoint_other_claude_configs(current: &str, outcome: &mut RepointOutcome) {
             profile,
             stored,
         } = repair;
-        let write = gateway_entry(profile.as_deref(), "claude-code").and_then(|entry| {
-            backup_file("claude-code", &path)?;
+        let write = secondary_claude_gateway_entry(profile.as_deref()).and_then(|entry| {
+            backup_secondary_claude_file(&path)?;
             edit_json_gateway(&path, "mcpServers", Some(&entry), true)
         });
         match write {
@@ -5145,6 +5196,49 @@ mod tests {
                 home.join(".claude").join(".claude.json"),
                 home.join(".claude.json"),
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_claude_profile_directories_are_discovered() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_path("claude-symlink-profile");
+        let home = root.join("home");
+        let target = root.join("work-profile");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(".claude.json"), "{}").unwrap();
+        symlink(&target, home.join(".claude-work")).unwrap();
+
+        let dirs = claude_profile_dirs(&home).unwrap();
+        assert!(dirs.iter().any(|name| name == ".claude-work"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_profile_scan_surfaces_read_errors() {
+        let missing = temp_path("missing-claude-profile-home");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert!(claude_profile_dirs(&missing).is_err());
+    }
+
+    #[test]
+    fn secondary_claude_backups_have_per_path_identities() {
+        let home = PathBuf::from(if cfg!(windows) {
+            r"C:\Users\someone"
+        } else {
+            "/home/someone"
+        });
+        let personal = secondary_claude_backup_name(&home.join(".claude.json"));
+        let work = secondary_claude_backup_name(&home.join(".claude-work").join(".claude.json"));
+        assert_ne!(personal, work);
+        assert_eq!(
+            secondary_claude_backup_name(&home.join(".claude-work").join(".claude.json")),
+            work,
+            "the identity must stay stable across launches"
         );
     }
 
@@ -6975,6 +7069,24 @@ command = "npx"
             Some("cursor")
         );
         assert!(uenv.get(crate::brand::PROFILE).is_none());
+    }
+
+    #[test]
+    fn secondary_claude_repair_keeps_profile_without_primary_client_id() {
+        let entry = secondary_claude_gateway_entry(Some("work")).unwrap();
+        let env: std::collections::HashMap<_, _> = entry
+            .env
+            .iter()
+            .map(|e| (e.key.clone(), e.value.clone()))
+            .collect();
+        assert_eq!(
+            env.get(crate::brand::PROFILE).unwrap().as_deref(),
+            Some("work")
+        );
+        assert!(
+            !env.contains_key(crate::brand::CLIENT_ID),
+            "a secondary config must fall through to its own frozen profile"
+        );
     }
 
     // Informational (no assert): prints what the Cursor plugin scanner finds on
