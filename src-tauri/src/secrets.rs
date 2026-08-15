@@ -667,19 +667,83 @@ mod platform;
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 mod platform {
     use keyring::Entry;
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     use super::{account, SERVICE};
 
+    /// Serializes every Secret Service operation in this process (SBS-815).
+    ///
+    /// The `sync-secret-service` backend negotiates a fresh encrypted session
+    /// (`dh-ietf1024-sha256-aes128-cbc-pkcs7`) per operation. gnome-keyring 50
+    /// races its own per-client bookkeeping when several of those land at once
+    /// and aborts the daemon outright (`gkd_secret_service_get_pkcs11_session:
+    /// assertion 'client' failed` -> `aes_negotiate: assertion 'session' failed`
+    /// -> SIGABRT in `g_variant_new_va`). systemd restarts it, but the login
+    /// keyring comes back LOCKED, so a crash costs the user every vault read
+    /// until they unlock it by hand.
+    ///
+    /// These calls used to be serialized for free by the GTK main loop. SBS-813
+    /// moved them onto the blocking pool, where they are genuinely concurrent,
+    /// so the serialization has to be explicit now.
+    static SERVICE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// How long to wait before the single retry in `with_service`. systemd brings
+    /// the daemon back within ~1s of an abort, so one pause slightly longer than
+    /// that turns a crash into a recovered operation.
+    const RETRY_DELAY: Duration = Duration::from_millis(1200);
+
+    /// True when the error means the connection died under us rather than
+    /// answering the question. `NoEntry` is an answer; a dead D-Bus peer is not.
+    fn is_transient(err: &keyring::Error) -> bool {
+        matches!(
+            err,
+            keyring::Error::PlatformFailure(_) | keyring::Error::NoStorageAccess(_)
+        )
+    }
+
+    /// Run one Secret Service operation with the process lock held, retrying it
+    /// once if the service died mid-call.
+    ///
+    /// `op` covers `Entry::new` as well as the read or write itself: building the
+    /// entry already talks to the service to resolve the collection, so it fails
+    /// the same way and has to be inside the retry.
+    ///
+    /// The lock is deliberately held across the retry sleep. Any thread that
+    /// would take it in that window is talking to the same restarting daemon and
+    /// would only fail; and every caller runs on the blocking pool (SBS-813),
+    /// never the GTK main loop, so the wait cannot freeze the UI.
+    ///
+    /// This does NOT serialize against other processes — the gateway runs its own
+    /// copy of this lock. The retry is what covers a crash triggered by the app
+    /// and the gateway probing the service at the same moment.
+    fn with_service<T>(op: impl FnMut() -> Result<T, keyring::Error>) -> Result<T, keyring::Error> {
+        with_service_after(RETRY_DELAY, op)
+    }
+
+    fn with_service_after<T>(
+        delay: Duration,
+        mut op: impl FnMut() -> Result<T, keyring::Error>,
+    ) -> Result<T, keyring::Error> {
+        let _serialized = SERVICE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match op() {
+            Err(e) if is_transient(&e) => {
+                std::thread::sleep(delay);
+                op()
+            }
+            other => other,
+        }
+    }
+
     pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
-        Entry::new(SERVICE, &account(server_id, key))
-            .map_err(|e| e.to_string())?
-            .set_password(value)
+        with_service(|| Entry::new(SERVICE, &account(server_id, key))?.set_password(value))
             .map_err(|e| e.to_string())
     }
 
     pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
-        let entry = Entry::new(SERVICE, &account(server_id, key)).map_err(|e| e.to_string())?;
-        match entry.get_password() {
+        match with_service(|| Entry::new(SERVICE, &account(server_id, key))?.get_password()) {
             Ok(v) => Ok(Some(v)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(e.to_string()),
@@ -687,11 +751,97 @@ mod platform {
     }
 
     pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
-        let entry = Entry::new(SERVICE, &account(server_id, key)).map_err(|e| e.to_string())?;
-        match entry.delete_credential() {
+        match with_service(|| Entry::new(SERVICE, &account(server_id, key))?.delete_credential()) {
             Ok(()) => Ok(()),
             Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(e.to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn dead_daemon() -> keyring::Error {
+            keyring::Error::PlatformFailure("org.freedesktop.secrets vanished".into())
+        }
+
+        /// The gnome-keyring 50 abort recovery path (SBS-815): the daemon dies
+        /// mid-operation, systemd restarts it, and the retry succeeds where the
+        /// first attempt could not.
+        #[test]
+        fn a_secret_service_op_retries_once_when_the_daemon_dies_mid_call() {
+            let calls = AtomicUsize::new(0);
+            let result = with_service_after(Duration::ZERO, || {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(dead_daemon())
+                } else {
+                    Ok("recovered")
+                }
+            });
+
+            assert_eq!(result.unwrap(), "recovered");
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "one retry, not a loop");
+        }
+
+        /// `NoEntry` answers the question, so retrying it would only double the
+        /// D-Bus traffic that causes the crash in the first place.
+        #[test]
+        fn a_secret_service_op_does_not_retry_a_definitive_answer() {
+            let calls = AtomicUsize::new(0);
+            let result = with_service_after(Duration::ZERO, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(keyring::Error::NoEntry)
+            });
+
+            assert!(matches!(result, Err(keyring::Error::NoEntry)));
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry for an answer");
+        }
+
+        /// A service that stays down surfaces the failure instead of retrying
+        /// forever — callers distinguish a read failure from "never saved"
+        /// (SBS-789), so the error has to reach them.
+        #[test]
+        fn a_secret_service_op_gives_up_after_a_single_retry() {
+            let calls = AtomicUsize::new(0);
+            let result = with_service_after(Duration::ZERO, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(dead_daemon())
+            });
+
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "one attempt, one retry");
+        }
+
+        /// The actual fix: concurrent callers never negotiate two sessions at
+        /// once, which is what races gnome-keyring's per-client bookkeeping.
+        #[test]
+        fn secret_service_ops_never_overlap_across_threads() {
+            static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+            static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(|| {
+                        with_service_after(Duration::ZERO, || {
+                            let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+                            MAX_IN_FLIGHT.fetch_max(now, Ordering::SeqCst);
+                            // Wide enough that unserialized threads would overlap.
+                            std::thread::sleep(Duration::from_millis(5));
+                            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                            Ok::<_, keyring::Error>(())
+                        })
+                        .unwrap();
+                    });
+                }
+            });
+
+            assert_eq!(
+                MAX_IN_FLIGHT.load(Ordering::SeqCst),
+                1,
+                "two sessions negotiated at once is exactly what crashes the daemon"
+            );
         }
     }
 }
