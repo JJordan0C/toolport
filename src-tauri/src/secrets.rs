@@ -688,18 +688,46 @@ mod platform {
     /// so the serialization has to be explicit now.
     static SERVICE_LOCK: Mutex<()> = Mutex::new(());
 
-    /// How long to wait before the single retry in `with_service`. systemd brings
-    /// the daemon back within ~1s of an abort, so one pause slightly longer than
-    /// that turns a crash into a recovered operation.
+    /// Base wait before the single retry in `with_service`. systemd brings the
+    /// daemon back within ~1s of an abort, so one pause slightly longer than that
+    /// turns a crash into a recovered operation.
     const RETRY_DELAY: Duration = Duration::from_millis(1200);
 
+    /// Width of the per-process stagger added to `RETRY_DELAY`.
+    const RETRY_JITTER_MS: u64 = 500;
+
     /// True when the error means the connection died under us rather than
-    /// answering the question. `NoEntry` is an answer; a dead D-Bus peer is not.
+    /// answering the question.
+    ///
+    /// Only `PlatformFailure` qualifies. keyring 3.6.3 maps exactly `Locked`,
+    /// `NoResult` and `Prompt` onto `NoStorageAccess` (`secret_service.rs`
+    /// `decode_error`) and everything else — including a vanished D-Bus peer —
+    /// onto `PlatformFailure`. So `NoStorageAccess` never means a dead daemon; it
+    /// means the collection is locked or an unlock prompt was dismissed. Retrying
+    /// it cannot succeed, and it is the state the login keyring comes back in
+    /// after the crash this module guards against, so treating it as transient
+    /// would tax every later vault read with a pointless sleep and could raise a
+    /// second unlock prompt. `NoEntry` is likewise an answer, not a failure.
     fn is_transient(err: &keyring::Error) -> bool {
-        matches!(
-            err,
-            keyring::Error::PlatformFailure(_) | keyring::Error::NoStorageAccess(_)
-        )
+        matches!(err, keyring::Error::PlatformFailure(_))
+    }
+
+    /// Wait before the retry, staggered per process.
+    ///
+    /// The lock above is per process, so a crash can still be triggered by the
+    /// app and the gateway racing each other. If both then slept exactly
+    /// `RETRY_DELAY` they would wake on the same tick and negotiate two sessions
+    /// at once — the same race again, with each side's single retry already
+    /// spent. Offsetting by process id splits the two wake-ups.
+    fn retry_delay() -> Duration {
+        RETRY_DELAY + Duration::from_millis(jitter_ms(std::process::id()))
+    }
+
+    /// Scatter the pid across the jitter window multiplicatively, so the app and
+    /// the gateway — whose pids are usually close, since one spawns the other —
+    /// land far apart in the window rather than a millisecond apart.
+    fn jitter_ms(pid: u32) -> u64 {
+        u64::from(pid).wrapping_mul(2_654_435_761) % RETRY_JITTER_MS
     }
 
     /// Run one Secret Service operation with the process lock held, retrying it
@@ -709,16 +737,20 @@ mod platform {
     /// entry already talks to the service to resolve the collection, so it fails
     /// the same way and has to be inside the retry.
     ///
-    /// The lock is deliberately held across the retry sleep. Any thread that
-    /// would take it in that window is talking to the same restarting daemon and
-    /// would only fail; and every caller runs on the blocking pool (SBS-813),
-    /// never the GTK main loop, so the wait cannot freeze the UI.
+    /// The lock is deliberately held across the retry sleep: any thread that would
+    /// take it in that window is talking to the same restarting daemon and would
+    /// only fail. Most callers are on the blocking pool (SBS-813), but
+    /// `install_gateway` and `uninstall_gateway` are still sync commands that
+    /// reach the vault on the GTK main loop, so a genuine daemon death can stall
+    /// window controls for the delay. Narrowing `is_transient` keeps that off the
+    /// common paths (a locked keyring no longer sleeps at all); moving those two
+    /// commands onto the blocking pool is the real fix and is tracked separately.
     ///
     /// This does NOT serialize against other processes — the gateway runs its own
-    /// copy of this lock. The retry is what covers a crash triggered by the app
-    /// and the gateway probing the service at the same moment.
+    /// copy of this lock. The staggered retry is what covers a crash triggered by
+    /// the app and the gateway probing the service at the same moment.
     fn with_service<T>(op: impl FnMut() -> Result<T, keyring::Error>) -> Result<T, keyring::Error> {
-        with_service_after(RETRY_DELAY, op)
+        with_service_after(retry_delay(), op)
     }
 
     fn with_service_after<T>(
@@ -797,6 +829,49 @@ mod platform {
 
             assert!(matches!(result, Err(keyring::Error::NoEntry)));
             assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry for an answer");
+        }
+
+        /// A locked keyring is exactly the state the daemon comes back in after
+        /// the crash, and keyring reports it as `NoStorageAccess`. Retrying it
+        /// cannot succeed, would tax every later read with a sleep, and can raise
+        /// a second unlock prompt — so it must be attempted once only.
+        #[test]
+        fn a_secret_service_op_does_not_retry_a_locked_keyring() {
+            let calls = AtomicUsize::new(0);
+            let result = with_service_after(Duration::ZERO, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(keyring::Error::NoStorageAccess(
+                    "the collection is locked".into(),
+                ))
+            });
+
+            assert!(matches!(result, Err(keyring::Error::NoStorageAccess(_))));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "a locked collection is an answer, not a dead daemon"
+            );
+        }
+
+        /// The app and the gateway must not wake from the retry on the same tick,
+        /// or they re-run the very race that killed the daemon.
+        #[test]
+        fn the_retry_delay_is_staggered_across_processes() {
+            // Pids one apart: the common case, since the app spawns the gateway.
+            assert_ne!(jitter_ms(4_100), jitter_ms(4_101));
+            assert_ne!(jitter_ms(4_101), jitter_ms(4_102));
+
+            // Adjacent pids land far apart in the window, not a millisecond apart.
+            let gap = jitter_ms(4_100).abs_diff(jitter_ms(4_101));
+            assert!(
+                gap > RETRY_JITTER_MS / 8,
+                "adjacent pids barely separated: {gap}ms"
+            );
+
+            // And the stagger never runs away: every pid stays inside the window.
+            for pid in [1_u32, 2, 999, 65_535, u32::MAX] {
+                assert!(jitter_ms(pid) < RETRY_JITTER_MS);
+            }
         }
 
         /// A service that stays down surfaces the failure instead of retrying
