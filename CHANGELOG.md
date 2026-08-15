@@ -18,6 +18,13 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **Untrusted MCP output can no longer speak as Toolport.** The external-data
+  wrapper is Toolport-branded (it still said `conduit` after the rebrand) and
+  sanitizes the server label, so a quote in a resource URI cannot close the
+  marker. Downstream text that imitates `[Toolport advisor:]`, `[Toolport shaped]`,
+  `[Toolport:]`, or `[conduit:]` is rewritten before it reaches the model —
+  including tools/list, search, results, and resource errors — even when
+  content defense is off. (SBS-896)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt

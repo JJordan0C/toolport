@@ -2859,6 +2859,41 @@ fn explain_match(query: &str, tool: &Value) -> Vec<String> {
     out
 }
 
+/// Rewrite `description` strings in a tool inputSchema so a search hit cannot
+/// deliver a fake Toolport voice (SBS-896).
+fn neutralize_schema_descriptions(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if let Some(s) = map.get("description").and_then(Value::as_str).map(str::to_string)
+            {
+                let next = integrity::neutralize_gateway_voice(&s);
+                if next != s {
+                    map.insert("description".to_string(), Value::String(next));
+                }
+            }
+            for (key, child) in map.iter_mut() {
+                if key != "description" {
+                    neutralize_schema_descriptions(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                neutralize_schema_descriptions(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn neutralize_listed_tool_descriptions(tools: &mut [Value]) {
+    for tool in tools {
+        if let Some(Value::String(s)) = tool.get("description").cloned() {
+            tool["description"] = Value::String(integrity::neutralize_gateway_voice(&s));
+        }
+    }
+}
+
 /// Project selected tools to search results, bounding the total size of their
 /// (sometimes enormous) input schemas. Lazy discovery exists to keep the agent's
 /// context small, so one server's giant schemas must not blow it up: the top
@@ -2875,9 +2910,15 @@ fn project_budgeted(tools: &[&Value]) -> Vec<Value> {
     const TOP_DESC_MAX: usize = 500;
     const MENU_DESC_MAX: usize = 140;
     let truncate = |d: Option<&Value>, max: usize| match d.and_then(|v| v.as_str()) {
-        Some(s) if s.chars().count() > max => {
-            let head: String = s.chars().take(max).collect();
-            Value::String(format!("{head}…"))
+        Some(s) => {
+            // Search is a delivery path for tool descriptions (SBS-896).
+            let s = integrity::neutralize_gateway_voice(s);
+            if s.chars().count() > max {
+                let head: String = s.chars().take(max).collect();
+                Value::String(format!("{head}…"))
+            } else {
+                Value::String(s)
+            }
         }
         _ => d.cloned().unwrap_or(Value::Null),
     };
@@ -2887,10 +2928,12 @@ fn project_budgeted(tools: &[&Value]) -> Vec<Value> {
         .map(|(i, t)| {
             let name = t.get("name").cloned().unwrap_or(Value::Null);
             if i == 0 {
+                let mut schema = t.get("inputSchema").cloned().unwrap_or(Value::Null);
+                neutralize_schema_descriptions(&mut schema);
                 json!({
                     "name": name,
                     "description": truncate(t.get("description"), TOP_DESC_MAX),
-                    "inputSchema": t.get("inputSchema").cloned().unwrap_or(Value::Null),
+                    "inputSchema": schema,
                 })
             } else {
                 json!({
@@ -5316,6 +5359,11 @@ fn defend_and_shape(
     // PII first, then injection defense: the wrap must go around already-
     // pseudonymized text, not the other way round.
     let pii = pseudonymize_if_enabled(reg, client, srv, &mut result);
+    // Brand-spoof neutralization is always-on (SBS-896): a fake
+    // `[Toolport advisor:` must not reach the model even when content
+    // defense is off. Toolport-authored shaping / advisor trailers are
+    // appended after this pass.
+    integrity::neutralize_untrusted_result(&mut result);
     if reg.content_defense_effective() || reg.block_on_injection_effective() {
         let block = reg.should_block_injection_for(srv);
         if let Some(msg) = integrity::defend_content(srv, tool, &mut result, block) {
@@ -7483,7 +7531,9 @@ fn handle_request_with_cancel(
                 // tools/list. Preserve those few tools when the requesting host
                 // explicitly negotiated the UI extension; the rest of the
                 // downstream catalog remains behind lazy discovery.
-                tools.extend(mcp_app_tools_for_client(catalog, allowed, router));
+                let mut app_tools = mcp_app_tools_for_client(catalog, allowed, router);
+                neutralize_listed_tool_descriptions(&mut app_tools);
+                tools.extend(app_tools);
                 let status = status_tool_def();
                 let full_tokens = savings::estimate_tokens(catalog)
                     + savings::estimate_tokens(std::slice::from_ref(&status));
@@ -7528,7 +7578,9 @@ fn handle_request_with_cancel(
                     reg.confirm_destructive,
                     &scoped,
                 );
-                tools.extend(mcp_app_tools_for_client(catalog, allowed, router));
+                let mut app_tools = mcp_app_tools_for_client(catalog, allowed, router);
+                neutralize_listed_tool_descriptions(&mut app_tools);
+                tools.extend(app_tools);
                 // Savings vs. advertising the whole (scoped) catalog + status.
                 let status = status_tool_def();
                 let full_tokens = savings::estimate_tokens(&scoped)
@@ -7581,6 +7633,10 @@ fn handle_request_with_cancel(
             if !relays_mcp_app_html_to_active_client(router, allowed) {
                 scoped.retain(mcp_app_tool_is_model_visible);
             }
+            // `scoped` is an owned clone (scope_tools). Neutralize descriptions
+            // here so a full tools/list cannot deliver a fake Toolport voice
+            // (SBS-896). Lazy-mode meta-tools above are Toolport-authored.
+            neutralize_listed_tool_descriptions(&mut scoped);
             tools.extend(scoped);
             gtrace(&format!(
                 "tools/list -> {} tools (cache={})",
@@ -8265,7 +8321,10 @@ fn handle_request_with_cancel(
                     return Some(error(
                         id,
                         -32602,
-                        &format!("Toolport: no server owns resource '{uri}'"),
+                        &format!(
+                            "Toolport: no server owns resource '{}'",
+                            integrity::sanitize_wrapper_label(uri)
+                        ),
                     ));
                 }
             }
@@ -8304,17 +8363,30 @@ fn handle_request_with_cancel(
                     if !preserve_mcp_app {
                         // Same owning-server id content defense uses below, so a
                         // resource's values are credited to the server that served it.
+                        // PII origins stay on the raw registry id (see
+                        // a_resource_and_a_tool_on_one_server_share_an_origin_identity).
                         let owner = router.resource_server(uri).unwrap_or(uri);
                         pseudonymize_if_enabled(reg, client, owner, &mut result);
+                        // Always-on: do not let a resource body speak as Toolport
+                        // when content defense is off (SBS-896). Skip MCP App HTML.
+                        integrity::neutralize_untrusted_result(&mut result);
                     }
                     if !preserve_mcp_app
                         && (reg.content_defense_effective() || reg.block_on_injection_effective())
                     {
-                        let srv = router.resource_server(uri).unwrap_or(uri);
-                        let block = reg.should_block_injection_for(srv);
-                        if let Some(msg) =
-                            integrity::defend_content(uri, "resource", &mut result, block)
-                        {
+                        let owner = router.resource_server(uri);
+                        // Wrapper / block message get a sanitized owner, never the
+                        // raw URI (SBS-896). Exempt-map lookup keeps the raw owner.
+                        let wrapper_label = owner
+                            .map(integrity::sanitize_wrapper_label)
+                            .unwrap_or_else(|| "resource".to_string());
+                        let block = reg.should_block_injection_for(owner.unwrap_or("resource"));
+                        if let Some(msg) = integrity::defend_content(
+                            &wrapper_label,
+                            "resource",
+                            &mut result,
+                            block,
+                        ) {
                             return Some(error(id, -32602, &msg));
                         }
                     }
@@ -8330,7 +8402,16 @@ fn handle_request_with_cancel(
                 Err(e) => Some(error(
                     id,
                     -32602,
-                    &format!("Toolport: {}", integrity::defend_error_text(uri, &e)),
+                    &format!(
+                        "Toolport: {}",
+                        integrity::defend_error_text(
+                            &router
+                                .resource_server(uri)
+                                .map(integrity::sanitize_wrapper_label)
+                                .unwrap_or_else(|| "resource".to_string()),
+                            &e,
+                        )
+                    ),
                 )),
             }
         }
@@ -8406,6 +8487,7 @@ fn handle_request_with_cancel(
                     // Independent of content defense, same reasoning as resources.
                     let owner = router.prompt_server(name).unwrap_or(name);
                     pseudonymize_if_enabled(reg, client, owner, &mut result);
+                    integrity::neutralize_untrusted_result(&mut result);
                     if reg.content_defense_effective() || reg.block_on_injection_effective() {
                         let srv = router.prompt_server(name).unwrap_or(name);
                         let block = reg.should_block_injection_for(srv);
@@ -9257,7 +9339,10 @@ fn handle_resource_subscription(
         return Some(error(
             id,
             -32602,
-            &format!("Toolport: no server owns resource '{uri}'"),
+            &format!(
+                "Toolport: no server owns resource '{}'",
+                integrity::sanitize_wrapper_label(uri)
+            ),
         ));
     };
     if let Some(set) = allowed {
@@ -9265,7 +9350,10 @@ fn handle_resource_subscription(
             return Some(error(
                 id,
                 -32602,
-                &format!("Toolport: no server owns resource '{uri}'"),
+                &format!(
+                    "Toolport: no server owns resource '{}'",
+                    integrity::sanitize_wrapper_label(uri)
+                ),
             ));
         }
     }
@@ -9318,7 +9406,10 @@ fn handle_resource_subscription(
                             return Some(success(id, json!({})));
                         }
                         Err(e) => {
-                            let msg = integrity::defend_error_text(uri, &e);
+                            let msg = integrity::defend_error_text(
+                                &integrity::sanitize_wrapper_label(&owner),
+                                &e,
+                            );
                             let mut table = state
                                 .resource_subs
                                 .lock()
@@ -23664,9 +23755,10 @@ mod tests {
             None,
         )
         .unwrap();
+        // Brand is Toolport after SBS-896 (was the pre-rebrand `conduit` marker).
         assert!(ordinary["result"]["contents"][0]["text"]
             .as_str()
-            .is_some_and(|text| text.starts_with("[conduit: the following is external data")));
+            .is_some_and(|text| text.starts_with("[Toolport: the following is external data")));
     }
 
     #[test]
