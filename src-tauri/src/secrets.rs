@@ -734,8 +734,21 @@ mod platform {
     /// lock file was contended would be a worse outcome than the race it guards.
     fn cross_process_guard() -> Option<crate::registry::FileLock> {
         let dir = crate::registry::conduit_dir()?;
-        crate::registry::lock_at(&dir.join("secret-service")).ok()
+        crate::registry::lock_at_for(&dir.join("secret-service"), LOCK_TIMEOUT).ok()
     }
+
+    /// Deadline for `cross_process_guard`, deliberately NOT the registry's 5s
+    /// default. That default is sized for a load-modify-save of a whole file;
+    /// this lock guards one D-Bus call that normally takes tens of milliseconds.
+    ///
+    /// The longest a peer can legitimately hold it is its own staggered retry:
+    /// `RETRY_DELAY` plus the widest slot (1200 + 4 × 150 = 1800ms) plus the two
+    /// attempts either side. 2.5s covers that with headroom and still bounds the
+    /// wait — which matters because `install_gateway` and `uninstall_gateway`
+    /// reach the vault on the GTK main loop, where 5s of held lock would be a
+    /// visible freeze. Past the deadline the operation proceeds unlocked rather
+    /// than failing, so this caps a stall; it does not turn one into an error.
+    const LOCK_TIMEOUT: Duration = Duration::from_millis(2500);
 
     /// Wait before the retry, staggered per process.
     ///
@@ -933,6 +946,28 @@ mod platform {
                     gaps.len()
                 );
             }
+        }
+
+        /// The cross-process deadline has to sit in a window: long enough to wait
+        /// out a peer's staggered retry (giving up exactly while the daemon is
+        /// restarting would drop the serialization when it matters most), short
+        /// enough that a held lock is not a visible freeze on the GTK main-loop
+        /// callers. Pins the relationship so bumping the retry constants alone
+        /// cannot silently invalidate it.
+        #[test]
+        fn the_cross_process_deadline_outlasts_a_peer_retry_but_stays_bounded() {
+            let widest_retry_sleep =
+                RETRY_DELAY + Duration::from_millis((RETRY_SLOTS - 1) * RETRY_SLOT_MS);
+
+            assert!(
+                LOCK_TIMEOUT > widest_retry_sleep,
+                "{LOCK_TIMEOUT:?} would abandon the lock while a peer is still retrying \
+                 ({widest_retry_sleep:?})"
+            );
+            assert!(
+                LOCK_TIMEOUT < Duration::from_secs(5),
+                "the registry's 5s default is for a file rewrite, not one D-Bus call"
+            );
         }
 
         /// A hash that funnelled every nearby pid into one slot would separate
