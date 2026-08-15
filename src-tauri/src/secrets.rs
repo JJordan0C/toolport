@@ -693,8 +693,16 @@ mod platform {
     /// turns a crash into a recovered operation.
     const RETRY_DELAY: Duration = Duration::from_millis(1200);
 
-    /// Width of the per-process stagger added to `RETRY_DELAY`.
-    const RETRY_JITTER_MS: u64 = 500;
+    /// Distinct retry slots a process can land in. A process occupies exactly one,
+    /// so two processes are either in the same slot or a whole `RETRY_SLOT_MS`
+    /// apart — a continuous jitter cannot promise that, and a linear
+    /// `pid * k % window` is worse still: it puts every pid pair a fixed distance
+    /// apart, so a whole class of pid spacings collapses onto a few milliseconds.
+    const RETRY_SLOTS: u64 = 5;
+
+    /// Slot width, comfortably longer than one DH session negotiation, so two
+    /// processes in different slots cannot overlap their handshakes.
+    const RETRY_SLOT_MS: u64 = 150;
 
     /// True when the error means the connection died under us rather than
     /// answering the question.
@@ -712,22 +720,44 @@ mod platform {
         matches!(err, keyring::Error::PlatformFailure(_))
     }
 
-    /// Wait before the retry, staggered per process.
+    /// Cross-process serialization for Secret Service access.
     ///
-    /// The lock above is per process, so a crash can still be triggered by the
-    /// app and the gateway racing each other. If both then slept exactly
-    /// `RETRY_DELAY` they would wake on the same tick and negotiate two sessions
-    /// at once — the same race again, with each side's single retry already
-    /// spent. Offsetting by process id splits the two wake-ups.
-    fn retry_delay() -> Duration {
-        RETRY_DELAY + Duration::from_millis(jitter_ms(std::process::id()))
+    /// `SERVICE_LOCK` only covers this process, but the app and the gateway are
+    /// two processes talking to the same daemon and either pair racing is enough
+    /// to abort it. This is the registry's own file-lock primitive on a dedicated
+    /// `secret-service.lock`, so both binaries queue behind one another instead of
+    /// negotiating sessions at the same moment.
+    ///
+    /// Best effort on purpose. If the lock cannot be taken — no data directory, or
+    /// a peer held it past the timeout — the operation still runs under the
+    /// in-process mutex and the staggered retry. Failing a vault read because a
+    /// lock file was contended would be a worse outcome than the race it guards.
+    fn cross_process_guard() -> Option<crate::registry::FileLock> {
+        let dir = crate::registry::conduit_dir()?;
+        crate::registry::lock_at(&dir.join("secret-service")).ok()
     }
 
-    /// Scatter the pid across the jitter window multiplicatively, so the app and
-    /// the gateway — whose pids are usually close, since one spawns the other —
-    /// land far apart in the window rather than a millisecond apart.
-    fn jitter_ms(pid: u32) -> u64 {
-        u64::from(pid).wrapping_mul(2_654_435_761) % RETRY_JITTER_MS
+    /// Wait before the retry, staggered per process.
+    ///
+    /// Belt and braces behind `cross_process_guard`: when that lock is
+    /// unavailable, a crash can still be triggered by the app and the gateway
+    /// racing. If both then slept exactly `RETRY_DELAY` they would wake on the
+    /// same tick and negotiate two sessions at once — the same race again, with
+    /// each side's single retry already spent.
+    fn retry_delay() -> Duration {
+        RETRY_DELAY + Duration::from_millis(retry_slot(std::process::id()) * RETRY_SLOT_MS)
+    }
+
+    /// Which retry slot this pid occupies, via splitmix64's finalizer: one changed
+    /// bit in the pid changes about half the output bits, so pids differing by 1,
+    /// 2 or 4 — the usual spacing when one process spawns another — do not fall
+    /// into a fixed pattern the way a plain multiply-and-mod does.
+    fn retry_slot(pid: u32) -> u64 {
+        let mut z = u64::from(pid).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        z % RETRY_SLOTS
     }
 
     /// Run one Secret Service operation with the process lock held, retrying it
@@ -746,9 +776,8 @@ mod platform {
     /// common paths (a locked keyring no longer sleeps at all); moving those two
     /// commands onto the blocking pool is the real fix and is tracked separately.
     ///
-    /// This does NOT serialize against other processes — the gateway runs its own
-    /// copy of this lock. The staggered retry is what covers a crash triggered by
-    /// the app and the gateway probing the service at the same moment.
+    /// Other processes are covered by `cross_process_guard`; the staggered retry
+    /// backs that up for the case where the file lock could not be taken.
     fn with_service<T>(op: impl FnMut() -> Result<T, keyring::Error>) -> Result<T, keyring::Error> {
         with_service_after(retry_delay(), op)
     }
@@ -757,9 +786,12 @@ mod platform {
         delay: Duration,
         mut op: impl FnMut() -> Result<T, keyring::Error>,
     ) -> Result<T, keyring::Error> {
+        // Always this order — in-process mutex, then the file lock — so two
+        // threads can never hold one and wait on the other.
         let _serialized = SERVICE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _across_processes = cross_process_guard();
         match op() {
             Err(e) if is_transient(&e) => {
                 std::thread::sleep(delay);
@@ -854,24 +886,55 @@ mod platform {
         }
 
         /// The app and the gateway must not wake from the retry on the same tick,
-        /// or they re-run the very race that killed the daemon.
+        /// or they re-run the very race that killed the daemon. Slots make the
+        /// separation structural: different slot => a full `RETRY_SLOT_MS` apart,
+        /// never a few milliseconds.
         #[test]
-        fn the_retry_delay_is_staggered_across_processes() {
-            // Pids one apart: the common case, since the app spawns the gateway.
-            assert_ne!(jitter_ms(4_100), jitter_ms(4_101));
-            assert_ne!(jitter_ms(4_101), jitter_ms(4_102));
-
-            // Adjacent pids land far apart in the window, not a millisecond apart.
-            let gap = jitter_ms(4_100).abs_diff(jitter_ms(4_101));
-            assert!(
-                gap > RETRY_JITTER_MS / 8,
-                "adjacent pids barely separated: {gap}ms"
-            );
-
-            // And the stagger never runs away: every pid stays inside the window.
-            for pid in [1_u32, 2, 999, 65_535, u32::MAX] {
-                assert!(jitter_ms(pid) < RETRY_JITTER_MS);
+        fn the_retry_stagger_separates_processes_by_a_whole_slot() {
+            for pid in [1_u32, 2, 999, 4_100, 65_535, u32::MAX] {
+                assert!(retry_slot(pid) < RETRY_SLOTS, "slot out of range for {pid}");
             }
+
+            // Two processes in different slots are a whole slot apart, which is
+            // longer than the DH handshake they must not overlap.
+            let delay_of = |pid: u32| retry_slot(pid) * RETRY_SLOT_MS;
+            let a = 4_100_u32;
+            let b = (a + 1..).find(|p| retry_slot(*p) != retry_slot(a)).unwrap();
+            assert!(delay_of(a).abs_diff(delay_of(b)) >= RETRY_SLOT_MS);
+        }
+
+        /// The failure mode of the multiply-and-mod stagger this replaced: it was
+        /// linear, so EVERY pair of pids a given distance apart landed the same
+        /// fixed gap apart (22ms for a delta of 2), and a whole class of spawn
+        /// spacings collapsed together. A mixing hash must not do that.
+        #[test]
+        fn the_retry_stagger_does_not_map_a_pid_delta_to_one_fixed_gap() {
+            for delta in [1_u32, 2, 4] {
+                let gaps: std::collections::HashSet<u64> = (4_000_u32..4_200)
+                    .map(|pid| {
+                        (retry_slot(pid) * RETRY_SLOT_MS)
+                            .abs_diff(retry_slot(pid + delta) * RETRY_SLOT_MS)
+                    })
+                    .collect();
+                assert!(
+                    gaps.len() > 2,
+                    "delta {delta} produces only {} distinct gap(s) — the stagger is linear",
+                    gaps.len()
+                );
+            }
+        }
+
+        /// A hash that funnelled every nearby pid into one slot would separate
+        /// nothing, so check the slots are actually used.
+        #[test]
+        fn the_retry_stagger_uses_every_slot() {
+            let used: std::collections::HashSet<u64> =
+                (4_000_u32..4_100).map(retry_slot).collect();
+            assert_eq!(
+                used.len() as u64,
+                RETRY_SLOTS,
+                "100 consecutive pids should reach all {RETRY_SLOTS} slots, saw {used:?}"
+            );
         }
 
         /// A service that stays down surfaces the failure instead of retrying
