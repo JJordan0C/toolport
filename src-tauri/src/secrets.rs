@@ -763,9 +763,11 @@ mod platform {
     /// Run one Secret Service operation with the process lock held, retrying it
     /// once if the service died mid-call.
     ///
-    /// `op` covers `Entry::new` as well as the read or write itself: building the
-    /// entry already talks to the service to resolve the collection, so it fails
-    /// the same way and has to be inside the retry.
+    /// `op` covers `Entry::new` as well as the read or write, but only for
+    /// convenience: in keyring 3.6.3 `Entry::new` just builds an in-memory
+    /// attribute map (`SsCredential::new_with_target`) and never touches D-Bus.
+    /// The retry exists for the read or write that follows it, which is where
+    /// `SecretService::connect` opens the session.
     ///
     /// The lock is deliberately held across the retry sleep: any thread that would
     /// take it in that window is talking to the same restarting daemon and would
@@ -794,8 +796,17 @@ mod platform {
         let _across_processes = cross_process_guard();
         match op() {
             Err(e) if is_transient(&e) => {
+                // Say so. Otherwise the only evidence that SBS-815 recovery ran
+                // is a 1.2-1.7s stall, and a vault failure that persists past the
+                // retry (the keyring coming back LOCKED, say) looks identical to
+                // one that never had a daemon crash behind it.
+                eprintln!("conduit: secret service died mid-call ({e}); retrying once");
                 std::thread::sleep(delay);
-                op()
+                let retried = op();
+                if let Err(e) = &retried {
+                    eprintln!("conduit: secret service still failing after the retry ({e})");
+                }
+                retried
             }
             other => other,
         }
