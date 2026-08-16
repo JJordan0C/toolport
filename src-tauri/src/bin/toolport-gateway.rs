@@ -22595,7 +22595,7 @@ mod tests {
             profile: personal,
         });
         let (allowed, caller) =
-            resolve_http_caller(&reg, None, Some("tok-personal"), false).unwrap();
+            resolve_http_caller(&reg, None, Some("tok-personal"), false, true).unwrap();
         let set = allowed.expect("Personal client is scoped");
         assert!(set.contains("team-slack"));
         assert!(
