@@ -32,9 +32,25 @@ static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// its first rotation, including `gateway.log`, which publishes the HITL broker's
 /// bound port, and `inspect`'s raw request and response bodies (SBS-868).
 ///
-/// The mode is applied at creation, not after: setting it afterwards leaves a
-/// window in which the file exists world-readable. On Windows this is a no-op,
-/// the same way [`AtomicWriteOps::set_owner_only`] is.
+/// Two halves, because one is not enough:
+///
+/// 1. `mode(0o600)` at open, so a file this creates is never BORN 0644. Setting
+///    the mode after creating it would leave a window in which the file exists
+///    world-readable.
+/// 2. A tighten pass on the opened handle, because `mode()` is an `open(2)`
+///    create mask and POSIX applies it only when the inode is born. Every file
+///    that already exists from a build before this one is 0644 and would stay
+///    0644 forever: `oauth-debug.log` never rotates, and `inspect.jsonl` is not
+///    opened at all while capture is off, so neither ever reaches
+///    [`atomic_write`]'s 0600 rewrite. Without this an upgrade fixes nothing for
+///    an existing install, which is every install.
+///
+/// The tighten is scoped to the file being written, at the moment of writing,
+/// and only when the mode is actually wider - the same rule `atomic_write`
+/// already applies on rotation. It is not a startup sweep over the data dir.
+///
+/// On Windows both halves are a no-op, the same way
+/// [`AtomicWriteOps::set_owner_only`] is.
 pub fn open_append_private(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
@@ -43,7 +59,16 @@ pub fn open_append_private(path: &Path) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = file.metadata()?.permissions().mode();
+        if mode & 0o177 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(file)
 }
 
 trait AtomicWriteOps {
