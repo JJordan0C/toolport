@@ -97,8 +97,13 @@ which is also exactly what CI runs:
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib
-cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib registry
+cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib clients
 ```
+
+A filter runs a different subset than the full suite does, which can expose test
+interference the whole run happens to avoid. If a filtered run fails, re-run the
+named test on its own before assuming your change caused it, and check whether
+it also fails on `main` (SBS-904 is one such case).
 
 **Only `desktop.rs` itself needs the full build.** That module is
 `#[cfg(feature = "desktop")]`, so a test you add there does not run under
