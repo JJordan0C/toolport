@@ -18,13 +18,19 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
-- **A failed registry load no longer counts as "no HTTP clients".** `--insecure-loopback`
-  treats an empty `http_clients` list as permission to bind and serve without a bearer.
-  Boot used to fall back to `Registry::default()` on `load_resolved` Err, which is also
-  empty, so a corrupt or unreadable registry silently satisfied that precondition. The
-  open branch now requires a successful load _and_ no registered clients. A missing
-  registry file was already `Ok(default)` and is unchanged. A failed load with
-  `TOOLPORT_HTTP_TOKEN` still binds. (SBS-900)
+- **A registry that was not really read no longer counts as "no HTTP clients".**
+  `--insecure-loopback` treats an empty `http_clients` list as permission to bind and
+  serve without a bearer, and that list came back empty for three unrelated reasons: a
+  load error falling back to `Registry::default()`, a load that could not read the file
+  at all (locked, permissions) and reported it as absent, and a load recovered from a
+  backup, which is the state before the last save and so is missing exactly the save
+  that registered the first client. Loading now reports where the registry came from,
+  and the open branch requires a load that actually saw the configured state. The check
+  is also live rather than decided at boot: the file watcher republishes that verdict
+  with every reload, so a registry corrupted while the gateway runs closes the listener
+  instead of quietly re-opening it. A missing registry file is a real first run and still
+  opens with `--insecure-loopback`, and a failed load with `TOOLPORT_HTTP_TOKEN` still
+  binds. (SBS-900)
 - **Connect keeps stow/chezmoi config symlinks.** Writing a client config
   (Connect, Disconnect, migrate, launch-time re-point) used to replace a
   symlink at the config path with a regular file, leaving the file in the
