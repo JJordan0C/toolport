@@ -6,8 +6,41 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-08-16
+
+Agents can now keep what worked. A proven multi-tool orchestration can become a
+saved routine that survives sessions and clients, with a human approving the exact
+definition every time one is persisted.
+
+The rest of the release is mostly a security pass, and the credential one is the
+reason to upgrade rather than wait: the redaction gate in front of the public share
+link, the diagnostics bundle and the team config push missed several of the most
+ordinary ways a key is spelled, so live tokens could ride out to a public URL. Two
+more findings in the same family are closed here, along with a set of local-file
+permissions that were wider than intended and an installer that never checked who
+signed the build it was about to install.
+
+Underneath that is the same defect this project keeps finding in new places: code
+that reads a failed probe as good news. A failed reload signal, a failed vault read,
+a failed restart check, a failed backup stat could each come back looking like
+success. Each one now fails closed and says so.
+
 ### Added
 
+- **Persistent agent routines.** A proven multi-tool Code Mode orchestration can be
+  promoted into a saved, parameterized routine that outlives the session and works
+  from any client. Promotion is the only way in: `toolport_run_script` gains an
+  immutable input mode (inputs schema-validated, deep-frozen in the VM, dropped after
+  assessment), only immutable runs are promotion-eligible, and `toolport_save_routine`
+  takes a `runId` rather than source, so free-typed source can never be persisted.
+  Every save raises a one-shot desktop approval card showing the business summary,
+  the calls, the dependencies, the risk class and the content hash, with no
+  session-wide or always-allow shortcut. Saved routines are advertised as first-class
+  tools and preflight their arguments against the stored schema and observed
+  dependency fingerprints, failing closed to code mode on drift. A routine advisor
+  watches for repeated same-shape calls and puts strong candidates in a passive
+  Suggested routines queue in Settings, rather than prompting the model in-band.
+  Writes are off until you turn them on. (#625)
 - **Short install commands.** `irm https://toolport.app/install.ps1 | iex` on Windows and
   `curl -fsSL https://toolport.app/install.sh | bash` on macOS and Linux, replacing the
   86-character raw.githubusercontent URLs. Both redirect to a pinned commit rather than
@@ -15,6 +48,75 @@ Entries before the rename below shipped under the project's former name, Conduit
   to change without a reviewed change on both sides.
 - **winget package.** `winget install Toolport.Toolport` on Windows once the manifest is
   published, and each release submits its own update.
+- **The audit log records which client made the call.** Records carry the caller's
+  name alongside the server and tool, so an audit answers "who invoked this?" rather
+  than only "what ran?". (#722)
+- **Re-approve every drifted tool at once.** A lost or unreadable pin baseline used to
+  leave the catalog hidden with no way back except approving each tool by hand.
+  The baseline is recoverable, and a bulk **Re-approve all** clears a whole drift set
+  in one deliberate action. (#747)
+
+### Security
+
+- **Credentials no longer ride out through share links, diagnostics or the team push.**
+  One redaction gate sits in front of three egress paths: the public share link, the
+  diagnostics bundle people paste into issues, and the team config push that reaches
+  the org control plane and every teammate. It missed the ordinary spellings:
+  `--api-key=sk-...`, `--header=Authorization: Bearer ...`, `X-API-Key:`, `Cookie:`,
+  and the split form `--token sk-...`, whose value sits in its own argument with
+  nothing on it to recognise. Redaction now reads the whole argument list rather than
+  one argument at a time, so the split form is caught, and the flag name stays visible
+  while its value goes. A shared setup is meant to be readable, not to carry your keys.
+  (SBS-889)
+- **A server that echoes your API key no longer writes it into the audit log.** The
+  audited error text is the defended body, but "defended" is not "secret-free": the
+  injection scan looks for instruction overrides and the PII pass matches PII shapes,
+  and an API key is neither. A server answering `invalid api key sk-live-...` put a
+  live credential into `audit.jsonl` and into every CSV exported from it. No attacker
+  needed, just a server that echoes its input on failure. A credential pass now runs
+  over the text before it is stored, and it reads JSON bodies as well as prose while
+  leaving an ordinary failure message readable. (SBS-890)
+- **Local logs are owner-only from the start.** Ten append-mode logs were created with
+  the process umask, which under the usual 022 means world-readable, and only became
+  owner-only at their first size-triggered rotation. `oauth-debug.log` never rotates
+  and `inspect.jsonl` is not touched while capture is off, so those two never got
+  there at all. This matters most for `gateway.log`, which records the local approval
+  broker's bound port: on a shared machine a second OS account could read it. Every
+  log is now created 0600 and an existing wider file is tightened on next write, so an
+  upgrade fixes the files you already have. No-op on Windows. (SBS-868)
+- **The macOS installer checks who signed the build.** `codesign --verify` only proves
+  a bundle satisfies its own embedded requirement, so an artifact tampered with before
+  upload and re-signed with any other Developer ID would have passed. The installer now
+  requires Toolport's team identifier and fails closed otherwise. It also stages the
+  new app and swaps by rename, where it used to delete the installed app before
+  copying: an interrupted install could leave a machine with no Toolport at all.
+  (SBS-897)
+- **The installers' cross-OS hints stop routing around the pinned-commit rule.**
+  `toolport.app/install.sh` and `/install.ps1` redirect to a pinned commit precisely
+  because they are piped into a shell, and both scripts then told a user on the other
+  OS to fetch the unpinned `main` copy. Both hints use the pinned URLs now, and CI
+  fails on any reference to a movable ref. (SBS-894)
+- **A downstream server cannot forge Toolport's own error envelope.** A private field
+  the gateway uses to report protocol errors was honoured on results coming back from
+  a server, which let a hostile server author an error attributed to Toolport and skip
+  the whole content-defense layer for that result. It is now stripped at the transport
+  boundary, before anything reads it. (SBS-891)
+- **A revoked token can no longer stay live.** The generation bump that tells a running
+  gateway to reload swallowed a failed registry write, so a revoke could remove the
+  credential from the keychain, never reach the gateway, and still report success. The
+  failure is now propagated and the partial outcome is stated plainly. (#737)
+- **A locked or unreadable keyring is no longer read as "no secret stored".** A failed
+  vault read used to be indistinguishable from an absent secret, so Toolport could mint
+  a replacement bearer, report a missing refresh token, or show a stale secret status.
+  Each of those paths now distinguishes the error from the absence. (SBS-840, SBS-841,
+  #758)
+- **Disconnect fails loudly when the shared HTTP bearer cannot be revoked.** Reporting
+  a client disconnected while its token still works is the one outcome that matters
+  here. (SBS-845)
+- **The npx spawn guard covers the eval flags it missed, and Teams stops following
+  redirects with a member bearer.** A redirect would have replayed
+  `Authorization: Bearer` to a host of the redirector's choosing; team servers under
+  review are now an execution gate rather than a label. (#711, #713)
 
 ### Fixed
 
@@ -151,12 +253,10 @@ Entries before the rename below shipped under the project's former name, Conduit
   link and update the target, so the path under home stays a symlink.
   (SBS-886)
 
-> > > > > > > origin/main
-
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
-  users to run `toolport`.
+  users to run `toolport`. (SBS-846)
 - **A second Claude Code profile no longer gets stuck on an old gateway.**
   `CLAUDE_CONFIG_DIR` is usually set per shell or per launcher rather than exported, so a
   machine often has several Claude configs (a personal `~/.claude` beside a work
@@ -168,6 +268,81 @@ Entries before the rename below shipped under the project's former name, Conduit
   now re-pointed on launch, and each one's gateway binary counts as referenced so pruning
   cannot delete it. Strictly a repair: a profile with no Toolport entry does not get one,
   and a hand-customized entry is still left alone.
+- **A failed old-gateway check no longer hides the warning.** Settings swallowed the
+  error, so "no apps need a restart" and "we could not find out" looked identical. The
+  failure is now shown with a Retry that re-runs the check in place, and running
+  **Stop old gateways** clears it, since that result answers the same question. (#730)
+- **A failed backup stat aborts the config write.** The pre-write backup is what makes
+  a client-config write recoverable; continuing without one turned a safety step into
+  a silent no-op. (#745)
+- **A transient registry read failure retries instead of showing an empty app.**
+  A reload that lost a race with a write used to leave the UI looking like a machine
+  with nothing configured. (#724)
+- **A failed quarantine poll is no longer reported as a confirmed zero.** "Nothing is
+  quarantined" and "we could not ask" are different answers, and only one of them is
+  reassuring. (#741)
+- **Launch at login stays disabled until the OS state is actually known.** The switch
+  used to render as a verified Off while the real value was still unread. (#721)
+- **The gateway routes every tool it advertises.** The collapse guard could keep a tool
+  in the catalog whose route had been dropped, so a model could call something that
+  then failed to resolve. (#717)
+- **`install.sh` verifies its downloads like `install.ps1` already did.** Per-asset
+  digest, published size, https-only URLs, and the AppImage now stages in a temp
+  directory so a failed verification cannot delete a working install. (#744)
+- **Linux fixes.** AppImage launch-at-login points at `$APPIMAGE` rather than the
+  FUSE mount that disappears between runs; the bundled gateway is recopied when its
+  contents change rather than only its size; `XDG_CONFIG_HOME` is honoured for Zed,
+  Goose and AnythingLLM; a crash in gnome-keyring under concurrent Secret Service
+  sessions is avoided by serializing them and retrying a dead daemon; and blocking
+  file and keychain reads no longer run on the GTK main loop, which is what made the
+  window controls stop responding. (SBS-844, SBS-843, SBS-847, SBS-815, SBS-813)
+- **Concurrent OAuth sign-ins agree on the outcome.** A lock drop that failed to record
+  its verdict let a waiting process treat an unfinished attempt as a completed one.
+  (SBS-842)
+- **The audit log survives concurrent appends and rotation.** Append and rotate are
+  serialized, so a rotation cannot drop a record another process just wrote. (#708)
+- **Opening the data folder reports its failure.** It used to fail silently, leaving
+  the button looking broken rather than the action. (#768)
+- **Hermes is detected at its Windows platform config path.** (#746)
+- **A rich confirmation dialog renders valid markup.** Descriptions containing block
+  elements produced invalid DOM nesting. (#723)
+- **The onboarding dialog is named for screen readers**, and the role choice exposes
+  its selected state. (#726)
+
+### Internal
+
+- **Clippy runs in CI.** (#749)
+- **Tests stopped depending on the machine that runs them.** Four launcher tests read
+  the developer's real npx cache, and the SSRF tests assumed `.invalid` never resolves,
+  which is not true behind a resolver that answers every name. Both now inject what
+  they were reading from the host, so a clean checkout is green. (SBS-839, SBS-827)
+- Three multi-process contention tests no longer flake on a loaded runner. (SBS-895)
+
+### Thanks
+
+A big cycle for contributions: fifteen of the patches below came from outside, including
+the routines feature that leads this release.
+
+- **[forever-ivy](https://github.com/forever-ivy)** - persistent agent routines, the
+  headline feature of this release: immutable runs, human-approved promotion, first-class
+  routine tools and the Suggested routines queue (#706). Also the registry-reload retry
+  (#724), and the report that our SSRF tests fail behind a resolver that answers every
+  name, which turned out to be right and is fixed here (SBS-827).
+- **[aryansk](https://github.com/aryansk)** - eight patches: download verification in
+  `install.sh` (#744), the failed-reload-signal fix that stops a revoked token staying
+  live (#743), the quarantine poll that no longer reads as a confirmed zero (#742), the
+  aborted write on a failed backup stat (#745), routing every advertised tool (#717),
+  launch-at-login state (#721), valid dialog markup (#723), and onboarding
+  accessibility (#726).
+- **[joyheroes](https://github.com/joyheroes)** - surfaced two silently swallowed
+  failures: the old-gateway restart check (#778) and opening the data folder (#768).
+- **[BharadwajKanneveti](https://github.com/BharadwajKanneveti)** - the caller name in
+  audit records, so an audit says who invoked a tool (#722).
+- **[Vermitrude](https://github.com/Vermitrude)** - the Clippy gate in CI (#749).
+- **[rohankumardubey](https://github.com/rohankumardubey)** - serialized audit append
+  and rotation (#708).
+
+If we missed you, open an issue.
 
 ## [1.13.0] - 2026-08-13
 
