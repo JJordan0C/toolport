@@ -79,8 +79,14 @@ fn require_secure_team_url(server_url: &str) -> Result<(), String> {
 /// public name whose first lookup merely fails - turned the guard off and let the
 /// connection land on RFC1918.
 fn block_private_for_team_url(server_url: &str) -> bool {
+    block_private_for_team_url_with(server_url, &crate::oauth::resolve_host)
+}
+
+/// [`block_private_for_team_url`] with the resolver passed in, so the NXDOMAIN case
+/// can be tested without asking whichever DNS the developer is behind (SBS-827).
+fn block_private_for_team_url_with(server_url: &str, resolve: crate::oauth::HostResolver) -> bool {
     let host = crate::oauth::host_of_url(server_url).unwrap_or_default();
-    !crate::oauth::host_is_definitely_private(&host)
+    !crate::oauth::host_is_definitely_private_with(&host, resolve)
 }
 
 /// A ureq agent with a connect + read timeout. The team commands run on the Tauri
@@ -2933,12 +2939,22 @@ mod tests {
     /// exactly the host an attacker controls the DNS for.
     #[test]
     fn an_unresolvable_team_host_still_blocks_private_targets() {
-        // `.invalid` is reserved never to resolve (RFC 2606), so this is the NXDOMAIN
-        // case with no network dependency.
-        assert!(block_private_for_team_url("https://no-such-host-422.invalid"));
+        // A resolver that answers for literal IPs and NXDOMAINs every name. RFC 2606
+        // reserves `.invalid` from DELEGATION, which is not a promise that the local
+        // resolver says NXDOMAIN - plenty of them sinkhole every query, and when the
+        // sinkhole is a private address this assertion inverts. Injecting the answer
+        // is what makes it the NXDOMAIN case rather than a question for the network
+        // (SBS-827).
+        fn no_dns(host: &str) -> Result<Vec<std::net::IpAddr>, ()> {
+            host.parse::<std::net::IpAddr>()
+                .map(|ip| vec![ip])
+                .map_err(|_| ())
+        }
+        let blocks = |url: &str| block_private_for_team_url_with(url, &no_dns);
+        assert!(blocks("https://no-such-host-422.invalid"));
         // An empty or unparseable host must not grant LAN trust either.
-        assert!(block_private_for_team_url("https://"));
-        assert!(block_private_for_team_url("not a url"));
+        assert!(blocks("https://"));
+        assert!(blocks("not a url"));
     }
 
     #[test]

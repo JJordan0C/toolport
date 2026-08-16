@@ -756,20 +756,42 @@ pub(crate) fn ip_is_private(ip: &std::net::IpAddr) -> bool {
     }
 }
 
+/// How a host name becomes addresses. `Err` is NXDOMAIN, the case each caller
+/// below treats differently and the whole point of the #422 split.
+///
+/// Injectable because these three checks are the only DNS in the SSRF guard, and
+/// a test that wants to pin the unresolvable branch cannot get one from the
+/// network. RFC 2606 guarantees `.invalid` is never DELEGATED; it does not
+/// guarantee the local resolver returns NXDOMAIN, and ISP resolvers, captive
+/// portals, split-horizon corporate DNS and consumer routers routinely answer
+/// every query with a sinkhole address. When that address is private, the guard
+/// correctly says "private" and the test that assumed otherwise correctly fails.
+/// The test was wrong about its environment, not the code (SBS-827).
+pub(crate) type HostResolver<'a> = &'a dyn Fn(&str) -> Result<Vec<std::net::IpAddr>, ()>;
+
+/// The system resolver. A literal IP resolves to itself without touching DNS.
+pub(crate) fn resolve_host(host: &str) -> Result<Vec<std::net::IpAddr>, ()> {
+    use std::net::ToSocketAddrs;
+    match (host, 0u16).to_socket_addrs() {
+        Ok(addrs) => Ok(addrs.map(|sa| sa.ip()).collect()),
+        Err(_) => Err(()),
+    }
+}
+
 /// True if `host` is loopback, private, or link-local. Resolves DNS (literal IPs
 /// resolve to themselves); fails closed (treats an unresolvable host as private).
 pub fn host_is_private(host: &str) -> bool {
-    use std::net::ToSocketAddrs;
+    host_is_private_with(host, &resolve_host)
+}
+
+fn host_is_private_with(host: &str, resolve: HostResolver) -> bool {
     let h = host.trim().to_ascii_lowercase();
     if h.is_empty() || h == "localhost" || h.ends_with(".localhost") {
         return true;
     }
-    match (h.as_str(), 0u16).to_socket_addrs() {
-        Ok(addrs) => {
-            let ips: Vec<_> = addrs.map(|sa| sa.ip()).collect();
-            ips.is_empty() || ips.iter().any(ip_is_private)
-        }
-        Err(_) => true,
+    match resolve(&h) {
+        Ok(ips) => ips.is_empty() || ips.iter().any(ip_is_private),
+        Err(()) => true,
     }
 }
 
@@ -781,7 +803,10 @@ pub fn host_is_private(host: &str) -> bool {
 /// trust: an attacker who serves NXDOMAIN for their own domain cannot get it classified as
 /// local and thereby switch off the SSRF endpoint guard. See issue #422.
 pub fn host_is_definitely_private(host: &str) -> bool {
-    use std::net::ToSocketAddrs;
+    host_is_definitely_private_with(host, &resolve_host)
+}
+
+pub(crate) fn host_is_definitely_private_with(host: &str, resolve: HostResolver) -> bool {
     let h = host.trim().to_ascii_lowercase();
     if h.is_empty() {
         return false;
@@ -789,14 +814,11 @@ pub fn host_is_definitely_private(host: &str) -> bool {
     if h == "localhost" || h.ends_with(".localhost") {
         return true;
     }
-    match (h.as_str(), 0u16).to_socket_addrs() {
+    match resolve(&h) {
         // Confirmed local ONLY if it resolved to at least one address and every one is
         // private. A mix of private + public is not confirmed-local (fail safe: guard on).
-        Ok(addrs) => {
-            let ips: Vec<_> = addrs.map(|sa| sa.ip()).collect();
-            !ips.is_empty() && ips.iter().all(ip_is_private)
-        }
-        Err(_) => false,
+        Ok(ips) => !ips.is_empty() && ips.iter().all(ip_is_private),
+        Err(()) => false,
     }
 }
 
@@ -805,14 +827,17 @@ pub fn host_is_definitely_private(host: &str) -> bool {
 /// NOT link-local. Fails OPEN (false on an empty/unresolvable host) so the stricter
 /// `host_is_private` check downstream still catches those.
 pub fn host_is_link_local(host: &str) -> bool {
-    use std::net::ToSocketAddrs;
+    host_is_link_local_with(host, &resolve_host)
+}
+
+fn host_is_link_local_with(host: &str, resolve: HostResolver) -> bool {
     let h = host.trim().to_ascii_lowercase();
     if h.is_empty() || h == "localhost" || h.ends_with(".localhost") {
         return false;
     }
-    match (h.as_str(), 0u16).to_socket_addrs() {
-        Ok(addrs) => addrs.map(|sa| sa.ip()).any(|ip| ip_is_link_local(&ip)),
-        Err(_) => false,
+    match resolve(&h) {
+        Ok(ips) => ips.iter().any(ip_is_link_local),
+        Err(()) => false,
     }
 }
 
@@ -1751,25 +1776,38 @@ mod tests {
         assert!(!host_is_private("8.8.8.8"));
     }
 
+    /// A resolver that answers for literal IPs (which need no DNS) and NXDOMAINs
+    /// every NAME.
+    ///
+    /// This is what these tests always assumed the network would do for
+    /// `.invalid`, and what a resolver that hijacks NXDOMAIN does not do. Passing
+    /// it makes the unresolvable-host assertions mean what they claim instead of
+    /// asking whichever DNS the developer is behind for permission (SBS-827).
+    fn no_dns(host: &str) -> Result<Vec<std::net::IpAddr>, ()> {
+        host.parse::<std::net::IpAddr>()
+            .map(|ip| vec![ip])
+            .map_err(|_| ())
+    }
+
     #[test]
     fn host_is_definitely_private_requires_positive_confirmation() {
+        let confirmed = |h: &str| host_is_definitely_private_with(h, &no_dns);
         // Positively local: localhost and literal private IPs (no DNS needed).
-        assert!(host_is_definitely_private("localhost"));
-        assert!(host_is_definitely_private("foo.localhost"));
-        assert!(host_is_definitely_private("127.0.0.1"));
-        assert!(host_is_definitely_private("10.1.2.3"));
-        assert!(host_is_definitely_private("192.168.1.10"));
+        assert!(confirmed("localhost"));
+        assert!(confirmed("foo.localhost"));
+        assert!(confirmed("127.0.0.1"));
+        assert!(confirmed("10.1.2.3"));
+        assert!(confirmed("192.168.1.10"));
 
         // NOT confirmable, so NOT local: empty, public, and (the #422 fix) unresolvable.
-        // `.invalid` is guaranteed non-resolvable (RFC 2606), so this needs no network.
-        assert!(!host_is_definitely_private(""));
-        assert!(!host_is_definitely_private("8.8.8.8"));
-        assert!(!host_is_definitely_private("no-such-host-422.invalid"));
+        assert!(!confirmed(""));
+        assert!(!confirmed("8.8.8.8"));
+        assert!(!confirmed("no-such-host-422.invalid"));
 
         // The contrast that is the whole bug: host_is_private treats an unresolvable
         // host as private (fail closed, for refusing), but that must NOT grant local trust.
-        assert!(host_is_private("no-such-host-422.invalid"));
-        assert!(!host_is_definitely_private("no-such-host-422.invalid"));
+        assert!(host_is_private_with("no-such-host-422.invalid", &no_dns));
+        assert!(!confirmed("no-such-host-422.invalid"));
     }
 
     #[test]
@@ -1779,7 +1817,7 @@ mod tests {
         // true and made guard_endpoint a no-op, so a metadata doc pointing at 127.0.0.1
         // was accepted. With host_is_definitely_private it's false, so the guard still
         // refuses the internal endpoint.
-        let server_local = host_is_definitely_private("no-such-host-422.invalid");
+        let server_local = host_is_definitely_private_with("no-such-host-422.invalid", &no_dns);
         assert!(!server_local, "an unresolvable server host is not local");
         assert!(
             guard_endpoint("http://127.0.0.1:9999/token", server_local, "token").is_err(),
@@ -1787,7 +1825,7 @@ mod tests {
         );
 
         // A genuinely local server (literal private IP) still gets its local endpoints.
-        let local = host_is_definitely_private("192.168.1.10");
+        let local = host_is_definitely_private_with("192.168.1.10", &no_dns);
         assert!(local);
         assert!(guard_endpoint("http://127.0.0.1:9999/token", local, "token").is_ok());
     }

@@ -90,11 +90,29 @@ pub fn resolve_direct(command: &str, args: &[String]) -> Option<DirectSpawn> {
 
 fn resolve_direct_uncached(command: &str, args: &[String]) -> Option<DirectSpawn> {
     let node = node_executable()?;
-    resolve_in(command, args, &npx_package_roots(), &node)
+    resolve_in(
+        command,
+        args,
+        &npx_package_roots(),
+        &node,
+        &crate::downstream::resolve_command,
+    )
 }
 
-/// The body of [`resolve_direct`], with the two pieces of machine state - where npm
-/// unpacks `_npx` packages, and where `node` lives - passed in.
+/// How the launcher finds a bare command name on this machine. Production passes
+/// [`crate::downstream::resolve_command`]; tests pass a fixture-scoped lookup.
+///
+/// This is the THIRD piece of machine state, and the one that was missed: an
+/// `npx_roots` fixture bounds the cache walk, but the shim fallback still asked
+/// the host PATH where `npx` lives. On a developer machine that answers, so four
+/// tests asserting "this spec must fall back to npx" resolved against whatever
+/// npm the developer had installed and failed on a clean checkout of main while
+/// CI stayed green (SBS-839).
+type CommandLookup<'a> = &'a dyn Fn(&str) -> String;
+
+/// The body of [`resolve_direct`], with the three pieces of machine state - where
+/// npm unpacks `_npx` packages, where `node` lives, and how a bare command name is
+/// found on PATH - passed in.
 ///
 /// Split out so tests drive the real resolution against a fixture tree instead of the
 /// developer's actual npm cache, and without mutating process-wide environment.
@@ -103,13 +121,14 @@ fn resolve_in(
     args: &[String],
     npx_roots: &[PathBuf],
     node: &Path,
+    lookup: CommandLookup,
 ) -> Option<DirectSpawn> {
     if let Some(plan) = parse_launcher(command, args) {
         if let Some(direct) = resolve_npx_plan(&plan, npx_roots, node) {
             return Some(direct);
         }
     }
-    resolve_shim(command, args, node)
+    resolve_shim(command, args, node, lookup)
 }
 
 // ---------------------------------------------------------------------------
@@ -520,8 +539,13 @@ impl Version {
 /// npm's shims end with a line that invokes node on a `"%dp0%\..\<pkg>\bin\cli.js"`
 /// path. That is a generated format rather than a documented one, so this only
 /// rewrites when it finds exactly one such path and that path is a real `.js` file.
-fn resolve_shim(command: &str, args: &[String], node: &Path) -> Option<DirectSpawn> {
-    let resolved = crate::downstream::resolve_command(command);
+fn resolve_shim(
+    command: &str,
+    args: &[String],
+    node: &Path,
+    lookup: CommandLookup,
+) -> Option<DirectSpawn> {
+    let resolved = lookup(command);
     let path = Path::new(&resolved);
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     if ext != "cmd" && ext != "bat" {
@@ -669,6 +693,36 @@ mod tests {
         }
     }
 
+    /// A PATH on which nothing is installed. `resolve_command` echoes its input
+    /// back on a miss, so this is exactly what the production lookup returns for a
+    /// command that is not on the machine.
+    ///
+    /// Every fixture-driven resolution passes this. Without it the shim fallback
+    /// asks the DEVELOPER's PATH where `npx` is, which on a machine with npm
+    /// installed answers with a real shim - so four tests that assert a spec must
+    /// fall back to npx instead resolved against that install and failed on a
+    /// clean checkout, while CI (no npm shim in scope) stayed green (SBS-839).
+    fn nothing_on_path(command: &str) -> String {
+        command.to_string()
+    }
+
+    /// The production lookup, for the shim tests: they pass an ABSOLUTE path, which
+    /// `resolve_command` returns untouched on both platforms, so those tests drive
+    /// `resolve_shim` for real without a PATH search.
+    fn host_lookup(command: &str) -> String {
+        crate::downstream::resolve_command(command)
+    }
+
+    /// [`resolve_in`] against a fixture, with the host PATH out of scope.
+    fn resolve_fixture(
+        command: &str,
+        args: &[String],
+        roots: &[PathBuf],
+        node: &Path,
+    ) -> Option<DirectSpawn> {
+        resolve_in(command, args, roots, node, &nothing_on_path)
+    }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
@@ -789,7 +843,7 @@ mod tests {
         );
         let node = fx.node();
 
-        let direct = resolve_in(
+        let direct = resolve_fixture(
             "npx",
             &s(&["-y", "toolport-mcp-servers", "vercel"]),
             &fx.roots(),
@@ -811,7 +865,7 @@ mod tests {
         let node = fx.node();
 
         let direct =
-            resolve_in("npx", &s(&["srv"]), &fx.roots(), &node).expect("string bin resolves");
+            resolve_fixture("npx", &s(&["srv"]), &fx.roots(), &node).expect("string bin resolves");
         // 1.10.0 > 1.9.0 numerically, which a string comparison would get wrong.
         assert!(
             direct.args[0].replace('\\', "/").contains("/new/"),
@@ -847,7 +901,7 @@ mod tests {
         let node = fx.node();
 
         let direct =
-            resolve_in("npx", &s(&["srv"]), &fx.roots(), &node).expect("cached package resolves");
+            resolve_fixture("npx", &s(&["srv"]), &fx.roots(), &node).expect("cached package resolves");
         assert!(
             direct.args[0].replace('\\', "/").contains("/rel/"),
             "expected the 1.4.0 release copy, got {}",
@@ -862,13 +916,13 @@ mod tests {
         let node = fx.node();
 
         assert!(
-            resolve_in("npx", &s(&["srv@2.0.0"]), &fx.roots(), &node).is_some(),
+            resolve_fixture("npx", &s(&["srv@2.0.0"]), &fx.roots(), &node).is_some(),
             "an exact match is safe to shortcut"
         );
         // A different version, a range, or a dist-tag all need the registry.
         for spec in ["srv@2.0.1", "srv@^2.0.0", "srv@latest"] {
             assert!(
-                resolve_in("npx", &s(&[spec]), &fx.roots(), &node).is_none(),
+                resolve_fixture("npx", &s(&[spec]), &fx.roots(), &node).is_none(),
                 "{spec} must fall back to npx"
             );
         }
@@ -881,9 +935,9 @@ mod tests {
         let node = fx.node();
 
         // Never installed.
-        assert!(resolve_in("npx", &s(&["other-srv"]), &fx.roots(), &node).is_none());
+        assert!(resolve_fixture("npx", &s(&["other-srv"]), &fx.roots(), &node).is_none());
         // Installed, but the bin the caller asked for is not one of its bins.
-        assert!(resolve_in("npx", &s(&["-p", "srv", "nope"]), &fx.roots(), &node).is_none());
+        assert!(resolve_fixture("npx", &s(&["-p", "srv", "nope"]), &fx.roots(), &node).is_none());
 
         // Manifest promises an entry that is not on disk.
         let fx2 = Fixture::new("dangling");
@@ -894,7 +948,7 @@ mod tests {
             r#"{"name":"srv","version":"1.0.0","bin":{"srv":"bin/gone.js"}}"#,
         )
         .unwrap();
-        assert!(resolve_in("npx", &s(&["srv"]), &fx2.roots(), &fx2.node()).is_none());
+        assert!(resolve_fixture("npx", &s(&["srv"]), &fx2.roots(), &fx2.node()).is_none());
     }
 
     /// A downloaded package's `bin` is untrusted input; it must not be able to point
@@ -926,7 +980,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            resolve_in("npx", &s(&["srv"]), &fx.roots(), &fx.node()).is_none(),
+            resolve_fixture("npx", &s(&["srv"]), &fx.roots(), &fx.node()).is_none(),
             "a bin field pointing outside the package must not be spawned"
         );
     }
@@ -936,7 +990,7 @@ mod tests {
         let fx = Fixture::new("nonjs");
         // A package whose bin is a shell script, not something node can run.
         fx.package("h", "srv", "1.0.0", serde_json::json!({ "srv": "bin/cli.sh" }));
-        assert!(resolve_in("npx", &s(&["srv"]), &fx.roots(), &fx.node()).is_none());
+        assert!(resolve_fixture("npx", &s(&["srv"]), &fx.roots(), &fx.node()).is_none());
     }
 
     // ----- .cmd shim parsing -----------------------------------------------
@@ -996,7 +1050,8 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\..\to
             &["..\\pkg\\bin\\cli.js"],
         );
 
-        let direct = resolve_shim(&shim, &s(&["--flag"]), &node).expect("shim must resolve");
+        let direct = resolve_shim(&shim, &s(&["--flag"]), &node, &host_lookup)
+            .expect("shim must resolve");
         assert_eq!(direct.command, node.to_string_lossy());
         assert!(direct.args[0].replace('\\', "/").ends_with("pkg/bin/cli.js"));
         assert_eq!(direct.args[1], "--flag", "shim args pass through");
@@ -1014,7 +1069,7 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\..\to
             &["..\\pkg\\bin\\one.js", "..\\pkg\\bin\\two.js"],
         );
 
-        assert!(resolve_shim(&shim, &[], &node).is_none());
+        assert!(resolve_shim(&shim, &[], &node, &host_lookup).is_none());
     }
 
     /// A shim that climbs out of its own `node_modules` is refused, matching what
@@ -1032,7 +1087,7 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\..\to
             &[],
         );
         assert!(outside.is_file(), "the decoy must exist for this to prove anything");
-        assert!(resolve_shim(&shim, &[], &node).is_none());
+        assert!(resolve_shim(&shim, &[], &node, &host_lookup).is_none());
     }
 
     #[test]
@@ -1044,7 +1099,7 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\..\to
             "@ECHO off\r\n\"%dp0%\\..\\pkg\\bin\\cli.sh\" %*\r\n",
             &["..\\pkg\\bin\\cli.sh"],
         );
-        assert!(resolve_shim(&shim, &[], &node).is_none());
+        assert!(resolve_shim(&shim, &[], &node, &host_lookup).is_none());
     }
 
     #[test]
