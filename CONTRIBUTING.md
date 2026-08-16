@@ -76,6 +76,51 @@ matches CI. Frontend tests use [Vitest](https://vitest.dev) and live alongside
 the code as `*.test.ts` or `*.test.tsx` files inside `src/`, depending on whether
 the test contains JSX.
 
+### Run the smallest loop your change needs
+
+`npm run test:rust` builds with the `desktop` feature, which pulls Tauri and
+(on Linux) WebKitGTK: **528 crates against 288 without it**. On a laptop or a
+default 32G Codespace that is the difference between a build that finishes and
+one that fills the disk. Most changes do not need it.
+
+**Frontend only** (anything under `src/`, including every panel in
+`ActivityView.tsx` and `SettingsView.tsx`) needs no Rust build at all:
+
+```bash
+npm run test          # vitest
+npm run lint
+npx tsc --noEmit
+```
+
+**Rust outside `src-tauri/src/desktop.rs`** runs with the desktop feature off,
+which is also exactly what CI runs:
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib
+cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib registry
+```
+
+**Only `desktop.rs` itself needs the full build.** That module is
+`#[cfg(feature = "desktop")]`, so a test you add there does not run under
+`--no-default-features` and therefore **does not run in CI either**, since every
+Rust job there passes that flag. If the logic you are fixing has no Tauri
+dependency (file reads, string formatting, path resolution), prefer moving the
+core into the module that owns it (`gatewaylog`, `registry`, `clients`, ...) and
+leaving a thin caller in `desktop.rs`. That makes it testable in the light loop
+and gets it CI coverage it would otherwise never have.
+
+If `target/` is still too large, `--lib` alone beats `--lib --bins --tests`,
+`cargo clean -p conduit` drops just this crate's artifacts, and
+`CARGO_TARGET_DIR=/some/other/volume` moves the whole thing off a full disk.
+
+### Let CI do the verifying
+
+CI runs the full matrix on **every pull request**, including the platforms most
+contributors do not have. You do not need a clean local run before opening one:
+push a draft PR and iterate on what CI reports. That is the intended path when
+your machine cannot build the whole project, and it is never treated as a lower
+grade of contribution.
+
 The GitHub required check is still named **Build + test**. That name is a
 merge gate over the Linux suite, the headless Rust matrix (the Windows
 keyring tests live on `windows-latest`), and the `install.ps1` Pester job

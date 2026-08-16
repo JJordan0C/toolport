@@ -112,3 +112,17 @@ core-foundation = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
+# Debug builds carried full debug info, which is most of what makes `target/`
+# enormous: it reached 21G on a maintainer machine, and a contributor reported
+# Codespaces' 32G disk filling before a clean build finished (#728). Line tables
+# keep backtraces with file and line numbers, which is what a failing test
+# actually needs, and drop the variable-level DWARF that nothing in this
+# project's workflow reads. `RUSTFLAGS=-Cdebuginfo=2` restores the rest for a
+# real debugger session.
+[profile.dev]
+debug = "line-tables-only"
+
+# Same for the profile `cargo test` builds under.
+[profile.test]
+debug = "line-tables-only"
