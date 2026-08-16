@@ -2786,29 +2786,85 @@ pub fn load_resolved_with_source() -> Result<(Registry, LoadSource), String> {
     Ok((registry, source))
 }
 
+/// Credential-bearing HTTP header names. Matched ANYWHERE in an argument, not
+/// only as a prefix: launchers routinely wrap the header in a flag
+/// (`--header=Authorization: Bearer sk-...`), and a prefix test walks straight
+/// past that (SBS-889).
+const SECRET_HEADERS: [&str; 8] = [
+    "authorization:",
+    "proxy-authorization:",
+    "x-api-key:",
+    "x-auth-token:",
+    "x-goog-api-key:",
+    "api-key:",
+    "cookie:",
+    "private-token:",
+];
+
+/// Flags whose VALUE is a credential, in the joined form (`--api-key=sk-...`).
+/// The leading dashes are stripped before comparison, so both `-` and `--`
+/// spellings match.
+const SECRET_FLAGS: [&str; 14] = [
+    "header",
+    "headers",
+    "api-key",
+    "apikey",
+    "api_key",
+    "token",
+    "auth",
+    "auth-token",
+    "auth_token",
+    "access-token",
+    "access_token",
+    "password",
+    "secret",
+    "bearer",
+];
+
 /// True when a command argument looks like it carries a secret: an inline
-/// credential param (password=, token=, ...) or a connection URI with embedded
+/// credential param (password=, token=, ...), a credential-bearing flag
+/// (`--api-key=...`), an HTTP auth header, or a connection URI with embedded
 /// userinfo (scheme://user:pass@host). Used to redact args before sharing, since
 /// some servers (e.g. Postgres) take a connection string with a password in args.
 /// Biased toward over-redacting: for a share, a false positive is harmless.
-pub(crate) fn arg_looks_secret(arg: &str) -> bool {
+///
+/// Per-argument only. The SPLIT form (`--api-key` `sk-...`) puts the secret in
+/// its own argv entry with no marker of its own, so it is invisible here and
+/// needs [`secret_arg_mask`], which sees the whole slice.
+pub fn arg_looks_secret(arg: &str) -> bool {
     let lower = arg.to_ascii_lowercase();
     let trimmed = lower.trim();
-    const NEEDLES: [&str; 8] = [
-        "password=", "pwd=", "token=", "apikey=", "api_key=", "secret=", "accountkey=",
+    const NEEDLES: [&str; 12] = [
+        "password=",
+        "pwd=",
+        "token=",
+        "apikey=",
+        "api_key=",
+        "api-key=",
+        "secret=",
+        "accountkey=",
         "access_key",
+        "access-key",
+        "session=",
+        "credential=",
     ];
     if NEEDLES.iter().any(|n| lower.contains(n)) {
         return true;
     }
+    // `--api-key=sk-...`, `--header=Authorization: ...`: the needle list keys off
+    // the parameter name, which here sits behind a flag spelling it does not know.
+    if let Some((flag, value)) = trimmed.split_once('=') {
+        if arg_is_secret_flag(flag) && !value.trim().is_empty() {
+            return true;
+        }
+    }
     // Common remote-MCP launchers pass an HTTP auth header as one argument.
     // It has no key=value marker, but sharing it would disclose the credential.
-    for header in ["authorization:", "proxy-authorization:"] {
-        if trimmed
-            .strip_prefix(header)
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            return true;
+    for header in SECRET_HEADERS {
+        if let Some(at) = trimmed.find(header) {
+            if !trimmed[at + header.len()..].trim().is_empty() {
+                return true;
+            }
         }
     }
     // Some launchers split the header name and value into separate arguments.
@@ -2828,6 +2884,168 @@ pub(crate) fn arg_looks_secret(arg: &str) -> bool {
         }
     }
     false
+}
+
+/// True when `arg` is a flag whose value is a credential (`--header`, `-H`,
+/// `--api-key`, ...), so the argument AFTER it must be redacted.
+///
+/// `-H` is matched case-sensitively: lowercased it collides with `-h`/`--help`,
+/// and redacting the argument after a help flag would corrupt a shared setup for
+/// no gain. Every other spelling is case-insensitive.
+fn arg_is_secret_flag(arg: &str) -> bool {
+    let raw = arg.trim();
+    if raw == "-H" {
+        return true;
+    }
+    let name = raw.trim_start_matches('-').to_ascii_lowercase();
+    !name.is_empty() && SECRET_FLAGS.contains(&name.as_str())
+}
+
+/// Per-argument redaction mask for a whole argv slice: `mask[i]` is true when
+/// argument `i` must not leave the machine.
+///
+/// [`arg_looks_secret`] alone cannot be correct here. Launchers split the flag
+/// and its value into separate entries (`--token` `sk-live-...`), and the value
+/// entry carries no `=`, no header name and no URI userinfo - nothing a
+/// per-argument test can see. Only the flag before it says what it is, which
+/// needs the slice (SBS-889).
+///
+/// The flag itself is left visible: the NAME is not a credential, and keeping it
+/// makes a shared setup readable ("--token <redacted>" rather than two blanks).
+pub fn secret_arg_mask<S: AsRef<str>>(args: &[S]) -> Vec<bool> {
+    let mut mask = vec![false; args.len()];
+    for (i, arg) in args.iter().enumerate() {
+        let arg = arg.as_ref();
+        if arg_looks_secret(arg) {
+            mask[i] = true;
+        }
+        // A bare flag: the credential is the next entry. `--token=x` is already
+        // self-describing and handled above, so only the value-less form counts.
+        if !arg.contains('=') && arg_is_secret_flag(arg) {
+            if let Some(next) = mask.get_mut(i + 1) {
+                *next = true;
+            }
+        }
+    }
+    mask
+}
+
+/// Vendor prefixes that make a bare token recognisable as a credential with no
+/// key beside it. Matched case-insensitively against a word with surrounding
+/// punctuation stripped.
+const SECRET_TOKEN_PREFIXES: [&str; 18] = [
+    "sk-", "sk_", "pk_live_", "rk_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
+    "glpat-", "xoxb-", "xoxa-", "xoxp-", "xoxs-", "akia", "asia", "aiza",
+];
+
+/// Minimum length for a token-shaped word, so ordinary prose that happens to
+/// start with a prefix is left alone.
+const SECRET_TOKEN_MIN_LEN: usize = 12;
+
+/// Auth schemes and bare key names whose credential is the NEXT word.
+const SECRET_LEAD_WORDS: [&str; 6] = ["bearer", "basic", "digest", "token", "key", "password"];
+
+/// Redact credential-shaped words from free text.
+///
+/// Sized for text that came back from a downstream server. An error body is the
+/// server's own words and routinely echoes the argument it just rejected
+/// ("invalid api key sk-live-... for request 42"). The injection scan looks for
+/// instruction overrides and the PII pass matches PII shapes; neither is a
+/// credential test, so without this the key lands verbatim in the audit store
+/// and rides every CSV exported from it (SBS-890). No attacker is needed - a
+/// merely buggy server that echoes its input on failure produces this.
+///
+/// Word-granular and deliberately blunt: a word that looks like a credential, or
+/// that follows a credential key or auth scheme, is replaced whole; inside any
+/// other word, a vendor-prefixed token is replaced on its own, so a key quoted
+/// in a JSON body (`{"apiKey":"sk-live-..."}`) goes too. Whitespace is preserved
+/// so the surrounding message stays readable.
+pub fn redact_secret_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev = String::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let word_start = rest
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(rest.len());
+        out.push_str(&rest[..word_start]);
+        rest = &rest[word_start..];
+        if rest.is_empty() {
+            break;
+        }
+        let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let word = &rest[..word_end];
+        rest = &rest[word_end..];
+        if arg_looks_secret(word) || leads_a_secret(&prev) {
+            out.push_str(REDACTED);
+        } else {
+            out.push_str(&redact_token_runs(word));
+        }
+        prev = word.to_ascii_lowercase();
+    }
+    out
+}
+
+const REDACTED: &str = "<redacted>";
+
+/// Replace vendor-prefixed tokens inside one word, leaving its punctuation in
+/// place. An error body is often JSON, so the credential arrives glued to quotes,
+/// braces and a field name rather than standing alone.
+fn redact_token_runs(word: &str) -> String {
+    fn is_token_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
+    }
+    let mut out = String::with_capacity(word.len());
+    let mut rest = word;
+    while !rest.is_empty() {
+        let run_start = rest.find(is_token_char).unwrap_or(rest.len());
+        out.push_str(&rest[..run_start]);
+        rest = &rest[run_start..];
+        if rest.is_empty() {
+            break;
+        }
+        let run_end = rest.find(|c: char| !is_token_char(c)).unwrap_or(rest.len());
+        let run = &rest[..run_end];
+        rest = &rest[run_end..];
+        if token_looks_secret(run) {
+            out.push_str(REDACTED);
+        } else {
+            out.push_str(run);
+        }
+    }
+    out
+}
+
+/// True when a bare token is credential-shaped by its vendor prefix alone, with
+/// no key beside it to say so.
+fn token_looks_secret(token: &str) -> bool {
+    if token.len() < SECRET_TOKEN_MIN_LEN {
+        return false;
+    }
+    let lower = token.to_ascii_lowercase();
+    SECRET_TOKEN_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
+/// True when the PREVIOUS word says the next one is a credential: an auth scheme
+/// ("Bearer"), a header name ("Authorization:") or a bare key word ("key").
+fn leads_a_secret(prev: &str) -> bool {
+    let bare = trim_word_punctuation(prev);
+    if SECRET_LEAD_WORDS.contains(&bare) {
+        return true;
+    }
+    // "Authorization:" as its own word: the value is whatever follows.
+    SECRET_HEADERS.iter().any(|h| prev == *h)
+}
+
+/// Strip the quotes, brackets and sentence punctuation that wrap a word in prose
+/// or in a JSON error body, so the shape test sees the token itself.
+fn trim_word_punctuation(word: &str) -> &str {
+    word.trim_matches(|c: char| {
+        matches!(
+            c,
+            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | ':' | '.'
+        )
+    })
 }
 
 /// Redact credentials embedded in a URL's authority: `scheme://user:pass@host/x`
@@ -2855,6 +3073,67 @@ mod tests {
     use crate::approval::fingerprint_allow_key;
 
     static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// SBS-890: an error body is the downstream server's own words. It has been
+    /// through the injection scan and the PII pass, and neither is a credential
+    /// test, so the redactor is what keeps a key out of `audit.jsonl`.
+    #[test]
+    fn redact_secret_text_removes_credential_shapes_and_keeps_the_message() {
+        let cases = [
+            "invalid api key sk-live-abcdefghijklmnop for request 42",
+            "auth failed: Authorization: Bearer sk-live-abcdefghijklmnop",
+            "rejected token ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "bad request {\"apiKey\":\"sk-live-abcdefghijklmnop\"}",
+            "upstream said: X-API-Key: sk-live-abcdefghijklmnop is expired",
+        ];
+        for case in cases {
+            let redacted = redact_secret_text(case);
+            assert!(
+                !redacted.contains("sk-live-abcdefghijklmnop")
+                    && !redacted.contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
+                "credential survived: {redacted}"
+            );
+            assert!(redacted.contains("<redacted>"), "nothing redacted: {case}");
+        }
+
+        // An ordinary failure must stay readable, or the audit row loses its reason.
+        let plain = "HTTP 503: upstream unavailable, retry after 30s";
+        assert_eq!(redact_secret_text(plain), plain);
+        assert_eq!(redact_secret_text(""), "");
+    }
+
+    /// The mask is what the three egress sinks share; a regression here leaks to
+    /// a public share link, a pasted diagnostics bundle and the org control plane
+    /// at once (SBS-889).
+    #[test]
+    fn secret_arg_mask_covers_joined_and_split_credential_flags() {
+        let args = [
+            "-y",
+            "mcp-remote",
+            "https://mcp.example.com/sse",
+            "--header",
+            "Authorization: Bearer sk-live-secret",
+            "--api-key=sk-live-joined",
+            "--token",
+            "sk-live-split",
+        ];
+        assert_eq!(
+            secret_arg_mask(&args),
+            vec![false, false, false, false, true, true, false, true]
+        );
+
+        // A value-less trailing flag must not panic or over-run the slice.
+        assert_eq!(secret_arg_mask(&["--token"]), vec![false]);
+        assert!(secret_arg_mask::<&str>(&[]).is_empty());
+
+        // `-h` is help, not a header: redacting what follows would corrupt the
+        // shared setup for nothing. `-H` (curl's spelling) is the credential one.
+        assert_eq!(secret_arg_mask(&["-h", "topic"]), vec![false, false]);
+        assert_eq!(
+            secret_arg_mask(&["-H", "X-API-Key: sk-live"]),
+            vec![false, true]
+        );
+    }
 
     /// Pins the plumbing the concurrency tests rely on (SBS-895). Without this, a typo in
     /// the env-var name would silently leave those tests on the 5s production budget and

@@ -1467,8 +1467,9 @@ fn team_server_export(reg: &Registry) -> Value {
             let args: Vec<String> = s
                 .args
                 .iter()
-                .map(|a| {
-                    if crate::arg_looks_secret(a) {
+                .zip(crate::registry::secret_arg_mask(&s.args))
+                .map(|(a, secret)| {
+                    if secret {
                         "<redacted>".to_string()
                     } else {
                         a.clone()

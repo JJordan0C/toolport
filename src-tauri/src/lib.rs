@@ -38,7 +38,7 @@ pub mod topology;
 pub mod usage_report;
 pub mod vendors;
 
-pub(crate) use registry::{arg_looks_secret, redact_url_userinfo};
+pub(crate) use registry::redact_url_userinfo;
 
 #[cfg(feature = "desktop")]
 pub fn run() {

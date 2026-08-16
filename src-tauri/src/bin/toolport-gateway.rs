@@ -5184,13 +5184,16 @@ fn approve_pii_release(
 ///
 /// Falls back to `raw` only when the defended body has no text at all, so a failure is
 /// never audited with an empty reason.
+///
+/// Defended is not the same as secret-free. The injection scan looks for instruction
+/// overrides and the PII pass matches PII shapes; an API key is neither, so a server that
+/// echoes the argument it rejected ("invalid api key sk-live-... ") writes a live
+/// credential into `audit.jsonl` and into every CSV exported from it. The credential pass
+/// runs last, over whichever text is about to be stored (SBS-890).
 fn audited_error_text(raw: &str, defended: &Value) -> String {
     let text = content_text(defended);
-    if text.trim().is_empty() {
-        raw.to_string()
-    } else {
-        text
-    }
+    let stored = if text.trim().is_empty() { raw } else { &text };
+    registry::redact_secret_text(stored)
 }
 
 /// True when none of `tokens` still appears literally in `value`.

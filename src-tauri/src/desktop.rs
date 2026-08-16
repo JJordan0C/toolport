@@ -1789,7 +1789,16 @@ fn registry_summary(reg: &Registry) -> String {
 fn safe_command_target(cmd: &str, args: &[String]) -> String {
     let mut parts = Vec::with_capacity(args.len() + 1);
     parts.push(redact_arg_for_sharing(cmd));
-    parts.extend(args.iter().map(|arg| redact_arg_for_sharing(arg)));
+    // The mask, not a per-argument test: `--token sk-...` hides the credential in
+    // an entry that looks like any other word on its own (SBS-889).
+    let mask = registry::secret_arg_mask(args);
+    for (arg, secret) in args.iter().zip(mask) {
+        parts.push(if secret {
+            "<redacted>".to_string()
+        } else {
+            redact_url_userinfo(arg)
+        });
+    }
     parts.join(" ").trim().to_string()
 }
 
@@ -3656,8 +3665,11 @@ fn build_export(
             // Some servers take credentials inline in args (e.g. a Postgres
             // connection string with a password). Redact those too, so a shared
             // setup never leaks a secret the env-stripping above wouldn't catch.
-            for a in &mut s.args {
-                if arg_looks_secret(a) {
+            // The mask sees the whole slice, so the split form (`--api-key`
+            // `sk-...`) is caught as well as the joined one (SBS-889).
+            let mask = registry::secret_arg_mask(&s.args);
+            for (a, secret) in s.args.iter_mut().zip(mask) {
+                if secret {
                     *a = "<redacted>".to_string();
                 }
             }
@@ -5329,7 +5341,7 @@ fn registry_startup_failure_message(path: Option<&std::path::Path>, error: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{arg_looks_secret, redact_url_userinfo};
+    use crate::registry::{arg_looks_secret, redact_url_userinfo};
     use registry::EnvVar;
 
     fn unique_update_test_dir(label: &str) -> std::path::PathBuf {
@@ -6243,11 +6255,24 @@ mod tests {
         assert!(arg_looks_secret("Basic dXNlcjpwYXNz"));
         assert!(arg_looks_secret("Digest username=admin,response=secret"));
         assert!(arg_looks_secret("Proxy-Authorization: Basic dXNlcjpwYXNz"));
+        // SBS-889: spellings the needle list and the prefix-only header test
+        // walked past. Every one of these shipped a live credential.
+        assert!(arg_looks_secret("--api-key=sk-live-secret"));
+        assert!(arg_looks_secret("--auth-token=sk-live-secret"));
+        assert!(arg_looks_secret("--header=Authorization: Bearer sk-live-secret"));
+        assert!(arg_looks_secret("--header=X-API-Key: sk-live-secret"));
+        assert!(arg_looks_secret("X-API-Key: sk-live-secret"));
+        assert!(arg_looks_secret("Cookie: session=abc123"));
+        assert!(arg_looks_secret("--token=sk-live-secret"));
         // Legitimate args must NOT be redacted.
         assert!(!arg_looks_secret("-y"));
         assert!(!arg_looks_secret("@modelcontextprotocol/server-postgres"));
         assert!(!arg_looks_secret("--stdio"));
         assert!(!arg_looks_secret("https://api.githubcopilot.com/mcp/")); // no userinfo
+        // A bare flag carries nothing on its own; only the value after it does,
+        // and that is secret_arg_mask's job.
+        assert!(!arg_looks_secret("--token"));
+        assert!(!arg_looks_secret("--header"));
 
         let mut reg = Registry::default();
         reg.add_server(ServerEntry {
@@ -6280,6 +6305,58 @@ mod tests {
         assert_eq!(args[1], "@modelcontextprotocol/server-postgres");
         assert_eq!(args[2], "<redacted>");
         assert_eq!(args[3], "<redacted>");
+    }
+
+    /// SBS-889: the split form. `--token` `sk-...` puts the credential in an argv
+    /// entry that looks like any other word on its own, so a per-argument test
+    /// cannot see it. Every egress sink must use the slice-aware mask.
+    #[test]
+    fn export_redacts_space_separated_secret_args() {
+        let secret_args = vec![
+            "-y".to_string(),
+            "mcp-remote".to_string(),
+            "--header".to_string(),
+            "Authorization: Bearer sk-live-secret".to_string(),
+            "--api-key".to_string(),
+            "sk-live-other".to_string(),
+            "-H".to_string(),
+            "X-API-Key: sk-live-third".to_string(),
+        ];
+        let mask = registry::secret_arg_mask(&secret_args);
+        // Benign args survive, and so does the flag NAME - only its value goes.
+        assert_eq!(
+            mask,
+            vec![false, false, false, true, false, true, false, true]
+        );
+
+        let mut reg = Registry::default();
+        reg.add_server(ServerEntry {
+            id: "remote".into(),
+            name: "Remote".into(),
+            transport: "stdio".into(),
+            command: Some("npx".into()),
+            args: secret_args.clone(),
+            env: vec![],
+            url: None,
+            source: None,
+            disabled_tools: vec![],
+            cwd: None,
+            client_credentials: None,
+            unknown_fields: serde_json::Map::new(),
+        });
+        let serialized = serde_json::to_string(&build_export(&reg, None, None, None)).unwrap();
+        for leaked in ["sk-live-secret", "sk-live-other", "sk-live-third"] {
+            assert!(!serialized.contains(leaked), "{leaked} leaked: {serialized}");
+        }
+        // The diagnostics bundle is the second sink, over the same argv.
+        let diagnostics = safe_command_target("npx", &secret_args);
+        for leaked in ["sk-live-secret", "sk-live-other", "sk-live-third"] {
+            assert!(
+                !diagnostics.contains(leaked),
+                "{leaked} leaked into diagnostics: {diagnostics}"
+            );
+        }
+        assert!(diagnostics.contains("--header"), "flag name kept readable");
     }
 
     #[test]
