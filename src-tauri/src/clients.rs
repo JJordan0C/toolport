@@ -387,6 +387,33 @@ fn claude_code_config_path(config_dir: &std::path::Path) -> PathBuf {
     config_dir.join(".claude.json")
 }
 
+/// Goose relocates its whole tree — `config/config.yaml` and
+/// `config/.goosehints` included — when `GOOSE_PATH_ROOT` is an absolute path
+/// (SBS-899). Relative or empty values are a misconfiguration, not an
+/// instruction to write relative to Toolport's cwd. Matches Goose's own
+/// `Paths::validated_path_root`.
+fn goose_path_root_from(raw: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let dir = PathBuf::from(raw.filter(|p| !p.is_empty())?);
+    dir.is_absolute().then_some(dir)
+}
+
+fn goose_config_under_root(root: &Path) -> PathBuf {
+    root.join("config").join("config.yaml")
+}
+
+fn goose_hints_under_root(root: &Path) -> PathBuf {
+    root.join("config").join(".goosehints")
+}
+
+fn rules_sentinel_block(path: PathBuf) -> crate::instructions::Target {
+    crate::instructions::Target {
+        path,
+        strategy: crate::instructions::Strategy::SentinelBlock,
+        char_cap: None,
+        blocked_if_present: None,
+    }
+}
+
 /// Every `.claude.json` on this machine that some Claude Code process may read.
 ///
 /// [`claude_config_dir_override`] resolves the ONE config Toolport reads and writes,
@@ -476,6 +503,11 @@ fn client_config_path(client_id: &str) -> Option<PathBuf> {
             return Some(claude_code_config_path(&dir));
         }
     }
+    if client_id == "goose" {
+        if let Some(root) = goose_path_root_from(std::env::var_os("GOOSE_PATH_ROOT")) {
+            return Some(goose_config_under_root(&root));
+        }
+    }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         return resolve_client_config_path_linux(client_id, &home);
@@ -556,10 +588,12 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
 /// `~/.claude.json` but its rules live under `~/.claude/rules/`. `None` means the client has
 /// no global-rules location we write: either its globals are UI/cloud-stored (Cursor, Warp),
 /// or it's covered transitively by another client's file (Antigravity reads Gemini's
-/// `GEMINI.md`; VS Code Copilot reads Claude Code's `~/.claude` rules). Unlike the config
-/// resolver these paths are all home-anchored (or literal `~/.config`), so one cross-platform
-/// resolver covers Linux too — no XDG/data-dir or MSIX handling needed. See the spec's adapter
-/// table for citations.
+/// `GEMINI.md`; VS Code Copilot reads Claude Code's `~/.claude` rules). Most of these
+/// paths are home-anchored. Goose and Zed on Linux follow `XDG_CONFIG_HOME` via
+/// [`client_rules_target`] / `dirs::config_dir()`, matching [`client_config_path`]
+/// (SBS-899 / #757). Goose also honours absolute `GOOSE_PATH_ROOT`, which relocates
+/// both `config/config.yaml` and `config/.goosehints`. See the spec's adapter table
+/// for citations.
 fn resolve_rules_target(
     client_id: &str,
     home: &std::path::Path,
@@ -627,7 +661,22 @@ fn resolve_rules_target(
             char_cap: Some(6000), // Windsurf hard-caps the global rules file.
             blocked_if_present: None,
         },
-        "goose" => block(home.join(".config").join("goose").join(".goosehints")),
+        // Sibling of config.yaml. Windows uses the etcetera config dir
+        // (%APPDATA%\\Block\\goose\\config); macOS/Linux default to ~/.config/goose
+        // (Goose's documented XDG location). Production Linux overlays XDG via
+        // client_rules_target; GOOSE_PATH_ROOT is handled there too.
+        "goose" => match platform {
+            Platform::Windows => block(
+                config
+                    .join("Block")
+                    .join("goose")
+                    .join("config")
+                    .join(".goosehints"),
+            ),
+            Platform::MacOs | Platform::Linux => {
+                block(home.join(".config").join("goose").join(".goosehints"))
+            }
+        },
         "pi" => block(home.join(".pi").join("agent").join("AGENTS.md")),
         "omp" => block(home.join(".omp").join("agent").join("AGENTS.md")),
         "zed" => match platform {
@@ -642,9 +691,25 @@ fn resolve_rules_target(
 }
 
 /// The rules-file target for a client on the current machine, or `None` if unsupported /
-/// transitively covered. Mirrors [`client_config_path`].
+/// transitively covered. Mirrors [`client_config_path`]: Goose/Zed on Linux honor
+/// `XDG_CONFIG_HOME`, and Goose honors absolute `GOOSE_PATH_ROOT` (SBS-899).
 pub fn client_rules_target(client_id: &str) -> Option<crate::instructions::Target> {
+    if client_id == "goose" {
+        if let Some(root) = goose_path_root_from(std::env::var_os("GOOSE_PATH_ROOT")) {
+            return Some(rules_sentinel_block(goose_hints_under_root(&root)));
+        }
+    }
     let home = home()?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if matches!(client_id, "goose" | "zed") {
+        let config = dirs::config_dir().unwrap_or_else(|| home.join(".config"));
+        let path = match client_id {
+            "goose" => config.join("goose").join(".goosehints"),
+            "zed" => config.join("zed").join("AGENTS.md"),
+            _ => unreachable!("guarded by matches! above"),
+        };
+        return Some(rules_sentinel_block(path));
+    }
     resolve_rules_target(client_id, &home, Platform::current())
 }
 
@@ -8935,6 +9000,40 @@ command = "npx"
     }
 
     #[test]
+    fn rules_target_goose_matches_config_directory() {
+        // Rules sit beside config.yaml so the two path families cannot drift
+        // (SBS-899). Windows uses the etcetera config dir; macOS/Linux stay on
+        // Goose's documented ~/.config/goose (macOS config in Toolport is
+        // Application Support — a pre-existing split, listed in the PR).
+        for platform in Platform::ALL {
+            let home = mock_home(platform);
+            let rules = resolve_rules_target("goose", &home, platform).expect("supported");
+            let config =
+                resolve_client_config_path("goose", &home, platform).expect("goose config");
+            match platform {
+                Platform::Windows => {
+                    assert_eq!(
+                        rules.path,
+                        home.join("AppData")
+                            .join("Roaming")
+                            .join("Block")
+                            .join("goose")
+                            .join("config")
+                            .join(".goosehints")
+                    );
+                    assert_eq!(rules.path.parent(), config.parent());
+                }
+                Platform::MacOs | Platform::Linux => {
+                    assert_eq!(
+                        rules.path,
+                        home.join(".config").join("goose").join(".goosehints")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rules_target_unsupported_clients_return_none() {
         // Cursor/Warp store globals in UI/cloud; Continue is deferred; chat/identity apps have
         // no global rules file we manage.
@@ -9061,6 +9160,9 @@ command = "npx"
         // `.claude.json`). The override itself is covered by
         // `claude_code_config_follows_a_relocated_config_dir`.
         let _claude_config_dir = EnvRestore::set("CLAUDE_CONFIG_DIR", Path::new(""));
+        // goose_path / client_config_path honor GOOSE_PATH_ROOT; clear it so this
+        // table assertion stays on the documented default (SBS-899).
+        let _goose_root = EnvRestore::set("GOOSE_PATH_ROOT", Path::new(""));
         let home = home().expect("home dir should be available in tests");
         let platform = Platform::current();
         for client in defs() {
@@ -9218,6 +9320,9 @@ command = "npx"
 
         std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
         std::env::set_var("XDG_DATA_HOME", &xdg_data);
+        // Absolute GOOSE_PATH_ROOT wins over XDG; neutralize it so this test
+        // pins the XDG branch (SBS-899).
+        let _goose_root = EnvRestore::set("GOOSE_PATH_ROOT", Path::new(""));
 
         let home = home().expect("home dir");
         let vscode = client_config_path("vscode").unwrap();
@@ -9268,6 +9373,95 @@ command = "npx"
         assert_eq!(
             kilo_code,
             home.join(".config").join("kilo").join("kilo.jsonc")
+        );
+    }
+
+    /// SBS-899: Team Instructions for Goose/Zed must land in the same XDG
+    /// config dir as Connect already writes (`client_config_path`). Without
+    /// this, a user with `XDG_CONFIG_HOME=/data/cfg` gets a successful write
+    /// to `~/.config/...` that Goose/Zed never read.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn client_rules_paths_honor_xdg_dirs_on_linux() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("conduit-xdg-rules-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let xdg_config = base.join("xdg-config");
+        std::fs::create_dir_all(&xdg_config).unwrap();
+
+        let _xdg = EnvRestore::set("XDG_CONFIG_HOME", &xdg_config);
+        let _goose_root = EnvRestore::set("GOOSE_PATH_ROOT", Path::new(""));
+
+        let goose = client_rules_target("goose").expect("goose has a rules target");
+        let zed = client_rules_target("zed").expect("zed has a rules target");
+        let goose_config = client_config_path("goose").expect("goose config");
+        let zed_config = client_config_path("zed").expect("zed config");
+
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(
+            goose.path,
+            xdg_config.join("goose").join(".goosehints"),
+            "Goose Team Instructions must follow XDG_CONFIG_HOME"
+        );
+        assert_eq!(
+            zed.path,
+            xdg_config.join("zed").join("AGENTS.md"),
+            "Zed Team Instructions must follow XDG_CONFIG_HOME"
+        );
+        assert_eq!(
+            goose.path.parent(),
+            goose_config.parent(),
+            "Goose rules and config must share a directory so the two families cannot drift"
+        );
+        assert_eq!(
+            zed.path.parent(),
+            zed_config.parent(),
+            "Zed rules and config must share a directory so the two families cannot drift"
+        );
+    }
+
+    /// SBS-899: absolute GOOSE_PATH_ROOT relocates both config.yaml and
+    /// .goosehints to `<root>/config/`, matching Goose `Paths::get_dir`.
+    #[test]
+    fn goose_path_root_relocates_config_and_rules() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("goose-root-{}", std::process::id()));
+        let _restore = EnvRestore::set("GOOSE_PATH_ROOT", &root);
+
+        assert_eq!(
+            client_config_path("goose"),
+            Some(root.join("config").join("config.yaml"))
+        );
+        assert_eq!(
+            client_rules_target("goose")
+                .expect("goose has a rules target")
+                .path,
+            root.join("config").join(".goosehints")
+        );
+    }
+
+    /// Relative / empty GOOSE_PATH_ROOT is ignored — same rule as
+    /// `CLAUDE_CONFIG_DIR` and Goose's own `validated_path_root`.
+    #[test]
+    fn goose_path_root_relative_or_empty_is_ignored() {
+        assert_eq!(goose_path_root_from(None), None);
+        assert_eq!(
+            goose_path_root_from(Some(std::ffi::OsString::from(""))),
+            None
+        );
+        assert_eq!(
+            goose_path_root_from(Some(std::ffi::OsString::from("relative/goose"))),
+            None
+        );
+        let absolute = if cfg!(windows) {
+            PathBuf::from(r"C:\\abs\\goose")
+        } else {
+            PathBuf::from("/abs/goose")
+        };
+        assert_eq!(
+            goose_path_root_from(Some(absolute.clone().into_os_string())),
+            Some(absolute)
         );
     }
 

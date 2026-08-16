@@ -18,6 +18,11 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **Team Instructions now follow `XDG_CONFIG_HOME` for Goose and Zed.** Connect
+  already wrote those clients' MCP configs under XDG (#757 / SBS-847); the rules
+  writer still hardcoded `~/.config`, so an org push could succeed and never
+  apply. Absolute `GOOSE_PATH_ROOT` is honoured on both the config and rules
+  paths (`<root>/config/config.yaml` and `<root>/config/.goosehints`). (SBS-899)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
