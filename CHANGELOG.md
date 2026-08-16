@@ -18,6 +18,13 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **A space no longer smuggles a forged Toolport marker past the voice rewrite.**
+  The gateway-voice matcher folded zero-width, bidi, fullwidth and homoglyph
+  evasions but compared whitespace literally, so `[ Toolport advisor: …]` with a
+  plain space (or a tab, a newline, a no-break space, or a doubled space inside
+  the brand) reached the model unchanged while the zero-width form was caught.
+  Whitespace is now folded like the other evasions: ignored before the brand and
+  collapsed to one space inside it. (SBS-896)
 - **Untrusted MCP output can no longer speak as Toolport.** The external-data
   wrapper is Toolport-branded (it still said `conduit` after the rebrand) and
   sanitizes the server label, so a quote in a resource URI cannot close the
