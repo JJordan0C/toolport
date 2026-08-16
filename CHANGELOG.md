@@ -26,6 +26,19 @@ Entries before the rename below shipped under the project's former name, Conduit
   who upgrades in place also gets the block moved to the new path: an unchanged
   org text used to skip the write entirely, so the new location stayed empty and
   coverage reported Stale until someone edited the instructions. (SBS-899)
+- **A registry that was not really read no longer counts as "no HTTP clients".**
+  `--insecure-loopback` treats an empty `http_clients` list as permission to bind and
+  serve without a bearer, and that list came back empty for three unrelated reasons: a
+  load error falling back to `Registry::default()`, a load that could not read the file
+  at all (locked, permissions) and reported it as absent, and a load recovered from a
+  backup, which is the state before the last save and so is missing exactly the save
+  that registered the first client. Loading now reports where the registry came from,
+  and the open branch requires a load that actually saw the configured state. The check
+  is also live rather than decided at boot: the file watcher republishes that verdict
+  with every reload, so a registry corrupted while the gateway runs closes the listener
+  instead of quietly re-opening it. A missing registry file is a real first run and still
+  opens with `--insecure-loopback`, and a failed load with `TOOLPORT_HTTP_TOKEN` still
+  binds. (SBS-900)
 - **A transient missing quarantine store no longer installs an empty block set.**
   Rewriting `quarantine.json` uses a temp file plus rename, so a reader can see
   `NotFound` for a tick. That used to look like "nothing is blocked" and the
@@ -118,6 +131,9 @@ Entries before the rename below shipped under the project's former name, Conduit
   old content and the gateway entry disappeared. Writes now follow the
   link and update the target, so the path under home stays a symlink.
   (SBS-886)
+
+> > > > > > > origin/main
+
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt

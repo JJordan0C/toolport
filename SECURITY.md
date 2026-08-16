@@ -51,8 +51,11 @@ manager around it. What network surface exists depends on the mode you run:
   when no token is set **and** `http_clients` is empty. Registered clients left
   over from earlier use keep the bind authenticated, so the listener still
   answers `401` to every request without a matching bearer; revoke those entries
-  first if you want the open listener. The flag never permits an open
-  non-loopback bind.
+  first if you want the open listener. An empty `http_clients` list only counts
+  when the registry was actually read: a registry recovered from a backup, or one
+  the gateway could not read at all, is empty for a reason that says nothing about
+  what is configured, so the flag does not open a listener over it. The flag never
+  permits an open non-loopback bind.
 - **Headless / Docker.** The published image runs the HTTP bridge and sets
   `TOOLPORT_HTTP_HOST=0.0.0.0` so it is reachable off-host. Every bind, including
   loopback, **requires** `TOOLPORT_HTTP_TOKEN` (legacy `CONDUIT_HTTP_TOKEN`) or a
