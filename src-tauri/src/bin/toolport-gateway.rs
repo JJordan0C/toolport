@@ -3683,6 +3683,7 @@ fn resolve_http_caller(
     env_token: Option<&str>,
     provided: Option<&str>,
     allow_insecure_open: bool,
+    registry_loaded: bool,
 ) -> Option<(Option<std::collections::HashSet<String>>, HttpCaller)> {
     let owner_scope = |allowed: &Option<std::collections::HashSet<String>>| {
         allowed.as_ref().map(|set| {
@@ -3747,7 +3748,11 @@ fn resolve_http_caller(
     // resolves for the server that minted it), so this is a weaker isolation
     // boundary rather than an open channel. The mode is already labelled insecure;
     // this is one more thing it gives up.
-    if allow_insecure_open && env_token.is_none() && reg.http_clients.is_empty() {
+    //
+    // SBS-900: `reg.http_clients.is_empty()` is also true when boot `load_resolved`
+    // returned Err and fell back to `Registry::default()`. That is not "no clients
+    // configured". A missing registry file is `Ok(default)` and is not this case.
+    if allow_insecure_open && env_token.is_none() && registry_loaded && reg.http_clients.is_empty() {
         return Some((
             None,
             HttpCaller {
@@ -3770,8 +3775,16 @@ fn resolve_http_scope(
     env_token: Option<&str>,
     provided: Option<&str>,
     allow_insecure_open: bool,
+    registry_loaded: bool,
 ) -> Option<Option<std::collections::HashSet<String>>> {
-    resolve_http_caller(reg, env_token, provided, allow_insecure_open).map(|(allowed, _)| allowed)
+    resolve_http_caller(
+        reg,
+        env_token,
+        provided,
+        allow_insecure_open,
+        registry_loaded,
+    )
+    .map(|(allowed, _)| allowed)
 }
 
 /// The audit label for a registered HTTP client's bearer: its `label`, or its `id`
@@ -13853,20 +13866,38 @@ fn insecure_loopback_requested(args: &[String]) -> bool {
 }
 
 /// Startup admission policy. The escape hatch is never valid for a non-loopback bind.
-fn http_bind_is_authorized(loopback: bool, auth_configured: bool, insecure_loopback: bool) -> bool {
-    auth_configured || http_allows_insecure_open(loopback, auth_configured, insecure_loopback)
+///
+/// `registry_loaded` is the boot `load_resolved` outcome (Ok=true, Err=false). A
+/// failed load must not authorize the `--insecure-loopback` open bind (SBS-900).
+fn http_bind_is_authorized(
+    loopback: bool,
+    auth_configured: bool,
+    insecure_loopback: bool,
+    registry_loaded: bool,
+) -> bool {
+    auth_configured
+        || http_allows_insecure_open(
+            loopback,
+            auth_configured,
+            insecure_loopback,
+            registry_loaded,
+        )
 }
 
-/// Activate the open-listener fallback only when the escape hatch was required at startup.
+/// Activate the open-listener fallback only when the escape hatch was required at startup
+/// and the registry actually loaded. `Registry::default()` after `load_resolved` Err
+/// also has empty `http_clients`; that must not count as "no clients configured"
+/// (SBS-900).
 fn http_allows_insecure_open(
     loopback: bool,
     auth_configured: bool,
     insecure_loopback: bool,
+    registry_loaded: bool,
 ) -> bool {
-    loopback && insecure_loopback && !auth_configured
+    loopback && insecure_loopback && !auth_configured && registry_loaded
 }
 
-fn serve_http(state: GatewayState, port: u16) {
+fn serve_http(state: GatewayState, port: u16, registry_loaded: bool) {
     let host = conduit_lib::brand::env_var("TOOLPORT_HTTP_HOST", "CONDUIT_HTTP_HOST")
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "127.0.0.1".to_string());
@@ -13886,10 +13917,15 @@ fn serve_http(state: GatewayState, port: u16) {
     let auth_configured = token.is_some() || registered_clients;
     let args: Vec<String> = std::env::args().collect();
     let insecure_loopback = insecure_loopback_requested(&args);
-    let allow_insecure_open =
-        http_allows_insecure_open(loopback, auth_configured, insecure_loopback);
+    let allow_insecure_open = http_allows_insecure_open(
+        loopback,
+        auth_configured,
+        insecure_loopback,
+        registry_loaded,
+    );
 
-    if !http_bind_is_authorized(loopback, auth_configured, insecure_loopback) {
+    if !http_bind_is_authorized(loopback, auth_configured, insecure_loopback, registry_loaded)
+    {
         if loopback {
             eprintln!(
                 "toolport-gateway: refusing to bind {host}:{port} without HTTP authentication. \
@@ -13942,6 +13978,7 @@ fn serve_http(state: GatewayState, port: u16) {
                     search6,
                     confirm6,
                     allow_insecure_open,
+                    registry_loaded,
                 )
             });
             glog(&format!(
@@ -13967,7 +14004,15 @@ fn serve_http(state: GatewayState, port: u16) {
     eprintln!(
         "toolport-gateway: HTTP on http://localhost:{port}  (OpenAPI /openapi.json, MCP POST /mcp)"
     );
-    serve_http_loop(server, state, token, search, confirm, allow_insecure_open);
+    serve_http_loop(
+        server,
+        state,
+        token,
+        search,
+        confirm,
+        allow_insecure_open,
+        registry_loaded,
+    );
 }
 
 /// The accept loop for one listener. Each accepted request is handed to its own
@@ -14123,6 +14168,7 @@ fn serve_http_loop(
     search: Arc<SearchGuard>,
     confirm: Arc<ConfirmGuard>,
     allow_insecure_open: bool,
+    registry_loaded: bool,
 ) {
     serve_http_loop_with_inflight(
         server,
@@ -14131,6 +14177,7 @@ fn serve_http_loop(
         search,
         confirm,
         allow_insecure_open,
+        registry_loaded,
         Arc::new(AtomicUsize::new(0)),
     );
 }
@@ -14142,6 +14189,7 @@ fn serve_http_loop_with_inflight(
     search: Arc<SearchGuard>,
     confirm: Arc<ConfirmGuard>,
     allow_insecure_open: bool,
+    registry_loaded: bool,
     inflight: Arc<AtomicUsize>,
 ) {
     for request in server.incoming_requests() {
@@ -14164,6 +14212,7 @@ fn serve_http_loop_with_inflight(
                 &search,
                 &confirm,
                 allow_insecure_open,
+                registry_loaded,
             );
         });
     }
@@ -14194,6 +14243,7 @@ fn handle_connection(
     search: &SearchGuard,
     confirm: &ConfirmGuard,
     allow_insecure_open: bool,
+    registry_loaded: bool,
 ) {
     let method = request.method().to_string().to_uppercase();
     let url = request.url().to_string();
@@ -14305,7 +14355,13 @@ fn handle_connection(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Resolve authorization, routing scope, audit attribution, and MCP
         // session ownership from one token lookup and one effective allow-set.
-        match resolve_http_caller(&reg, token.as_deref(), provided_tok, allow_insecure_open) {
+        match resolve_http_caller(
+            &reg,
+            token.as_deref(),
+            provided_tok,
+            allow_insecure_open,
+            registry_loaded,
+        ) {
             Some((allowed, resolved_caller)) => {
                 caller = Some(resolved_caller);
                 Some(allowed)
@@ -14616,7 +14672,11 @@ fn main() {
         );
         glog("WARNING: MSIX container detected but devirtualization failed (UNC view unreachable)");
     }
-    let loaded = match registry::load_resolved() {
+    // SBS-900: keep the load *outcome* next to the in-memory registry. Err falls
+    // back to `Registry::default()`, whose empty `http_clients` must not satisfy
+    // the `--insecure-loopback` open branch. A missing file is `Ok(default)` and
+    // is not this case. Watcher reload-fail already keeps the previous registry.
+    let (loaded, registry_loaded) = match registry::load_resolved() {
         Ok(r) => {
             glog(&format!(
                 "load_resolved OK: {} servers total, {} enabled (active={})",
@@ -14629,7 +14689,7 @@ fn main() {
             // re-enable code mode after a corrupt registry (WS2-5). The watcher
             // already fails safe by not updating the flag on reload failure.
             seed_code_mode_after_registry_load(Ok(&r));
-            r
+            (r, true)
         }
         Err(e) => {
             // Always surface this (not only under CONDUIT_DEBUG). A corrupt or
@@ -14643,7 +14703,7 @@ fn main() {
             );
             glog(&format!("load_resolved ERR: {e}"));
             seed_code_mode_after_registry_load(Err(()));
-            registry::Registry::default()
+            (registry::Registry::default(), false)
         }
     };
     inspect::clear();
@@ -14887,7 +14947,7 @@ fn main() {
     // so it replaces the stdio loop; the background build + registry watcher
     // started above still keep the router and cache live underneath it.
     if let Some(port) = http_port_opt {
-        serve_http(state, port);
+        serve_http(state, port, registry_loaded);
         return;
     }
 
@@ -19925,7 +19985,9 @@ mod tests {
         let port = server.server_addr().to_ip().unwrap().port();
         let search = Arc::new(SearchGuard::default());
         let confirm = Arc::new(ConfirmGuard::new());
-        std::thread::spawn(move || serve_http_loop(server, state, None, search, confirm, true));
+        std::thread::spawn(move || {
+            serve_http_loop(server, state, None, search, confirm, true, true)
+        });
         std::thread::sleep(Duration::from_millis(50)); // let the listener come up
 
         // Kick off the slow (blocking) call on its own thread, then let it get parked
@@ -20044,6 +20106,7 @@ mod tests {
                 None,
                 search,
                 confirm,
+                true,
                 true,
                 listener_inflight,
             )
@@ -20224,15 +20287,67 @@ mod tests {
 
     #[test]
     fn http_bind_requires_auth_except_for_explicit_loopback_escape_hatch() {
-        assert!(http_bind_is_authorized(true, true, false));
-        assert!(http_bind_is_authorized(false, true, false));
-        assert!(http_bind_is_authorized(true, false, true));
-        assert!(!http_bind_is_authorized(true, false, false));
-        assert!(!http_bind_is_authorized(false, false, false));
-        assert!(!http_bind_is_authorized(false, false, true));
-        assert!(http_allows_insecure_open(true, false, true));
-        assert!(!http_allows_insecure_open(true, true, true));
-        assert!(!http_allows_insecure_open(false, false, true));
+        assert!(http_bind_is_authorized(true, true, false, true));
+        assert!(http_bind_is_authorized(false, true, false, true));
+        assert!(http_bind_is_authorized(true, false, true, true));
+        assert!(!http_bind_is_authorized(true, false, false, true));
+        assert!(!http_bind_is_authorized(false, false, false, true));
+        assert!(!http_bind_is_authorized(false, false, true, true));
+        assert!(http_allows_insecure_open(true, false, true, true));
+        assert!(!http_allows_insecure_open(true, true, true, true));
+        assert!(!http_allows_insecure_open(false, false, true, true));
+    }
+
+    /// SBS-900: boot `load_resolved` Err falls back to `Registry::default()`, whose
+    /// empty `http_clients` used to satisfy the `--insecure-loopback` open branch.
+    /// A failed load is not "no clients configured". A missing file is `Ok(default)`
+    /// and is not this case.
+    #[test]
+    fn failed_registry_load_does_not_open_insecure_loopback() {
+        let reg = Registry::default();
+        // Request resolver: flag + empty default after a failed load must not open.
+        assert!(
+            resolve_http_scope(&reg, None, None, true, false).is_none(),
+            "failed load must not authorize the open caller"
+        );
+        assert!(
+            resolve_http_caller(&reg, None, None, true, false).is_none(),
+            "failed load must not mint the open HttpCaller"
+        );
+        // Startup: failed load + no env token must not authorize the open bind.
+        assert!(
+            !http_allows_insecure_open(true, false, true, false),
+            "failed load must not activate the open-listener fallback"
+        );
+        assert!(
+            !http_bind_is_authorized(true, false, true, false),
+            "failed load + no env token must not authorize the open bind"
+        );
+        // Failed load + env token still binds; the token is the auth, not the hatch.
+        assert!(
+            http_bind_is_authorized(true, true, true, false),
+            "failed load + env token must still bind"
+        );
+        assert!(
+            !http_allows_insecure_open(true, true, true, false),
+            "an env token must not also open the unauthenticated branch"
+        );
+        assert_eq!(
+            resolve_http_scope(&reg, Some("envtok"), Some("envtok"), true, false),
+            Some(None),
+            "failed load + matching env token must still authorize"
+        );
+    }
+
+    /// SBS-900: a successful empty load (`Ok(Registry::default())`, including a
+    /// missing file) plus `--insecure-loopback` still opens.
+    #[test]
+    fn successful_empty_registry_load_still_opens_insecure_loopback() {
+        let reg = Registry::default();
+        assert_eq!(resolve_http_scope(&reg, None, None, true, true), Some(None));
+        assert!(resolve_http_caller(&reg, None, None, true, true).is_some());
+        assert!(http_allows_insecure_open(true, false, true, true));
+        assert!(http_bind_is_authorized(true, false, true, true));
     }
 
     #[test]
@@ -20457,14 +20572,14 @@ mod tests {
     fn resolve_http_scope_auth_and_scope_policy() {
         let mut reg = Registry::default();
         // No auth configured at all -> open only under the explicit escape hatch.
-        assert_eq!(resolve_http_scope(&reg, None, None, true), Some(None));
-        assert_eq!(resolve_http_scope(&reg, None, None, false), None);
+        assert_eq!(resolve_http_scope(&reg, None, None, true, true), Some(None));
+        assert_eq!(resolve_http_scope(&reg, None, None, false, true), None);
         // Legacy env token: exact match -> unscoped; mismatch -> rejected.
         assert_eq!(
-            resolve_http_scope(&reg, Some("envtok"), Some("envtok"), false),
+            resolve_http_scope(&reg, Some("envtok"), Some("envtok"), false, true),
             Some(None)
         );
-        assert!(resolve_http_scope(&reg, Some("envtok"), Some("nope"), false).is_none());
+        assert!(resolve_http_scope(&reg, Some("envtok"), Some("nope"), false, true).is_none());
         // A registered client with an empty profile is authorized but unscoped.
         reg.http_clients.push(registry::HttpClient {
             id: "c1".into(),
@@ -20473,13 +20588,13 @@ mod tests {
             profile: String::new(),
         });
         assert_eq!(
-            resolve_http_scope(&reg, None, Some("fulltok"), false),
+            resolve_http_scope(&reg, None, Some("fulltok"), false, true),
             Some(None)
         );
         // Once any client is registered, an unknown/absent bearer is rejected
         // (the open default no longer applies).
-        assert!(resolve_http_scope(&reg, None, Some("unknown"), false).is_none());
-        assert!(resolve_http_scope(&reg, None, None, false).is_none());
+        assert!(resolve_http_scope(&reg, None, Some("unknown"), false, true).is_none());
+        assert!(resolve_http_scope(&reg, None, None, false, true).is_none());
         // A client scoped to a non-empty profile resolves to a (possibly empty)
         // allow-set; exact membership is covered by enabled_servers_for tests.
         reg.http_clients.push(registry::HttpClient {
@@ -20489,19 +20604,22 @@ mod tests {
             profile: "Default".into(),
         });
         assert!(matches!(
-            resolve_http_scope(&reg, None, Some("scopedtok"), false),
+            resolve_http_scope(&reg, None, Some("scopedtok"), false, true),
             Some(Some(_))
         ));
 
         // Removing the last registered client while the gateway is live must not
         // turn an authenticated listener into an open one. Only immutable startup
         // policy from `--insecure-loopback` enables the fallback.
-        let authenticated_startup_allows_open = http_allows_insecure_open(true, true, true);
+        let authenticated_startup_allows_open = http_allows_insecure_open(true, true, true, true);
         reg.http_clients.clear();
-        assert!(resolve_http_scope(&reg, None, None, authenticated_startup_allows_open).is_none());
-        let explicit_open_startup = http_allows_insecure_open(true, false, true);
+        assert!(
+            resolve_http_scope(&reg, None, None, authenticated_startup_allows_open, true)
+                .is_none()
+        );
+        let explicit_open_startup = http_allows_insecure_open(true, false, true, true);
         assert_eq!(
-            resolve_http_scope(&reg, None, None, explicit_open_startup),
+            resolve_http_scope(&reg, None, None, explicit_open_startup, true),
             Some(None)
         );
     }
@@ -20525,7 +20643,7 @@ mod tests {
         });
 
         let (_, caller) =
-            resolve_http_caller(&reg, None, Some("client-token"), false).unwrap();
+            resolve_http_caller(&reg, None, Some("client-token"), false, true).unwrap();
 
         // Use a real in-memory downstream route so the tools/call request reaches
         // execute_call(), which is where the audit entry is recorded.
@@ -20650,8 +20768,8 @@ mod tests {
             profile: String::new(),
         });
 
-        let (_, first) = resolve_http_caller(&reg, None, Some("tok1"), false).unwrap();
-        let (_, second) = resolve_http_caller(&reg, None, Some("tok2"), false).unwrap();
+        let (_, first) = resolve_http_caller(&reg, None, Some("tok1"), false, true).unwrap();
+        let (_, second) = resolve_http_caller(&reg, None, Some("tok2"), false, true).unwrap();
         assert_eq!(first.audit_label.as_deref(), Some("Open WebUI"));
         assert_eq!(second.audit_label.as_deref(), Some("Open WebUI"));
         assert_ne!(
@@ -20703,8 +20821,8 @@ mod tests {
             token_sha256: registry::sha256_hex("t-b"),
             profile: String::new(),
         });
-        let (_, a) = resolve_http_caller(&reg, None, Some("t-a"), false).unwrap();
-        let (_, b) = resolve_http_caller(&reg, None, Some("t-b"), false).unwrap();
+        let (_, a) = resolve_http_caller(&reg, None, Some("t-a"), false, true).unwrap();
+        let (_, b) = resolve_http_caller(&reg, None, Some("t-b"), false, true).unwrap();
         // What handle_http must pass into process_request (stable id, not label).
         assert_eq!(a.session_owner.identity, "client:alpha");
         assert_eq!(b.session_owner.identity, "client:beta");
@@ -21230,7 +21348,9 @@ mod tests {
         let port = server.server_addr().to_ip().unwrap().port();
         let search = Arc::new(SearchGuard::default());
         let confirm = Arc::new(ConfirmGuard::new());
-        std::thread::spawn(move || serve_http_loop(server, state, None, search, confirm, true));
+        std::thread::spawn(move || {
+            serve_http_loop(server, state, None, search, confirm, true, true)
+        });
 
         let body = modern_http_body(1, "tools/list", json!({}));
         let response = http_post_with_headers(

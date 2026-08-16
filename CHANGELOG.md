@@ -18,6 +18,13 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **A failed registry load no longer counts as "no HTTP clients".** `--insecure-loopback`
+  treats an empty `http_clients` list as permission to bind and serve without a bearer.
+  Boot used to fall back to `Registry::default()` on `load_resolved` Err, which is also
+  empty, so a corrupt or unreadable registry silently satisfied that precondition. The
+  open branch now requires a successful load _and_ no registered clients. A missing
+  registry file was already `Ok(default)` and is unchanged. A failed load with
+  `TOOLPORT_HTTP_TOKEN` still binds. (SBS-900)
 - **Linux `.deb` installs a `toolport` command.** The package still ships the
   crate binary as `conduit` (compat alias) and now also puts `toolport` on
   `PATH`, matching the AppImage installer and the brand. `install.sh` tells apt
