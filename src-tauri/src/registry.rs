@@ -22,6 +22,30 @@ const REGISTRY_VERSION: u32 = 1;
 /// Per-process counter for unique atomic-write temp names.
 static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Open an append-mode log, creating it owner-only.
+///
+/// The plain `OpenOptions::new().create(true).append(true)` pattern takes the
+/// process umask, which under the usual 022 lands 0644: world-readable. These
+/// files only became 0600 on their FIRST size-triggered rotation, because
+/// rotation goes through [`atomic_write`], which sets the mode before writing.
+/// So every append-mode log was readable by a second OS user from creation until
+/// its first rotation, including `gateway.log`, which publishes the HITL broker's
+/// bound port, and `inspect`'s raw request and response bodies (SBS-868).
+///
+/// The mode is applied at creation, not after: setting it afterwards leaves a
+/// window in which the file exists world-readable. On Windows this is a no-op,
+/// the same way [`AtomicWriteOps::set_owner_only`] is.
+pub fn open_append_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 trait AtomicWriteOps {
     fn set_owner_only(&self, file: &std::fs::File) -> std::io::Result<()>;
     fn write_all(&self, file: &mut std::fs::File, contents: &[u8]) -> std::io::Result<()>;

@@ -124,11 +124,8 @@ fn append_line(entry: &Value) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
+        // Owner-only from creation (SBS-868).
+        if let Ok(mut file) = crate::registry::open_append_private(&path) {
             let _ = file.write_all(format!("{entry}\n").as_bytes());
         }
         rotate_if_large(&path);

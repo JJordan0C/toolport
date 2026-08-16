@@ -2886,7 +2886,9 @@ fn record_event(event: &Value) {
         if recently_recorded(event, &path) {
             return;
         }
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        // Owner-only from creation (SBS-868): drift events carry injection
+        // signatures and evidence snippets.
+        if let Ok(mut file) = crate::registry::open_append_private(&path) {
             // Single write_all (not writeln!, which issues several syscalls) so the many
             // client-spawned gateways sharing this file can't interleave into corrupt JSON.
             let _ = file.write_all(format!("{event}\n").as_bytes());

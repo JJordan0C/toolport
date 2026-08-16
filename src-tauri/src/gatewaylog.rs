@@ -65,11 +65,9 @@ pub(crate) fn append_to(path: &Path, msg: &str) {
 /// One `O_APPEND` write of the whole record, so even the unlocked fallback
 /// cannot interleave half a line with another writer's.
 fn append_line(path: &Path, msg: &str) {
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
+    // Owner-only from creation: this log carries the broker's bound HITL port
+    // (SBS-868).
+    if let Ok(mut f) = crate::registry::open_append_private(path) {
         let _ = f.write_all(format!("{msg}\n").as_bytes());
     }
 }

@@ -590,12 +590,8 @@ fn write_line_at_with_rotation_hook(
             return;
         }
     };
-    let open = || {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-    };
+    // Owner-only from creation, not from the first rotation onward (SBS-868).
+    let open = || crate::registry::open_append_private(&path);
     // The registry normally created this directory before any call. Avoid a
     // redundant create-directory syscall on every append, but retain the
     // standalone/first-writer behavior by creating it and retrying on NotFound.

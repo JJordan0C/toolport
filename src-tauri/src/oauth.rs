@@ -191,11 +191,8 @@ fn debug_log(msg: &str) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
+        // Owner-only from creation (SBS-868).
+        if let Ok(mut f) = crate::registry::open_append_private(&path) {
             let _ = writeln!(f, "{msg}");
         }
     }
