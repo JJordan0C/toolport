@@ -5966,6 +5966,47 @@ fn log_repoint_outcome(current: &str, outcome: &RepointOutcome) {
     ));
 }
 
+/// Serializes tests that read or mutate the process-global env vars these resolvers depend on
+/// (`XDG_*`, `GOOSE_PATH_ROOT`, `CLAUDE_CONFIG_DIR`). The env is process-global and Rust runs
+/// tests in parallel, so a test in ANY module that sets one of those keys must hold this lock,
+/// not a lock of its own. Poison is recovered: a panic elsewhere shouldn't wedge these.
+#[cfg(test)]
+pub(crate) fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Sets a process env var and puts the old value back when the guard drops. Only valid while
+/// [`env_test_lock`] is held. Lives beside the lock so other modules' tests use both.
+#[cfg(test)]
+pub(crate) struct EnvRestore {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl EnvRestore {
+    pub(crate) fn set(key: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10297,30 +10338,9 @@ rules:
     /// runs tests in parallel, so without this the test that sets `XDG_CONFIG_HOME`
     /// could change `dirs::config_dir()` mid-flight under a test that reads it,
     /// which is exactly what made `client_config_paths_match_current_platform`
-    /// flake on CI. Poison is recovered: a panic elsewhere shouldn't wedge these.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct EnvRestore {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvRestore {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    /// flake on CI. Lives on the module (see [`super::env_test_lock`]) so tests in
+    /// other modules that set the same keys take the SAME lock.
+    use super::ENV_TEST_LOCK as ENV_LOCK;
 
     #[test]
     fn amp_is_registered() {
