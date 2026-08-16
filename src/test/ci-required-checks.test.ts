@@ -19,7 +19,12 @@ import { parse } from "yaml";
 const REQUIRED_CHECK_NAME = "Build + test";
 
 /** Jobs that must be green before the required check can be green. */
-const GATED_JOB_IDS = ["build-test", "cross-platform-rust", "installer-script"];
+const GATED_JOB_IDS = [
+  "build-test",
+  "cross-platform-rust",
+  "installer-script",
+  "pinned-install-urls",
+];
 
 interface WorkflowStep {
   name?: string;
@@ -225,7 +230,7 @@ jobs:
   merge-gate:
     name: Build + test
     if: always()
-    needs: [build-test, cross-platform-rust, installer-script]
+    needs: [build-test, cross-platform-rust, installer-script, pinned-install-urls]
     runs-on: ubuntu-22.04
     steps:
       - name: Require everything
@@ -233,6 +238,7 @@ jobs:
           echo "build-test=\${{ needs.build-test.result }}"
           echo "cross-platform-rust=\${{ needs.cross-platform-rust.result }}"
           echo "installer-script=\${{ needs.installer-script.result }}"
+          echo "pinned-install-urls=\${{ needs.pinned-install-urls.result }}"
 `);
     const gate = jobsWithCheckName(fixture.jobs, REQUIRED_CHECK_NAME)[0][1];
     // Passes the name / always() / needs assertions, but gates nothing.
@@ -287,14 +293,15 @@ jobs:
         run: |
           test "\${{ needs.build-test.result }}" = "success"
           test "\${{ needs.cross-platform-rust.result }}" = "success"
-          test "\${{ needs.installer-script.result }}" = "success"`;
+          test "\${{ needs.installer-script.result }}" = "success"
+          test "\${{ needs.pinned-install-urls.result }}" = "success"`;
     const gateWith = (extra: string, runsOn = "ubuntu-22.04") =>
       parseWorkflow(`
 jobs:
   merge-gate:
     name: Build + test
     if: always()
-    needs: [build-test, cross-platform-rust, installer-script]
+    needs: [build-test, cross-platform-rust, installer-script, pinned-install-urls]
     runs-on: ${runsOn}
     steps:
       - name: Require everything${extra}${script}
