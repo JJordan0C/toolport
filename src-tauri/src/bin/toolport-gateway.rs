@@ -8650,9 +8650,65 @@ fn merge_tool_scopes_for_http(reg: &Registry) -> HashMap<String, HashSet<String>
     by_server
 }
 
+/// Live quarantine enforcement a rebuild can keep when the store read fails
+/// (SBS-871). `None` is a genuine cold start (no prior decision).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PriorQuarantine {
+    set: BTreeSet<String>,
+    fail_closed: bool,
+}
+
+/// How [`build_router`] should start the quarantine set after a store read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QuarantineBootstrap {
+    UseSet(BTreeSet<String>),
+    KeepSet(BTreeSet<String>),
+    /// Carry the previous set forward AND keep the catalog hidden: the store is
+    /// still unreadable, so the set alone is not the full enforcement state.
+    KeepFailClosed(BTreeSet<String>),
+    FailClosedCatalog,
+}
+
+/// Decide the quarantine set a rebuilt router starts with (SBS-871).
+///
+/// A store `Err` must never become an empty set: keep the pre-rebuild live set
+/// when we have one, and hide the whole catalog on a genuine cold start.
+fn quarantine_bootstrap(
+    stored: Result<BTreeSet<String>, String>,
+    previous: Option<&PriorQuarantine>,
+) -> QuarantineBootstrap {
+    match stored {
+        Ok(set) => QuarantineBootstrap::UseSet(set),
+        Err(_) => match previous {
+            Some(prior) if prior.fail_closed => {
+                QuarantineBootstrap::KeepFailClosed(prior.set.clone())
+            }
+            Some(prior) => QuarantineBootstrap::KeepSet(prior.set.clone()),
+            None => QuarantineBootstrap::FailClosedCatalog,
+        },
+    }
+}
+
+/// Snapshot the live router's quarantine decision BEFORE a rebuild (SBS-871).
+///
+/// `None` only for the never-built startup placeholder. A router that WAS built but
+/// connected zero servers (every connect failed, or the profile is empty) is still a
+/// real prior decision, so a store `Err` on the next rebuild keeps that decision
+/// instead of pretending this is a cold start.
+fn prior_quarantine_from_router(router: &Router) -> Option<PriorQuarantine> {
+    if !router.is_built() {
+        return None;
+    }
+    Some(PriorQuarantine {
+        set: router.quarantined().clone(),
+        fail_closed: router.catalog_fail_closed(),
+    })
+}
+
 /// Spawn and connect every enabled server into a router. With `profile` set, only
 /// that profile's servers are connected (per-client scoping); otherwise the
 /// active profile is used.
+#[allow(clippy::too_many_arguments)] // SBS-871 adds the pre-rebuild quarantine set.
 fn build_router(
     reg: &Registry,
     profile: Option<&str>,
@@ -8668,6 +8724,8 @@ fn build_router(
     resource_updated: Option<ResourceUpdatedDispatch>,
     // Live subscription table so reconnect factories re-issue resources/subscribe.
     resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
+    // Pre-rebuild live quarantine set. `None` is a genuine cold start (SBS-871).
+    previous_quarantine: Option<PriorQuarantine>,
 ) -> Router {
     // In HTTP mode one process serves every registered client, so connect the
     // union of all their profiles (per-request filtering scopes each one down).
@@ -8715,35 +8773,57 @@ fn build_router(
         }
         allow
     };
+    // Historical installs have pins without quarantine.json. Materialize `{}`
+    // under the store lock so a later missing-while-pins-exist read is a real
+    // rename-window error, not every boot (SBS-871).
+    integrity::ensure_quarantine_store_for_existing_pins(profile);
+    let stored = if reg.quarantine_on_drift_effective() {
+        integrity::quarantined(profile)
+    } else {
+        // Baseline tamper invalidates the catalog's trust root, so those entries
+        // remain blocked even when optional high-risk drift quarantine is off.
+        integrity::mandatory_quarantined(profile)
+    };
+    let stored_error = stored.as_ref().err().cloned();
+    let bootstrap = quarantine_bootstrap(stored, previous_quarantine.as_ref());
+    if let Some(e) = stored_error {
+        match &bootstrap {
+            QuarantineBootstrap::KeepSet(_) => {
+                glog(&format!(
+                    "SECURITY: {e}; keeping the pre-rebuild quarantine set rather than \
+                     installing an empty one. Fix or replace the quarantine store."
+                ));
+                eprintln!("toolport: {e}; keeping the pre-rebuild quarantine set");
+            }
+            QuarantineBootstrap::KeepFailClosed(_) | QuarantineBootstrap::FailClosedCatalog => {
+                glog(&format!(
+                    "SECURITY: {e}; blocking the catalog until the quarantine store reads. \
+                     Fix or replace the quarantine store."
+                ));
+                eprintln!("toolport: {e}; blocking the catalog until the quarantine store reads");
+            }
+            QuarantineBootstrap::UseSet(_) => {}
+        }
+    }
+    let (quarantined, fail_closed_catalog) = match bootstrap {
+        QuarantineBootstrap::UseSet(set) | QuarantineBootstrap::KeepSet(set) => (set, false),
+        // Carry the set forward too: a fail-closed router can hold real blocks (an
+        // integrity write failure unions them in), and dropping them would weaken
+        // enforcement the moment the hide lifts.
+        QuarantineBootstrap::KeepFailClosed(set) => (set, true),
+        QuarantineBootstrap::FailClosedCatalog => (BTreeSet::new(), true),
+    };
     let policy = ToolPolicy {
         disabled,
         allow,
         deny_destructive: reg.deny_destructive_effective(),
         // Hide already-quarantined tools from the first build (the set persists across
         // restarts); newly detected drift is added during the integrity check below.
-        // On store failure, start with empty blocked and log loudly (SOU-320): there is
-        // no prior live set yet. We deliberately do NOT rename/clear a corrupt file —
-        // that would make the next reconcile install a permanent empty set.
-        quarantined: {
-            let stored = if reg.quarantine_on_drift_effective() {
-                integrity::quarantined(profile)
-            } else {
-                // Baseline tamper invalidates the catalog's trust root, so those entries
-                // remain blocked even when optional high-risk drift quarantine is off.
-                integrity::mandatory_quarantined(profile)
-            };
-            match stored {
-                Ok(set) => set,
-                Err(e) => {
-                    glog(&format!(
-                        "SECURITY: {e}; starting with no quarantine set (cold start has \
-                         no prior set to keep). Fix or replace the quarantine store."
-                    ));
-                    eprintln!("toolport: {e}; starting with no quarantine set");
-                    Default::default()
-                }
-            }
-        },
+        // On store Err, keep the pre-rebuild live set or hide the catalog (SBS-871).
+        // We deliberately do NOT rename/clear a corrupt file: that would make the
+        // next reconcile install a permanent empty set (SOU-320).
+        quarantined,
+        fail_closed_catalog,
     };
 
     // Connect concurrently so total time is the slowest server, not the sum. Each
@@ -9704,6 +9784,8 @@ fn requarantine_after_integrity_change(
     let mut guard = router
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Only a successful read is allowed to lift a fail-closed catalog (SBS-871).
+    let store_read_ok = persisted.is_ok();
     let mut enforce = match persisted {
         Ok(set) => set,
         Err(e) => {
@@ -9722,7 +9804,12 @@ fn requarantine_after_integrity_change(
     // make_mut clones the Router (sharing its Arc<ServerSlot> connections) only if an in-flight
     // request still holds the old Arc; the old snapshot keeps serving until that request ends.
     let r = Arc::make_mut(&mut guard);
-    r.requarantine(enforce);
+    if store_read_ok {
+        r.requarantine_from_store(enforce);
+    } else {
+        // Store still unreadable: install the union, but leave any fail-closed hide up.
+        r.requarantine(enforce);
+    }
     r.aggregated_tools()
 }
 
@@ -9743,6 +9830,9 @@ fn fail_closed_integrity_catalog(
         fail_closed.extend(persisted);
     }
     let r = Arc::make_mut(&mut guard);
+    // Never `requarantine_from_store` here: this is the integrity-store FAILURE path,
+    // so a fail-closed catalog stays hidden. `reconcile_quarantine` lifts it on the
+    // next watcher tick that actually reads the store (SBS-871).
     r.requarantine(fail_closed);
     r.aggregated_tools()
 }
@@ -9829,6 +9919,10 @@ fn reconcile_quarantine(
 /// only if it actually differs. Split out from the disk read so the decision logic is
 /// testable without touching `conduit_dir()`, which memoizes per process and so can't be
 /// redirected from a test once anything else has resolved it.
+///
+/// This is THE lift point for a fail-closed catalog (SBS-871): its only caller,
+/// `reconcile_quarantine`, gets here solely on a successful store read. Every other
+/// `requarantine` call sits on an error path and leaves the hide up.
 fn reconcile_to(
     router: &Arc<Mutex<Arc<Router>>>,
     stdout: &Arc<Mutex<std::io::Stdout>>,
@@ -9839,13 +9933,17 @@ fn reconcile_to(
         let mut guard = router
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.quarantined() == &want {
+        // The set alone is not the enforcement state: a fail-closed router hides
+        // everything while reporting an empty set, so comparing sets only would make a
+        // successful read of an empty store a no-op and leave the gateway dark until
+        // the process restarted (SBS-871).
+        if guard.quarantined() == &want && !guard.catalog_fail_closed() {
             false
         } else {
             // make_mut clones only if an in-flight request still holds the old Arc, so a
             // request mid-flight keeps serving its snapshot until it finishes.
             let r = Arc::make_mut(&mut guard);
-            r.requarantine(want);
+            r.requarantine_from_store(want);
             true
         }
     };
@@ -9864,6 +9962,33 @@ fn reconcile_to(
     changed
 }
 
+/// A fail-closed catalog serves nothing, so the last-good cache must go too
+/// (SBS-871). Every other empty build is treated as transient and deliberately keeps
+/// the cache; without this the hide would only reach `route_call` while `tools/list`
+/// kept advertising the catalog it was supposed to hide.
+///
+/// The on-disk cache is cleared as well, so a restart before the store recovers does
+/// not seed `tools/list` from it. The cost of a false alarm is one rebuild.
+fn clear_catalog_for_fail_closed(cached_tools: &SharedCatalog, profile: Option<&str>) {
+    *cached_tools
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(CatalogSnapshot::default());
+    save_tool_cache(&[], profile);
+    glog(
+        "SECURITY: quarantine store unreadable; cleared the tool cache so tools/list \
+         cannot serve the hidden catalog",
+    );
+}
+
+/// Whether the live router is hiding everything because the quarantine store could
+/// not be read (SBS-871).
+fn router_is_fail_closed(router: &Arc<Mutex<Arc<Router>>>) -> bool {
+    router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .catalog_fail_closed()
+}
+
 fn persist_and_emit_with_sessions(
     tools: &[Value],
     cached_tools: &SharedCatalog,
@@ -9873,6 +9998,11 @@ fn persist_and_emit_with_sessions(
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
     profile: Option<&str>,
 ) {
+    if router_is_fail_closed(router) {
+        clear_catalog_for_fail_closed(cached_tools, profile);
+        notify_tools_changed(stdout, mcp_sessions);
+        return;
+    }
     if !tools.is_empty() {
         let started = Instant::now();
         let tools = {
@@ -10312,6 +10442,16 @@ fn watch_tick(
         let _rebuild = rebuild_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Snapshot the pre-rebuild router BEFORE build_router so a store Err
+        // can keep the live quarantine set (SBS-871). The routes map is also
+        // the authoritative (server, original) source for tools a guarded
+        // rebuild keeps from the previous catalog (issue #700).
+        let previous_router = {
+            let guard = router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (**guard).clone()
+        };
         // Build the new router (spawns processes) before taking the router lock.
         let new_router = build_router(
             &new_reg,
@@ -10322,6 +10462,7 @@ fn watch_tick(
             root.as_deref(),
             resource_updated.cloned(),
             resource_subs.cloned(),
+            prior_quarantine_from_router(&previous_router),
         );
         // Re-issue tracked resource subscriptions against the fresh connections.
         if let Some(subs) = resource_subs {
@@ -10329,15 +10470,9 @@ fn watch_tick(
         }
         let server_count = new_router.server_count();
         let tools = new_router.aggregated_tools();
-        // Snapshot the pre-rebuild router BEFORE publishing the new one: its
-        // routes map is the authoritative (server, original) source for tools a
-        // guarded rebuild keeps from the previous catalog (issue #700).
-        let previous_router = {
-            let guard = router
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (**guard).clone()
-        };
+        // `previous_router` is snapshotted before `build_router` above (SBS-871),
+        // so it is already in scope here. Publish through `publish_registry` so
+        // the registry and its trust verdict land under one lock (SBS-900).
         publish_registry(new_reg);
         *router
             .lock()
@@ -11920,6 +12055,14 @@ fn rebuild_router_for_root(state: &GatewayState) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let root = current_client_root(state);
+    // Snapshot before build_router so a store Err keeps the live set (SBS-871).
+    let previous_router = {
+        let guard = state
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (**guard).clone()
+    };
     let new_router = build_router(
         &reg,
         profile.as_deref(),
@@ -11929,18 +12072,10 @@ fn rebuild_router_for_root(state: &GatewayState) {
         root.as_deref(),
         state.resource_updated_sink.clone(),
         Some(Arc::clone(&state.resource_subs)),
+        prior_quarantine_from_router(&previous_router),
     );
     reestablish_all_resource_subscriptions(&new_router, &state.resource_subs);
     let tools = new_router.aggregated_tools();
-    // Snapshot the pre-rebuild router before publishing: authoritative routes
-    // for tools a guarded rebuild keeps from the previous catalog (issue #700).
-    let previous_router = {
-        let guard = state
-            .router
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (**guard).clone()
-    };
     *state
         .router
         .lock()
@@ -12196,6 +12331,14 @@ fn process_request(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             let root = current_client_root(state);
+            // Snapshot before build_router so a store Err keeps the live set (SBS-871).
+            let previous_router = {
+                let guard = state
+                    .router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (**guard).clone()
+            };
             let built = build_router(
                 &reg,
                 profile_snapshot.as_deref(),
@@ -12205,19 +12348,11 @@ fn process_request(
                 root.as_deref(),
                 state.resource_updated_sink.clone(),
                 Some(Arc::clone(&state.resource_subs)),
+                prior_quarantine_from_router(&previous_router),
             );
             if built.server_count() > 0 {
                 reestablish_all_resource_subscriptions(&built, &state.resource_subs);
                 let tools = built.aggregated_tools();
-                // Snapshot the pre-rebuild router before publishing: authoritative
-                // routes for tools the guard keeps from the previous catalog.
-                let previous_router = {
-                    let guard = state
-                        .router
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    (**guard).clone()
-                };
                 *state
                     .router
                     .lock()
@@ -12241,7 +12376,11 @@ fn process_request(
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     Arc::make_mut(&mut guard).adopt_restored_routes(&previous_router, &tools);
                 }
-                if !tools.is_empty() {
+                // A fail-closed rebuild hides everything, so the cache must not keep
+                // serving the last-good catalog past it (SBS-871).
+                if router_is_fail_closed(&state.router) {
+                    clear_catalog_for_fail_closed(&state.cached_tools, profile_snapshot.as_deref());
+                } else if !tools.is_empty() {
                     *state
                         .cached_tools
                         .lock()
@@ -14985,8 +15124,13 @@ fn main() {
                 // Cold start: no upstream clients yet; reconnect factories still
                 // capture the shared table for later re-subscribes.
                 Some(resource_subs_for_build),
+                // Genuine cold start: no prior live set to keep (SBS-871).
+                None,
             );
             let tools = built.aggregated_tools();
+            // Read before the router is moved below: a fail-closed build must clear
+            // the cache instead of being treated as a transient empty one (SBS-871).
+            let fail_closed = built.catalog_fail_closed();
             glog(&format!(
                 "background build: {} tools from {} servers",
                 tools.len(),
@@ -15005,8 +15149,11 @@ fn main() {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(built);
             // Don't let a transient empty build (registry caught mid-write, or
             // every downstream momentarily unreachable) clobber a good catalog -
-            // that's what leaves a client showing only toolport_status.
-            if !tools.is_empty() {
+            // that's what leaves a client showing only toolport_status. A
+            // fail-closed build is the deliberate exception: it MUST clobber it.
+            if fail_closed {
+                clear_catalog_for_fail_closed(&cached_tools, p.as_deref());
+            } else if !tools.is_empty() {
                 // The disk cache loaded at startup is the baseline here, so a cold
                 // start that reaches a degraded downstream cannot overwrite a
                 // known-good catalog with its subset.
@@ -25605,6 +25752,200 @@ mod tests {
         assert!(reconcile_to(&router, &stdout, None, set_of(&["a__x"])));
         assert_eq!(router.lock().unwrap().quarantined(), &set_of(&["a__x"]));
         assert!(!reconcile_to(&router, &stdout, None, set_of(&["a__x"])));
+    }
+
+    /// SBS-871: build_router must not Default::default() an empty set on store Err.
+    /// Extracted so the decision can be tested without spawning downstream servers.
+    #[test]
+    fn sbs871_quarantine_bootstrap_keeps_prior_set_on_store_err() {
+        let prior = PriorQuarantine {
+            set: set_of(&["srv__wipe"]),
+            fail_closed: false,
+        };
+        assert_eq!(
+            quarantine_bootstrap(Err("store unreadable".into()), Some(&prior)),
+            QuarantineBootstrap::KeepSet(set_of(&["srv__wipe"]))
+        );
+    }
+
+    #[test]
+    fn sbs871_quarantine_bootstrap_fail_closes_catalog_on_cold_start_err() {
+        assert_eq!(
+            quarantine_bootstrap(Err("store unreadable".into()), None),
+            QuarantineBootstrap::FailClosedCatalog
+        );
+    }
+
+    #[test]
+    fn sbs871_quarantine_bootstrap_keeps_fail_closed_across_rebuild() {
+        let prior = PriorQuarantine {
+            set: BTreeSet::new(),
+            fail_closed: true,
+        };
+        assert_eq!(
+            quarantine_bootstrap(Err("still unreadable".into()), Some(&prior)),
+            QuarantineBootstrap::KeepFailClosed(BTreeSet::new())
+        );
+    }
+
+    /// SBS-871: a fail-closed router can still hold real blocks (an integrity write
+    /// failure unions the pending names in). Carrying only the flag forward would
+    /// drop them the moment the hide lifted.
+    #[test]
+    fn sbs871_quarantine_bootstrap_keeps_the_set_under_fail_closed() {
+        let prior = PriorQuarantine {
+            set: set_of(&["srv__wipe"]),
+            fail_closed: true,
+        };
+        assert_eq!(
+            quarantine_bootstrap(Err("still unreadable".into()), Some(&prior)),
+            QuarantineBootstrap::KeepFailClosed(set_of(&["srv__wipe"]))
+        );
+    }
+
+    #[test]
+    fn sbs871_quarantine_bootstrap_uses_the_store_on_ok() {
+        assert_eq!(
+            quarantine_bootstrap(Ok(set_of(&["srv__wipe"])), None),
+            QuarantineBootstrap::UseSet(set_of(&["srv__wipe"]))
+        );
+    }
+
+    #[test]
+    fn sbs871_prior_quarantine_from_placeholder_router_is_none() {
+        assert_eq!(prior_quarantine_from_router(&Router::new()), None);
+    }
+
+    /// SBS-871: a router that was really built but connected zero servers (every
+    /// connect failed, or an empty profile) still carries a quarantine decision.
+    /// Reading that as "no prior state" turned a transient store Err on a running
+    /// gateway into a full catalog hide.
+    #[test]
+    fn sbs871_prior_quarantine_from_a_live_zero_server_router_is_a_decision() {
+        let live = Router::with_policy(ToolPolicy::default());
+        assert_eq!(live.server_count(), 0);
+        let prior = prior_quarantine_from_router(&live);
+        assert_eq!(
+            prior,
+            Some(PriorQuarantine {
+                set: BTreeSet::new(),
+                fail_closed: false,
+            })
+        );
+        assert_eq!(
+            quarantine_bootstrap(Err("store unreadable".into()), prior.as_ref()),
+            QuarantineBootstrap::KeepSet(BTreeSet::new()),
+            "a live decision is kept, not replaced with a cold-start hide"
+        );
+    }
+
+    /// The gateway's router wrapper holding a router that fail-closed because the
+    /// quarantine store could not be read (SBS-871).
+    fn fail_closed_harness() -> (Arc<Mutex<Arc<Router>>>, Arc<Mutex<std::io::Stdout>>) {
+        let policy = ToolPolicy {
+            fail_closed_catalog: true,
+            ..ToolPolicy::default()
+        };
+        (
+            Arc::new(Mutex::new(Arc::new(Router::with_policy(policy)))),
+            Arc::new(Mutex::new(std::io::stdout())),
+        )
+    }
+
+    /// SBS-871: the hide must LIFT on a successful store read, including a successful
+    /// read of an EMPTY store. Comparing sets alone made that case a no-op (empty vs
+    /// empty), so a running gateway stayed dark until it restarted.
+    #[test]
+    fn sbs871_reconcile_to_lifts_fail_closed_on_a_successful_empty_read() {
+        let (router, stdout) = fail_closed_harness();
+        assert!(router.lock().unwrap().catalog_fail_closed());
+
+        assert!(
+            reconcile_to(&router, &stdout, None, BTreeSet::new()),
+            "a successful read of an empty store must reconcile, not no-op"
+        );
+        assert!(
+            !router.lock().unwrap().catalog_fail_closed(),
+            "a successful store read is exactly what lifts the hide"
+        );
+        // And it settles: the next watcher tick does nothing.
+        assert!(!reconcile_to(&router, &stdout, None, BTreeSet::new()));
+    }
+
+    /// SBS-871: everything that is NOT a successful store read must leave the hide up.
+    /// watch_tick, the ${ROOT} rebuild, and downstream tools/list_changed all run
+    /// requarantine_if_needed, so lifting here re-exposed every connected tool while
+    /// the store was still unreadable.
+    #[test]
+    fn sbs871_integrity_change_with_an_unreadable_store_keeps_fail_closed() {
+        let (router, _stdout) = fail_closed_harness();
+
+        requarantine_after_integrity_change(
+            &router,
+            set_of(&["srv__new_drift"]),
+            Err("quarantine store unreadable".into()),
+        );
+
+        assert!(
+            router.lock().unwrap().catalog_fail_closed(),
+            "an unreadable store must not re-expose the catalog"
+        );
+        assert!(
+            router
+                .lock()
+                .unwrap()
+                .quarantined()
+                .contains("srv__new_drift"),
+            "the new candidate is still recorded for when the hide lifts"
+        );
+    }
+
+    /// SBS-871: the counterpart. When the same path DOES read the store, the set is
+    /// known and the catalog comes back.
+    #[test]
+    fn sbs871_integrity_change_with_a_readable_store_lifts_fail_closed() {
+        let (router, _stdout) = fail_closed_harness();
+
+        requarantine_after_integrity_change(&router, BTreeSet::new(), Ok(set_of(&["srv__wipe"])));
+
+        assert!(!router.lock().unwrap().catalog_fail_closed());
+        assert_eq!(
+            router.lock().unwrap().quarantined(),
+            &set_of(&["srv__wipe"])
+        );
+    }
+
+    /// SBS-871: fail-closed makes aggregated_tools() empty, but every publish path
+    /// treats an empty build as transient and keeps the last-good cache. tools/list
+    /// prefers that cache, so the hide reached route_call and nothing else.
+    #[test]
+    fn sbs871_fail_closed_publish_clears_the_tool_cache() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-sbs871-fail-closed-cache-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        let (router, stdout) = fail_closed_harness();
+        let cached_tools: SharedCatalog =
+            Arc::new(Mutex::new(Arc::new(CatalogSnapshot::new(vec![
+                json!({ "name": "srv__wipe", "description": "", "inputSchema": {} }),
+            ]))));
+
+        persist_and_emit_with_sessions(&[], &cached_tools, &router, None, &stdout, None, None);
+
+        assert!(
+            cached_tools.lock().unwrap().tools.is_empty(),
+            "the last-good cache must not outlive the hide"
+        );
+        assert!(
+            load_tool_cache(None).is_empty(),
+            "and a restart must not seed tools/list from the on-disk copy"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
