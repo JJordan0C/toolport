@@ -26,6 +26,18 @@ Entries before the rename below shipped under the project's former name, Conduit
   who upgrades in place also gets the block moved to the new path: an unchanged
   org text used to skip the write entirely, so the new location stayed empty and
   coverage reported Stale until someone edited the instructions. (SBS-899)
+- **Untrusted MCP output can no longer speak as Toolport.** The external-data
+  wrapper is Toolport-branded (it still said `conduit` after the rebrand) and
+  sanitizes the server label, so a quote in a resource URI cannot close the
+  marker. Downstream text that imitates `[Toolport advisor:]`, `[Toolport shaped]`,
+  `[Toolport:]`, or `[conduit:]` is rewritten before it reaches the model,
+  including tools/list, search (ranked and pinned results), tool and resource
+  and prompt output, and resource errors, even when content defense is off. The
+  rewrite covers a whole tool definition (title, annotations, parameter
+  descriptions, enum values, property names) and a whole result (structured
+  output, prompt messages in any shape), and it folds the same zero-width,
+  fullwidth, and homoglyph evasions the injection scanner already folds.
+  (SBS-896)
 - **A registry that was not really read no longer counts as "no HTTP clients".**
   `--insecure-loopback` treats an empty `http_clients` list as permission to bind and
   serve without a bearer, and that list came back empty for three unrelated reasons: a
