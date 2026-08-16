@@ -25,6 +25,14 @@ Entries before the rename below shipped under the project's former name, Conduit
   the brand) reached the model unchanged while the zero-width form was caught.
   Whitespace is now folded like the other evasions: ignored before the brand and
   collapsed to one space inside it. (SBS-896)
+- **Team Instructions now follow `XDG_CONFIG_HOME` for Goose and Zed.** Connect
+  already wrote those clients' MCP configs under XDG (#757 / SBS-847); the rules
+  writer still hardcoded `~/.config`, so an org push could succeed and never
+  apply. Absolute `GOOSE_PATH_ROOT` is honoured on both the config and rules
+  paths (`<root>/config/config.yaml` and `<root>/config/.goosehints`). A member
+  who upgrades in place also gets the block moved to the new path: an unchanged
+  org text used to skip the write entirely, so the new location stayed empty and
+  coverage reported Stale until someone edited the instructions. (SBS-899)
 - **Untrusted MCP output can no longer speak as Toolport.** The external-data
   wrapper is Toolport-branded (it still said `conduit` after the rebrand) and
   sanitizes the server label, so a quote in a resource URI cannot close the
