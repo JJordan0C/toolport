@@ -20,10 +20,10 @@ more findings in the same family are closed here, along with a set of local-file
 permissions that were wider than intended and an installer that never checked who
 signed the build it was about to install.
 
-Underneath that is the same defect this project keeps finding in new places: code
-that reads a failed probe as good news. A failed reload signal, a failed vault read,
-a failed restart check, a failed backup stat could each come back looking like
-success. Each one now fails closed and says so.
+A run of hardening across the app, on one theme: a check that could not finish used
+to look exactly like a check that passed. A reload signal, a vault read, a restart
+check, a backup stat each had a failure path that came back looking like good news.
+They now report the failure, so what the app shows you is what it actually knows.
 
 ### Added
 
