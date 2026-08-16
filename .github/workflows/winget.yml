@@ -9,14 +9,27 @@ name: winget
 on:
   release:
     types: [released]
+  # Manual catch-up, because `release` fires exactly once per release and the
+  # submission can fail for a reason that resolves later. A NEW package waits in
+  # a moderation queue at winget-pkgs (community volunteers approve it), and
+  # `wingetcreate update` cannot run until that manifest is actually in the repo.
+  # So the approval can land days after the release whose job already failed,
+  # with no way to retry it. That is exactly what happened to 1.14.0 (SBS-903).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to submit, e.g. v1.14.0"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   submit:
-    # Prereleases are not what `winget install` should hand people.
-    if: ${{ !github.event.release.prerelease }}
+    # Prereleases are not what `winget install` should hand people. On a manual
+    # run `github.event.release` is null, so the tag is checked below instead.
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
     runs-on: windows-latest
     env:
       # A PAT with `public_repo`, because GITHUB_TOKEN cannot push to the
@@ -24,8 +37,26 @@ jobs:
       # below no-ops, so adding this workflow cannot fail a release. Same
       # gating style as the Azure signing steps in release.yml.
       WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
-      TAG: ${{ github.event.release.tag_name }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
+      # The release trigger cannot fire for a draft or a prerelease, but a manual
+      # run can name any tag, so it gets the check the trigger gave us for free.
+      - name: Check the tag is a published, non-prerelease release
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $release = gh release view $env:TAG --repo ${{ github.repository }} --json isDraft,isPrerelease | ConvertFrom-Json
+          if ($release.isDraft) {
+            throw "$env:TAG is still a draft. winget validation downloads the installer URL, which 404s until the release is published."
+          }
+          if ($release.isPrerelease) {
+            throw "$env:TAG is a prerelease, which is not what ``winget install`` should hand people."
+          }
+          Write-Output "$env:TAG is published and is not a prerelease."
+
       - name: Submit the manifest update
         if: ${{ env.WINGET_TOKEN != '' }}
         shell: pwsh
