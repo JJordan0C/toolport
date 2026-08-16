@@ -260,8 +260,36 @@ install_macos() {
     hdiutil detach "$tmp/mnt" >/dev/null 2>&1 || true
     err "No .app found in the disk image."
   fi
+
+  # Verify the Developer ID signature before anything touches /Applications
+  # (SBS-897). The digest check above proves the bytes match what GitHub
+  # published; it cannot detect an artifact tampered with BEFORE upload, because
+  # GitHub hashes whatever it was given. The signature is the control that
+  # covers that case, and this is the only chance to apply it: curl does not
+  # write com.apple.quarantine, so Gatekeeper never evaluates the copy on first
+  # launch. Fails closed - the header promises a signed release, so an
+  # unverifiable bundle is not installed.
+  say "Verifying the app signature"
+  if ! codesign --verify --deep --strict "$app" >/dev/null 2>&1; then
+    hdiutil detach "$tmp/mnt" >/dev/null 2>&1 || true
+    err "The app in the disk image failed signature verification, so it is not the release we signed." \
+      "Refusing to install it. Download the .dmg yourself from the Releases page if you want to inspect it."
+  fi
+
+  # Stage beside the target and rename into place, the same shape the AppImage
+  # path uses. The old code ran `rm -rf /Applications/Toolport.app` and only then
+  # copied, so under `set -euo pipefail` a cp that failed partway (disk full,
+  # interrupted, an unmounted image) aborted with the working install already
+  # deleted and a partial bundle in its place (SBS-897).
+  staged="/Applications/Toolport.app.new"
+  rm -rf "$staged"
+  if ! cp -R "$app" "$staged"; then
+    rm -rf "$staged"
+    hdiutil detach "$tmp/mnt" >/dev/null 2>&1 || true
+    err "Couldn't copy Toolport.app into /Applications. Your existing install is untouched."
+  fi
   rm -rf "/Applications/Toolport.app"
-  cp -R "$app" /Applications/
+  mv "$staged" "/Applications/Toolport.app"
   hdiutil detach "$tmp/mnt" >/dev/null 2>&1 || true
   say "Installed to /Applications/Toolport.app. Open it from Launchpad or run: open -a Toolport"
 }
@@ -270,5 +298,8 @@ say "Installing Toolport ${tag_name:-latest}"
 case "$os" in
   Linux) install_linux ;;
   Darwin) install_macos ;;
-  *) err "Unsupported OS: $os. On Windows, run in PowerShell: irm https://raw.githubusercontent.com/$REPO/main/scripts/install.ps1 | iex" ;;
+  # The PINNED short URL, never raw.githubusercontent/main: this line is a
+  # pipe-into-a-shell instruction like the documented one-liner, so it must go
+  # through the same pinned-commit control (SBS-894).
+  *) err "Unsupported OS: $os. On Windows, run in PowerShell: irm https://toolport.app/install.ps1 | iex" ;;
 esac

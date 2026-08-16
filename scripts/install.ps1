@@ -57,7 +57,10 @@ function Install-Toolport {
     # definition.
     $onWindows = if ($null -ne $IsWindows) { $IsWindows } else { $true }
     if (-not $onWindows) {
-        throw "This installer is for Windows. On macOS or Linux run: curl -fsSL https://raw.githubusercontent.com/$repo/main/scripts/install.sh | bash"
+        # The PINNED short URL, never raw.githubusercontent/main: this line is a
+        # pipe-into-a-shell instruction like the documented one-liner, so it must
+        # go through the same pinned-commit control (SBS-894).
+        throw "This installer is for Windows. On macOS or Linux run: curl -fsSL https://toolport.app/install.sh | bash"
     }
     if ($PSVersionTable.PSVersion -lt [version]"5.1") {
         throw "PowerShell 5.1 or newer is required (found $($PSVersionTable.PSVersion))."

@@ -192,7 +192,7 @@ app act on it. Each one now fails closed.
   If the app already manages that client, disconnect it there first or the gateway
   connects twice.
 - **Windows one-line install.**
-  `irm https://raw.githubusercontent.com/tsouth89/toolport/main/scripts/install.ps1 | iex`,
+  `irm https://toolport.app/install.ps1 | iex`,
   matching the macOS and Linux one-liners. It resolves the release through the GitHub
   API, picks the NSIS asset for the machine's architecture, and refuses to install
   anything it cannot verify against the per-asset digest (`-AllowUnverified` is the

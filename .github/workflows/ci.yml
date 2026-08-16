@@ -201,6 +201,36 @@ jobs:
           $result = Invoke-Pester -Path scripts/install.Tests.ps1 -Output Detailed -PassThru
           if ($result.FailedCount -gt 0) { exit 1 }
 
+  # SBS-894: toolport.app/install.sh and /install.ps1 redirect to a PINNED
+  # COMMIT of those scripts, because they are piped into a shell and a movable
+  # URL there means anything that lands on main runs on users' machines. Both
+  # scripts' wrong-OS hints used to send the user to
+  # raw.githubusercontent.com/<repo>/main/scripts/..., routing straight around
+  # that control. The policy lived only in a comment, so it regressed the moment
+  # someone wrote a helpful hint. This makes it a check.
+  pinned-install-urls:
+    name: Pinned installer URLs
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: No file may point at the unpinned installer path
+        run: |
+          # This file is excluded because the search term below is itself an
+          # occurrence. Nothing here is piped into a user's shell.
+          matches="$(git grep -n -- 'main/scripts/' -- ':!.github/workflows/ci.yml' || true)"
+          if [ -n "$matches" ]; then
+            echo "$matches"
+            echo
+            echo "The lines above point at the unpinned installer path on main."
+            echo "Use the pinned short URLs instead: https://toolport.app/install.sh"
+            echo "and https://toolport.app/install.ps1 (SBS-894)."
+            exit 1
+          fi
+
   # SBS-874: branch protection required contexts are only the check named
   # "Build + test". That name used to belong to the Linux-only job, so a red
   # Windows keyring run (Headless Rust tests (windows-latest)) or a red
@@ -218,14 +248,17 @@ jobs:
       - build-test
       - cross-platform-rust
       - installer-script
+      - pinned-install-urls
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     steps:
-      - name: Require Linux, Windows/macOS headless, and install.ps1
+      - name: Require Linux, Windows/macOS headless, install.ps1 and pinned URLs
         run: |
           echo "build-test=${{ needs.build-test.result }}"
           echo "cross-platform-rust=${{ needs.cross-platform-rust.result }}"
           echo "installer-script=${{ needs.installer-script.result }}"
+          echo "pinned-install-urls=${{ needs.pinned-install-urls.result }}"
           test "${{ needs.build-test.result }}" = "success"
           test "${{ needs.cross-platform-rust.result }}" = "success"
           test "${{ needs.installer-script.result }}" = "success"
+          test "${{ needs.pinned-install-urls.result }}" = "success"
