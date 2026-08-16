@@ -2832,9 +2832,28 @@ const SECRET_FLAGS: [&str; 14] = [
 /// its own argv entry with no marker of its own, so it is invisible here and
 /// needs [`secret_arg_mask`], which sees the whole slice.
 pub fn arg_looks_secret(arg: &str) -> bool {
+    looks_secret(arg, BareNeedles::Match)
+}
+
+/// Whether the two no-`=` needles count.
+///
+/// `access_key` / `access-key` as a bare substring is the right bias for an argv
+/// entry, where a false positive costs a `<redacted>` in a setup nobody reads
+/// closely. It is the wrong bias for free text, where it turns "missing
+/// access-key in config" into "missing <redacted> in config" and leaves an audit
+/// row nobody can act on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BareNeedles {
+    Match,
+    Ignore,
+}
+
+fn looks_secret(arg: &str, bare: BareNeedles) -> bool {
     let lower = arg.to_ascii_lowercase();
     let trimmed = lower.trim();
-    const NEEDLES: [&str; 12] = [
+    /// Needles in assignment form: the `=` is what makes the value a credential
+    /// rather than a mention of one.
+    const ASSIGNED_NEEDLES: [&str; 10] = [
         "password=",
         "pwd=",
         "token=",
@@ -2843,12 +2862,15 @@ pub fn arg_looks_secret(arg: &str) -> bool {
         "api-key=",
         "secret=",
         "accountkey=",
-        "access_key",
-        "access-key",
         "session=",
         "credential=",
     ];
-    if NEEDLES.iter().any(|n| lower.contains(n)) {
+    /// Needles with no assignment marker, so the name alone is the whole signal.
+    const BARE_NEEDLES: [&str; 2] = ["access_key", "access-key"];
+    if ASSIGNED_NEEDLES.iter().any(|n| lower.contains(n)) {
+        return true;
+    }
+    if bare == BareNeedles::Match && BARE_NEEDLES.iter().any(|n| lower.contains(n)) {
         return true;
     }
     // `--api-key=sk-...`, `--header=Authorization: ...`: the needle list keys off
@@ -2919,9 +2941,15 @@ pub fn secret_arg_mask<S: AsRef<str>>(args: &[S]) -> Vec<bool> {
         if arg_looks_secret(arg) {
             mask[i] = true;
         }
-        // A bare flag: the credential is the next entry. `--token=x` is already
-        // self-describing and handled above, so only the value-less form counts.
-        if !arg.contains('=') && arg_is_secret_flag(arg) {
+        // A flag with no value of its own: the credential is the next entry.
+        // `--token=x` is self-describing and already handled above, but
+        // `--token=` with an EMPTY value is the split form wearing an `=`, and
+        // launchers do emit it - so it must mark the next entry too.
+        let (name, joined_value) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (arg, None),
+        };
+        if joined_value.is_none_or(|value| value.trim().is_empty()) && arg_is_secret_flag(name) {
             if let Some(next) = mask.get_mut(i + 1) {
                 *next = true;
             }
@@ -2931,35 +2959,74 @@ pub fn secret_arg_mask<S: AsRef<str>>(args: &[S]) -> Vec<bool> {
 }
 
 /// Vendor prefixes that make a bare token recognisable as a credential with no
-/// key beside it. Matched case-insensitively against a word with surrounding
-/// punctuation stripped.
-const SECRET_TOKEN_PREFIXES: [&str; 18] = [
-    "sk-", "sk_", "pk_live_", "rk_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
-    "glpat-", "xoxb-", "xoxa-", "xoxp-", "xoxs-", "akia", "asia", "aiza",
+/// key beside it. Matched case-insensitively against a single token run.
+const SECRET_TOKEN_PREFIXES: [&str; 15] = [
+    "sk-",
+    "sk_",
+    "pk_live_",
+    "rk_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "xoxb-",
+    "xoxa-",
+    "xoxp-",
+    "xoxs-",
 ];
 
-/// Minimum length for a token-shaped word, so ordinary prose that happens to
-/// start with a prefix is left alone.
+/// Cloud key prefixes that are four bare letters with no separator, so they sit
+/// one `starts_with` away from ordinary words: `asia` also begins
+/// `asia-southeast1` and `asia-northeast1`, Google Cloud region ids that appear
+/// in perfectly normal upstream errors. These therefore require the whole run to
+/// be alphanumeric (no `-`, `_` or `.`) and full key length - an AWS key is the
+/// prefix plus 16 characters, and a Google key is longer still.
+const SECRET_CLOUD_KEY_PREFIXES: [&str; 3] = ["akia", "asia", "aiza"];
+
+/// Minimum length for a prefixed token, so ordinary prose that happens to start
+/// with a prefix is left alone.
 const SECRET_TOKEN_MIN_LEN: usize = 12;
 
-/// Auth schemes and bare key names whose credential is the NEXT word.
-/// Auth schemes whose next word is the credential, always. "Bearer" is not a
-/// word that appears in an error message for any other reason.
+/// Minimum length for a bare cloud key: `AKIA` + 16 characters.
+const CLOUD_KEY_MIN_LEN: usize = 20;
+
+/// Auth schemes that introduce a credential. Deliberately NOT unconditional:
+/// "basic authentication failed" and "digest authentication required" are
+/// ordinary sentences, so what follows must still look like a credential.
 const SECRET_SCHEME_WORDS: [&str; 3] = ["bearer", "basic", "digest"];
 
-/// Words that USUALLY precede a credential but are also ordinary English
-/// ("missing key in request", "invalid token for user"). The word after one of
-/// these is redacted only when it is itself credential-shaped, so a real key
-/// with no vendor prefix is still caught without shredding the sentence around
-/// it.
-const SECRET_HINT_WORDS: [&str; 6] = ["token", "key", "apikey", "password", "secret", "credential"];
+/// Names that introduce a credential, as a whole run or as the tail of a field
+/// name (`access_token`, `apiKey`, `client_secret`). What follows is redacted
+/// only when it also looks like a credential, because every one of these is also
+/// ordinary English: "missing key in request" must not become "missing key
+/// <redacted> request".
+const SECRET_HINT_NAMES: [&str; 10] = [
+    "token",
+    "key",
+    "apikey",
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "credential",
+    "authorization",
+    "cookie",
+];
 
-/// How long an opaque word must be, after a hint word, before it is treated as
-/// a credential rather than prose. Real keys are long; "for", "in" and "request"
-/// are not.
+/// Minimum length before an opaque run is treated as a credential rather than as
+/// a word in a sentence. Real keys are long; "for", "in" and "request" are not.
 const OPAQUE_SECRET_MIN_LEN: usize = 16;
 
-/// Redact credential-shaped words from free text.
+/// Minimum length for the mixed-case form, which is a stronger signal than
+/// length alone (a base64 credential is rarely shorter than this).
+const MIXED_CASE_SECRET_MIN_LEN: usize = 10;
+
+const REDACTED: &str = "<redacted>";
+
+/// Redact credential-shaped text from a free-text message.
 ///
 /// Sized for text that came back from a downstream server. An error body is the
 /// server's own words and routinely echoes the argument it just rejected
@@ -2969,115 +3036,125 @@ const OPAQUE_SECRET_MIN_LEN: usize = 16;
 /// and rides every CSV exported from it (SBS-890). No attacker is needed - a
 /// merely buggy server that echoes its input on failure produces this.
 ///
-/// Word-granular and deliberately blunt: a word that looks like a credential, or
-/// that follows a credential key or auth scheme, is replaced whole; inside any
-/// other word, a vendor-prefixed token is replaced on its own, so a key quoted
-/// in a JSON body (`{"apiKey":"sk-live-..."}`) goes too. Whitespace is preserved
-/// so the surrounding message stays readable.
+/// Works on TOKEN RUNS, not whitespace-separated words, because an error body is
+/// as often JSON as prose: in `{"access_token":"A1b2..."}` the field name and its
+/// value are one word, and that name is the only thing saying the value is a
+/// credential. Punctuation and whitespace are preserved so the surrounding
+/// message survives - an audit reason nobody can interpret is its own failure.
 pub fn redact_secret_text(text: &str) -> String {
+    fn is_run_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '=')
+    }
     let mut out = String::with_capacity(text.len());
-    let mut prev = String::new();
+    // Set by a run that NAMES a credential ("access_token", "Authorization",
+    // "Bearer"); consumed by the run after it.
+    let mut named = false;
     let mut rest = text;
     while !rest.is_empty() {
-        let word_start = rest
+        let ws_end = rest
             .find(|c: char| !c.is_whitespace())
             .unwrap_or(rest.len());
-        out.push_str(&rest[..word_start]);
-        rest = &rest[word_start..];
+        out.push_str(&rest[..ws_end]);
+        rest = &rest[ws_end..];
         if rest.is_empty() {
             break;
         }
         let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let word = &rest[..word_end];
         rest = &rest[word_end..];
-        if arg_looks_secret(word) || follows_a_credential_marker(&prev, word) {
+        // Whole-word forms first: a URI with userinfo, or an inline `key=value`,
+        // spans several runs, so only the word sees them.
+        if looks_secret(word, BareNeedles::Ignore) {
             out.push_str(REDACTED);
-        } else {
-            out.push_str(&redact_token_runs(word));
+            named = false;
+            continue;
         }
-        prev = word.to_ascii_lowercase();
-    }
-    out
-}
-
-const REDACTED: &str = "<redacted>";
-
-/// Replace vendor-prefixed tokens inside one word, leaving its punctuation in
-/// place. An error body is often JSON, so the credential arrives glued to quotes,
-/// braces and a field name rather than standing alone.
-fn redact_token_runs(word: &str) -> String {
-    fn is_token_char(c: char) -> bool {
-        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
-    }
-    let mut out = String::with_capacity(word.len());
-    let mut rest = word;
-    while !rest.is_empty() {
-        let run_start = rest.find(is_token_char).unwrap_or(rest.len());
-        out.push_str(&rest[..run_start]);
-        rest = &rest[run_start..];
-        if rest.is_empty() {
-            break;
-        }
-        let run_end = rest.find(|c: char| !is_token_char(c)).unwrap_or(rest.len());
-        let run = &rest[..run_end];
-        rest = &rest[run_end..];
-        if token_looks_secret(run) {
-            out.push_str(REDACTED);
-        } else {
-            out.push_str(run);
+        // Otherwise walk the word's runs, carrying the marker across words so
+        // `api key <opaque>` and `"apiKey":"<opaque>"` are the same case.
+        let mut inner = word;
+        while !inner.is_empty() {
+            let run_start = inner.find(is_run_char).unwrap_or(inner.len());
+            out.push_str(&inner[..run_start]);
+            inner = &inner[run_start..];
+            if inner.is_empty() {
+                break;
+            }
+            let run_end = inner.find(|c: char| !is_run_char(c)).unwrap_or(inner.len());
+            let run = &inner[..run_end];
+            inner = &inner[run_end..];
+            if token_looks_secret(run) || (named && looks_like_a_credential(run)) {
+                out.push_str(REDACTED);
+                named = false;
+            } else {
+                out.push_str(run);
+                named = names_a_credential(run);
+            }
         }
     }
     out
 }
 
-/// True when a bare token is credential-shaped by its vendor prefix alone, with
-/// no key beside it to say so.
-fn token_looks_secret(token: &str) -> bool {
-    if token.len() < SECRET_TOKEN_MIN_LEN {
-        return false;
-    }
-    let lower = token.to_ascii_lowercase();
-    SECRET_TOKEN_PREFIXES.iter().any(|p| lower.starts_with(p))
-}
-
-/// True when the PREVIOUS word says `word` is a credential.
-///
-/// Two strengths, because the audit `err` field has to stay readable: an error
-/// nobody can interpret is its own failure. An auth scheme or a header name
-/// ("Bearer", "Authorization:") is never followed by anything but the
-/// credential, so it redacts unconditionally. A hint word ("key", "token") is
-/// ordinary English - "missing key in request" must not become "missing key
-/// <redacted> request" - so it redacts only an opaque, long, mixed-case-and-digit
-/// word, which prose does not produce and an unprefixed API key does.
-fn follows_a_credential_marker(prev: &str, word: &str) -> bool {
-    let bare_prev = trim_word_punctuation(prev);
-    if SECRET_SCHEME_WORDS.contains(&bare_prev) || SECRET_HEADERS.iter().any(|h| prev == *h) {
+/// True when a run is recognisable as a credential from its own shape, with no
+/// name beside it to say so.
+fn token_looks_secret(run: &str) -> bool {
+    let lower = run.to_ascii_lowercase();
+    if run.len() >= SECRET_TOKEN_MIN_LEN
+        && SECRET_TOKEN_PREFIXES.iter().any(|p| lower.starts_with(p))
+    {
         return true;
     }
-    SECRET_HINT_WORDS.contains(&bare_prev) && looks_opaque(word)
+    run.len() >= CLOUD_KEY_MIN_LEN
+        && run.chars().all(|c| c.is_ascii_alphanumeric())
+        && SECRET_CLOUD_KEY_PREFIXES
+            .iter()
+            .any(|p| lower.starts_with(p))
 }
 
-/// A long word that mixes letters and digits: the shape of a credential with no
-/// vendor prefix to recognise it by, and not the shape of a word in a sentence.
-fn looks_opaque(word: &str) -> bool {
-    let bare = trim_word_punctuation(word);
-    bare.len() >= OPAQUE_SECRET_MIN_LEN
-        && bare.chars().any(|c| c.is_ascii_digit())
-        && bare.chars().any(|c| c.is_ascii_alphabetic())
-        && bare
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '='))
-}
-
-/// Strip the quotes, brackets and sentence punctuation that wrap a word in prose
-/// or in a JSON error body, so the shape test sees the token itself.
-fn trim_word_punctuation(word: &str) -> &str {
-    word.trim_matches(|c: char| {
-        matches!(
-            c,
-            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | ':' | '.'
-        )
+/// True when a run NAMES a credential, so the run after it is its value: a
+/// scheme word, or a name that is (or ends with) one of [`SECRET_HINT_NAMES`].
+///
+/// The tail match needs a separator or a camelCase hump before the hint, so
+/// `access_token`, `client-secret` and `apiKey` count while `monkey` does not.
+fn names_a_credential(run: &str) -> bool {
+    let lower = run.to_ascii_lowercase();
+    if SECRET_SCHEME_WORDS.contains(&lower.as_str()) {
+        return true;
+    }
+    SECRET_HINT_NAMES.iter().any(|hint| {
+        if lower == *hint {
+            return true;
+        }
+        let Some(head) = lower.strip_suffix(hint) else {
+            return false;
+        };
+        if head.is_empty() {
+            return false;
+        }
+        head.ends_with(['-', '_', '.'])
+            || run[head.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
     })
+}
+
+/// True when a run could be the credential a preceding name introduced: long and
+/// opaque, or shorter but mixed-case like a base64 secret.
+///
+/// Never a scheme word: "Bearer" after "Authorization:" is the scheme, and
+/// dropping it leaves an audit reason reading "Authorization: <redacted>
+/// <redacted>".
+fn looks_like_a_credential(run: &str) -> bool {
+    if SECRET_SCHEME_WORDS.contains(&run.to_ascii_lowercase().as_str()) {
+        return false;
+    }
+    let long_and_opaque = run.len() >= OPAQUE_SECRET_MIN_LEN
+        && run.chars().any(|c| c.is_ascii_digit())
+        && run.chars().any(|c| c.is_ascii_alphabetic());
+    let mixed_case = run.len() >= MIXED_CASE_SECRET_MIN_LEN
+        && run.chars().any(|c| c.is_ascii_uppercase())
+        && run.chars().any(|c| c.is_ascii_lowercase());
+    long_and_opaque || mixed_case
 }
 
 /// Redact credentials embedded in a URL's authority: `scheme://user:pass@host/x`
@@ -3128,18 +3205,52 @@ mod tests {
             assert!(redacted.contains("<redacted>"), "nothing redacted: {case}");
         }
 
-        // An unprefixed credential is caught by shape when a key word precedes it.
+        // An unprefixed credential is caught by shape when a name precedes it.
         let opaque = redact_secret_text("rejected api key A1b2C3d4E5f6G7h8J9k0 at edge");
         assert!(!opaque.contains("A1b2C3d4E5f6G7h8J9k0"), "{opaque}");
         assert!(opaque.ends_with("at edge"), "lost the rest: {opaque}");
 
+        // The JSON shape, which no whitespace-word pass can see: the field name
+        // and its value are ONE word, and the name is the only thing that says
+        // the value is a credential.
+        for json in [
+            r#"{"access_token":"A1b2C3d4E5f6G7h8J9k0L1m2N3p4Q5r6"}"#,
+            r#"{"apiKey":"A1b2C3d4E5f6G7h8J9k0L1m2N3p4Q5r6"}"#,
+            r#"{"client_secret": "A1b2C3d4E5f6G7h8J9k0L1m2N3p4Q5r6"}"#,
+        ] {
+            let redacted = redact_secret_text(json);
+            assert!(
+                !redacted.contains("A1b2C3d4E5f6G7h8J9k0L1m2N3p4Q5r6"),
+                "JSON credential survived: {redacted}"
+            );
+        }
+
+        // A bare cloud key still goes, but only at full length with no separator.
+        let aws = redact_secret_text("denied for AKIAIOSFODNN7EXAMPLE at edge");
+        assert!(!aws.contains("AKIAIOSFODNN7EXAMPLE"), "{aws}");
+
+        // The scheme word is not the credential. Dropping it leaves an audit
+        // reason reading "Authorization: <redacted> <redacted>".
+        let header = redact_secret_text("Authorization: Bearer sk-live-abcdefghijklmnop");
+        assert!(header.contains("Bearer"), "lost the scheme: {header}");
+        assert!(!header.contains("sk-live-abcdefghijklmnop"), "{header}");
+
         // An ordinary failure must stay readable, or the audit row loses its
-        // reason. "key" and "token" are English as often as they are markers.
+        // reason. Every marker below is also plain English.
         for plain in [
             "HTTP 503: upstream unavailable, retry after 30s",
             "missing key in request body",
             "invalid token for user 42",
             "the api key was rejected",
+            // basic/digest introduce a credential AND start ordinary sentences.
+            "basic authentication failed",
+            "digest authentication required",
+            // asia-* are Google Cloud region ids, not AWS keys.
+            "asia-southeast1 endpoint unavailable",
+            "asia-northeast1 is degraded",
+            // The two no-equals argv needles are prose here, not credentials.
+            "missing access-key in config",
+            "rotate access_key failed",
         ] {
             assert_eq!(redact_secret_text(plain), plain, "over-redacted: {plain}");
         }
@@ -3164,6 +3275,16 @@ mod tests {
         assert_eq!(
             secret_arg_mask(&args),
             vec![false, false, false, false, true, true, false, true]
+        );
+
+        // `--token=` with an EMPTY value is the split form wearing an `=`: the
+        // credential is still the next entry, and must be masked. The flag
+        // entry goes too, the same way every other joined form does - the
+        // `token=` needle cannot tell an empty value from a real one, and
+        // over-redacting a flag name is the harmless direction.
+        assert_eq!(
+            secret_arg_mask(&["--token=", "sk-live-split"]),
+            vec![true, true]
         );
 
         // A value-less trailing flag must not panic or over-run the slice.
