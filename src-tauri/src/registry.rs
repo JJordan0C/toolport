@@ -2943,7 +2943,21 @@ const SECRET_TOKEN_PREFIXES: [&str; 18] = [
 const SECRET_TOKEN_MIN_LEN: usize = 12;
 
 /// Auth schemes and bare key names whose credential is the NEXT word.
-const SECRET_LEAD_WORDS: [&str; 6] = ["bearer", "basic", "digest", "token", "key", "password"];
+/// Auth schemes whose next word is the credential, always. "Bearer" is not a
+/// word that appears in an error message for any other reason.
+const SECRET_SCHEME_WORDS: [&str; 3] = ["bearer", "basic", "digest"];
+
+/// Words that USUALLY precede a credential but are also ordinary English
+/// ("missing key in request", "invalid token for user"). The word after one of
+/// these is redacted only when it is itself credential-shaped, so a real key
+/// with no vendor prefix is still caught without shredding the sentence around
+/// it.
+const SECRET_HINT_WORDS: [&str; 6] = ["token", "key", "apikey", "password", "secret", "credential"];
+
+/// How long an opaque word must be, after a hint word, before it is treated as
+/// a credential rather than prose. Real keys are long; "for", "in" and "request"
+/// are not.
+const OPAQUE_SECRET_MIN_LEN: usize = 16;
 
 /// Redact credential-shaped words from free text.
 ///
@@ -2976,7 +2990,7 @@ pub fn redact_secret_text(text: &str) -> String {
         let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let word = &rest[..word_end];
         rest = &rest[word_end..];
-        if arg_looks_secret(word) || leads_a_secret(&prev) {
+        if arg_looks_secret(word) || follows_a_credential_marker(&prev, word) {
             out.push_str(REDACTED);
         } else {
             out.push_str(&redact_token_runs(word));
@@ -3026,15 +3040,33 @@ fn token_looks_secret(token: &str) -> bool {
     SECRET_TOKEN_PREFIXES.iter().any(|p| lower.starts_with(p))
 }
 
-/// True when the PREVIOUS word says the next one is a credential: an auth scheme
-/// ("Bearer"), a header name ("Authorization:") or a bare key word ("key").
-fn leads_a_secret(prev: &str) -> bool {
-    let bare = trim_word_punctuation(prev);
-    if SECRET_LEAD_WORDS.contains(&bare) {
+/// True when the PREVIOUS word says `word` is a credential.
+///
+/// Two strengths, because the audit `err` field has to stay readable: an error
+/// nobody can interpret is its own failure. An auth scheme or a header name
+/// ("Bearer", "Authorization:") is never followed by anything but the
+/// credential, so it redacts unconditionally. A hint word ("key", "token") is
+/// ordinary English - "missing key in request" must not become "missing key
+/// <redacted> request" - so it redacts only an opaque, long, mixed-case-and-digit
+/// word, which prose does not produce and an unprefixed API key does.
+fn follows_a_credential_marker(prev: &str, word: &str) -> bool {
+    let bare_prev = trim_word_punctuation(prev);
+    if SECRET_SCHEME_WORDS.contains(&bare_prev) || SECRET_HEADERS.iter().any(|h| prev == *h) {
         return true;
     }
-    // "Authorization:" as its own word: the value is whatever follows.
-    SECRET_HEADERS.iter().any(|h| prev == *h)
+    SECRET_HINT_WORDS.contains(&bare_prev) && looks_opaque(word)
+}
+
+/// A long word that mixes letters and digits: the shape of a credential with no
+/// vendor prefix to recognise it by, and not the shape of a word in a sentence.
+fn looks_opaque(word: &str) -> bool {
+    let bare = trim_word_punctuation(word);
+    bare.len() >= OPAQUE_SECRET_MIN_LEN
+        && bare.chars().any(|c| c.is_ascii_digit())
+        && bare.chars().any(|c| c.is_ascii_alphabetic())
+        && bare
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '/' | '='))
 }
 
 /// Strip the quotes, brackets and sentence punctuation that wrap a word in prose
@@ -3096,9 +3128,21 @@ mod tests {
             assert!(redacted.contains("<redacted>"), "nothing redacted: {case}");
         }
 
-        // An ordinary failure must stay readable, or the audit row loses its reason.
-        let plain = "HTTP 503: upstream unavailable, retry after 30s";
-        assert_eq!(redact_secret_text(plain), plain);
+        // An unprefixed credential is caught by shape when a key word precedes it.
+        let opaque = redact_secret_text("rejected api key A1b2C3d4E5f6G7h8J9k0 at edge");
+        assert!(!opaque.contains("A1b2C3d4E5f6G7h8J9k0"), "{opaque}");
+        assert!(opaque.ends_with("at edge"), "lost the rest: {opaque}");
+
+        // An ordinary failure must stay readable, or the audit row loses its
+        // reason. "key" and "token" are English as often as they are markers.
+        for plain in [
+            "HTTP 503: upstream unavailable, retry after 30s",
+            "missing key in request body",
+            "invalid token for user 42",
+            "the api key was rejected",
+        ] {
+            assert_eq!(redact_secret_text(plain), plain, "over-redacted: {plain}");
+        }
         assert_eq!(redact_secret_text(""), "");
     }
 
