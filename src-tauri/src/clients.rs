@@ -542,15 +542,27 @@ fn claude_code_config_paths_from(
 }
 
 fn client_config_path(client_id: &str) -> Option<PathBuf> {
-    let home = home()?;
-    if client_id == "claude-code" {
-        if let Some(dir) = claude_config_dir_override() {
-            return Some(claude_code_config_path(&dir));
-        }
-    }
+    client_config_path_with_home(client_id, home())
+}
+
+/// [`client_config_path`] with the home directory passed in, so a test can drive the
+/// `$HOME`-unavailable case on any platform (`dirs::home_dir` reads a known folder on
+/// Windows, so it cannot be unset from a test).
+fn client_config_path_with_home(client_id: &str, home: Option<PathBuf>) -> Option<PathBuf> {
+    // An absolute `GOOSE_PATH_ROOT` names the live config outright, so it resolves even
+    // when there is no home directory to fall back to. This mirrors `codex_path`, which
+    // checks `CODEX_HOME` before it ever calls this (SBS-885), and it keeps the config
+    // path in step with `client_rules_target`: without it Connect could write Goose Team
+    // Instructions under the root but fail to find the config beside them (SBS-899).
     if client_id == "goose" {
         if let Some(root) = goose_path_root_from(std::env::var_os("GOOSE_PATH_ROOT")) {
             return Some(goose_config_under_root(&root));
+        }
+    }
+    let home = home?;
+    if client_id == "claude-code" {
+        if let Some(dir) = claude_config_dir_override() {
+            return Some(claude_code_config_path(&dir));
         }
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -11038,6 +11050,26 @@ rules:
                 .path,
             root.join("config").join(".goosehints")
         );
+    }
+
+    /// SBS-899: an absolute GOOSE_PATH_ROOT names the live config outright, so it must
+    /// resolve with no home directory at all. `client_rules_target` already did, so
+    /// without this the rules file relocates but the config beside it comes back `None`
+    /// and Connect cannot write the gateway entry. Same rule `codex_path` applies to
+    /// `CODEX_HOME` (SBS-885).
+    #[test]
+    fn goose_path_root_resolves_without_a_home_dir() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("goose-nohome-{}", std::process::id()));
+        let _restore = EnvRestore::set("GOOSE_PATH_ROOT", &root);
+
+        assert_eq!(
+            client_config_path_with_home("goose", None),
+            Some(root.join("config").join("config.yaml")),
+            "an absolute GOOSE_PATH_ROOT must not depend on a resolvable home dir"
+        );
+        // The override is Goose-only: every other client still needs a home.
+        assert_eq!(client_config_path_with_home("zed", None), None);
     }
 
     /// Relative / empty GOOSE_PATH_ROOT is ignored — same rule as
