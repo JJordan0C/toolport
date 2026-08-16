@@ -211,6 +211,21 @@ describe("CI required merge gate (SBS-874)", () => {
     expect(runScripts(job).join("\n")).toContain("scripts/install.Tests.ps1");
   });
 
+  // SBS-894: being in the gate's `needs` only proves the job ran. A job that
+  // greps for nothing is green forever, so the gate would keep passing while
+  // the control it names does nothing.
+  it("still greps every movable ref in the pinned-URL job", () => {
+    const job = jobs["pinned-install-urls"];
+    expect(job).toBeDefined();
+    const script = runScripts(job).join("\n");
+    expect(script).toContain("git grep");
+    for (const movableRef of ["main", "master", "HEAD"]) {
+      expect(script, `${movableRef}/scripts/ is not covered`).toContain(movableRef);
+    }
+    // The grep is only a gate if a hit exits non-zero.
+    expect(script).toMatch(/exit 1/);
+  });
+
   it("still runs Windows keyring tests on a windows-latest matrix cell", () => {
     const job = jobs["cross-platform-rust"];
     expect(job).toBeDefined();

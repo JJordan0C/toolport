@@ -26,6 +26,13 @@ set -euo pipefail
 REPO="tsouth89/toolport"
 API="https://api.github.com/repos/$REPO/releases/latest"
 
+# The Apple Developer team the macOS builds are signed and notarized under (the
+# same identity the release workflow's APPLE_* secrets use). `codesign --verify`
+# only proves a bundle satisfies its OWN embedded requirement, so a tampered
+# build re-signed with any other Developer ID passes it. This is the value that
+# ties the bundle to us, so install_macos checks it explicitly.
+EXPECTED_TEAM_ID="V4YZPC7T6G"
+
 say() { printf '\033[1;36m>\033[0m %s\n' "$*"; }
 err() {
   printf '\033[1;31mx\033[0m %s\n' "$*" >&2
@@ -248,7 +255,10 @@ install_macos() {
   url="$(asset_url "$suffix")"
   [ -n "$url" ] || err "No macOS .dmg found in $tag_name."
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  # Detach and clear the staging copy on ANY exit, not only the paths that
+  # remember to. Every `err` below is an `exit 1`, and one that forgot would
+  # otherwise leave the disk image mounted (SBS-897).
+  trap 'hdiutil detach "$tmp/mnt" >/dev/null 2>&1 || true; rm -rf "$tmp" "/Applications/Toolport.app.new"' EXIT
   digest="$(asset_field "$suffix" digest)"
   size="$(asset_field "$suffix" size)"
   download_and_verify "$url" "$tmp/toolport.dmg" "$digest" "$size"
@@ -261,35 +271,71 @@ install_macos() {
     err "No .app found in the disk image."
   fi
 
-  # Verify the Developer ID signature before anything touches /Applications
-  # (SBS-897). The digest check above proves the bytes match what GitHub
-  # published; it cannot detect an artifact tampered with BEFORE upload, because
-  # GitHub hashes whatever it was given. The signature is the control that
-  # covers that case, and this is the only chance to apply it: curl does not
-  # write com.apple.quarantine, so Gatekeeper never evaluates the copy on first
-  # launch. Fails closed - the header promises a signed release, so an
-  # unverifiable bundle is not installed.
+  # Verify the signature before anything touches /Applications (SBS-897). The
+  # digest check above proves the bytes match what GitHub published; it cannot
+  # detect an artifact tampered with BEFORE upload, because GitHub hashes
+  # whatever it was given. The signature is the control that covers that case,
+  # and this is the only chance to apply it: curl does not write
+  # com.apple.quarantine, so Gatekeeper never evaluates the copy on first launch.
+  #
+  # `codesign --verify` alone is NOT that control. It only proves the bundle
+  # satisfies its own embedded requirement, so an attacker who re-signs a
+  # tampered build with their OWN Developer ID passes it. The team identifier is
+  # what ties the bundle to us, so it is checked explicitly and is the hard gate.
   say "Verifying the app signature"
-  if ! codesign --verify --deep --strict "$app" >/dev/null 2>&1; then
+  need codesign
+  if ! codesign_output="$(codesign --verify --deep --strict --verbose=4 "$app" 2>&1)"; then
     hdiutil detach "$tmp/mnt" >/dev/null 2>&1 || true
-    err "The app in the disk image failed signature verification, so it is not the release we signed." \
+    err "The app in the disk image failed signature verification:" \
+      "  $codesign_output" \
       "Refusing to install it. Download the .dmg yourself from the Releases page if you want to inspect it."
   fi
+  signing_team="$(codesign -dv --verbose=4 "$app" 2>&1 |
+    sed -n 's/^TeamIdentifier=//p' | head -n1)"
+  if [ "$signing_team" != "$EXPECTED_TEAM_ID" ]; then
+    hdiutil detach "$tmp/mnt" >/dev/null 2>&1 || true
+    err "The app is signed by team '${signing_team:-none}', not Toolport's ($EXPECTED_TEAM_ID)." \
+      "A valid signature from someone else is exactly what this check exists to catch." \
+      "Refusing to install it."
+  fi
+  # Notarization, as a warning only. Unlike the team check this depends on
+  # machine state (an admin can turn assessment off, and an offline machine
+  # cannot reach the notary), so a failure here must not block a bundle we have
+  # already proved is ours and intact.
+  if command -v spctl >/dev/null 2>&1 &&
+    ! spctl_output="$(spctl --assess --type execute "$app" 2>&1)"; then
+    say "Note: Gatekeeper assessment did not pass ($spctl_output)."
+    say "      The signature and team check above both passed, so continuing."
+  fi
 
-  # Stage beside the target and rename into place, the same shape the AppImage
-  # path uses. The old code ran `rm -rf /Applications/Toolport.app` and only then
-  # copied, so under `set -euo pipefail` a cp that failed partway (disk full,
-  # interrupted, an unmounted image) aborted with the working install already
-  # deleted and a partial bundle in its place (SBS-897).
+  # Stage beside the target, then swap by rename only (SBS-897). The old code
+  # ran `rm -rf /Applications/Toolport.app` and only then copied, so under
+  # `set -euo pipefail` a cp that failed partway aborted with the working
+  # install already deleted. Deleting it just before the `mv` has the same
+  # defect in a smaller window: a failed rename leaves NOTHING at the
+  # destination. So the live bundle is moved aside, not removed, and is moved
+  # back if the rename fails.
   staged="/Applications/Toolport.app.new"
-  rm -rf "$staged"
+  previous="/Applications/Toolport.app.old"
+  rm -rf "$staged" "$previous"
   if ! cp -R "$app" "$staged"; then
     rm -rf "$staged"
     hdiutil detach "$tmp/mnt" >/dev/null 2>&1 || true
     err "Couldn't copy Toolport.app into /Applications. Your existing install is untouched."
   fi
-  rm -rf "/Applications/Toolport.app"
-  mv "$staged" "/Applications/Toolport.app"
+  if [ -e "/Applications/Toolport.app" ] && ! mv "/Applications/Toolport.app" "$previous"; then
+    rm -rf "$staged"
+    hdiutil detach "$tmp/mnt" >/dev/null 2>&1 || true
+    err "Couldn't move the existing Toolport.app aside (is it running?). Your existing install is untouched."
+  fi
+  if ! mv "$staged" "/Applications/Toolport.app"; then
+    # Put the working install back before reporting the failure.
+    [ -e "$previous" ] && mv "$previous" "/Applications/Toolport.app" || true
+    rm -rf "$staged"
+    hdiutil detach "$tmp/mnt" >/dev/null 2>&1 || true
+    err "Couldn't install Toolport.app. Your previous install has been restored."
+  fi
+  rm -rf "$previous"
   hdiutil detach "$tmp/mnt" >/dev/null 2>&1 || true
   say "Installed to /Applications/Toolport.app. Open it from Launchpad or run: open -a Toolport"
 }

@@ -217,17 +217,23 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: No file may point at the unpinned installer path
+      - name: No file may point at an unpinned installer path
         run: |
-          # This file is excluded because the search term below is itself an
-          # occurrence. Nothing here is piped into a user's shell.
-          matches="$(git grep -n -- 'main/scripts/' -- ':!.github/workflows/ci.yml' || true)"
+          # Every MOVABLE ref, not just `main`: raw.githubusercontent serves
+          # HEAD and master the same way, so pinning only one spelling leaves
+          # the same hole one word away. The trailing `scripts/` keeps this to
+          # the piped-into-a-shell files rather than any link into the repo.
+          #
+          # This file is excluded because the pattern below is itself an
+          # occurrence, and nothing here is piped into a user's shell.
+          matches="$(git grep -nE -- '(main|master|HEAD)/scripts/' -- ':!.github/workflows/ci.yml' || true)"
           if [ -n "$matches" ]; then
             echo "$matches"
             echo
-            echo "The lines above point at the unpinned installer path on main."
-            echo "Use the pinned short URLs instead: https://toolport.app/install.sh"
-            echo "and https://toolport.app/install.ps1 (SBS-894)."
+            echo "The lines above point at an unpinned installer path."
+            echo "toolport.app/install.* redirects to a PINNED COMMIT because those"
+            echo "scripts are piped into a shell; a movable ref routes around that."
+            echo "Use https://toolport.app/install.sh and /install.ps1 (SBS-894)."
             exit 1
           fi
 
