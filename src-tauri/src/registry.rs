@@ -2341,6 +2341,11 @@ enum ReadOutcome {
     Content(String),
     /// Still missing or empty after retries: genuinely absent, not a race.
     Absent,
+    /// The file is there but every read failed with something other than
+    /// not-found (sharing violation, permissions, I/O error). Recovery treats
+    /// this exactly like `Absent`, but a caller reading a security decision out
+    /// of the result has to know the real contents were never seen (SBS-900).
+    Unreadable,
 }
 
 /// Read the registry tolerating the transient states a concurrent `atomic_write`
@@ -2355,18 +2360,29 @@ enum ReadOutcome {
 fn read_registry_file(path: &Path) -> ReadOutcome {
     const ATTEMPTS: u32 = 4;
     const BACKOFF_MS: u64 = 75;
+    // Why the last attempt failed, so a file we were never allowed to read is not
+    // reported as a file that is not there (SBS-900). Recovery behaves the same
+    // for both; only the reported outcome differs.
+    let mut last_error: Option<std::io::ErrorKind> = None;
     for attempt in 0..ATTEMPTS {
         match std::fs::read_to_string(path) {
             Ok(content) if !content.trim().is_empty() => return ReadOutcome::Content(content),
+            // An empty read is the rename window itself, not an error.
+            Ok(_) => last_error = None,
             // Empty, missing, locked (sharing violation), or any other error:
             // all indistinguishable from a rename in flight. Wait and re-look.
-            _ => {}
+            Err(e) => last_error = Some(e.kind()),
         }
         if attempt + 1 < ATTEMPTS {
             std::thread::sleep(std::time::Duration::from_millis(BACKOFF_MS));
         }
     }
-    ReadOutcome::Absent
+    match last_error {
+        // Nothing there (or an empty file): a first run, or a deletion.
+        None | Some(std::io::ErrorKind::NotFound) => ReadOutcome::Absent,
+        // Present, but its contents were never seen by this process.
+        Some(_) => ReadOutcome::Unreadable,
+    }
 }
 
 /// Preserve an unreadable registry file next to the original before anything
@@ -2411,21 +2427,69 @@ fn quarantine_unreadable(path: &Path, content: &str) -> Option<PathBuf> {
     Some(dest)
 }
 
-fn load_from_inner(path: &Path) -> Result<Registry, String> {
-    let mut registry = match read_registry_file(path) {
+/// Where a loaded [`Registry`] actually came from.
+///
+/// `load_from` returns `Ok` for several quite different situations, and only some
+/// of them mean "this is everything the user configured". A caller that reads a
+/// security decision out of an EMPTY field has to tell them apart: the gateway
+/// treats an empty `http_clients` as "no HTTP auth is configured, so
+/// `--insecure-loopback` may serve an open listener", and a registry that was
+/// defaulted over contents nobody could read, or rebuilt from a backup taken
+/// before the first client was registered, is empty for a completely different
+/// reason (SBS-900).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadSource {
+    /// The primary registry file was read and parsed. Memory matches disk.
+    File,
+    /// No registry file and no backup worth recovering: a genuine first run.
+    /// Empty here is the truth.
+    FirstRun,
+    /// The primary was absent, unreadable, or unparseable, and the registry came
+    /// from a backup. `save_to` snapshots the PRE-write content, so the newest
+    /// backup is state N-1: the save that registered the first HTTP client is
+    /// exactly the one whose backup still has none.
+    Backup,
+    /// The primary exists but could not be read (locked, permissions, I/O) and
+    /// no backup was usable, so this is a `Registry::default()` standing in for
+    /// contents nobody has seen.
+    Unreadable,
+}
+
+impl LoadSource {
+    /// True only when an absent value in the loaded registry means the user never
+    /// configured it, rather than "this build could not tell". Everything
+    /// reconstructed or defaulted over unread contents is `false`, so a caller
+    /// that must fail closed can just ask.
+    pub fn is_authoritative(self) -> bool {
+        matches!(self, LoadSource::File | LoadSource::FirstRun)
+    }
+}
+
+fn load_from_inner(path: &Path) -> Result<(Registry, LoadSource), String> {
+    let (mut registry, source) = match read_registry_file(path) {
         // Genuinely missing or empty (not a rename race - read_registry_file
         // already waited that out): recover the last-known-good from the .bak
         // sibling if one survived, else this is a first run.
         ReadOutcome::Absent => {
             if let Some(reg) = restore_from_backup(path) {
                 record_registry_recovery("missing", None);
-                Ok(reg)
+                Ok((reg, LoadSource::Backup))
             } else {
-                Ok(Registry::default())
+                Ok((Registry::default(), LoadSource::FirstRun))
+            }
+        }
+        // Same recovery, different truth: the file is there and we never saw it,
+        // so a default here is a placeholder, not a first run (SBS-900).
+        ReadOutcome::Unreadable => {
+            if let Some(reg) = restore_from_backup(path) {
+                record_registry_recovery("missing", None);
+                Ok((reg, LoadSource::Backup))
+            } else {
+                Ok((Registry::default(), LoadSource::Unreadable))
             }
         }
         ReadOutcome::Content(content) => match serde_json::from_str(&content) {
-            Ok(reg) => Ok(reg),
+            Ok(reg) => Ok((reg, LoadSource::File)),
             // Present but unparseable by THIS build: corrupt, or a newer schema.
             // Quarantine the evidence BEFORE restore_from_backup self-heals the
             // primary from .bak, so nothing is ever silently destroyed.
@@ -2434,7 +2498,7 @@ fn load_from_inner(path: &Path) -> Result<Registry, String> {
                 match restore_from_backup(path) {
                     Some(reg) => {
                         record_registry_recovery("corrupt", quarantine);
-                        Ok(reg)
+                        Ok((reg, LoadSource::Backup))
                     }
                     None => Err(format!("Corrupt registry: {e}")),
                 }
@@ -2442,21 +2506,35 @@ fn load_from_inner(path: &Path) -> Result<Registry, String> {
         },
     }?;
     registry.normalize_profile_references();
-    Ok(registry)
+    Ok((registry, source))
 }
 
 /// Load an explicit registry while holding its cross-process lock across the full
 /// read/recovery path. Recovery can rewrite the primary from a backup, so even a caller
 /// that only intends to read must serialize with writers (SOU-330).
 pub fn load_from(path: &Path) -> Result<Registry, String> {
+    load_from_with_source(path).map(|(registry, _)| registry)
+}
+
+/// [`load_from`] plus where the result actually came from, for the callers that
+/// must not read "empty" as "nothing configured" (SBS-900).
+pub fn load_from_with_source(path: &Path) -> Result<(Registry, LoadSource), String> {
     let lock = lock_for(path, registry_lock_timeout())?;
-    load_from_locked(path, &lock)
+    load_from_locked_with_source(path, &lock)
 }
 
 /// Load while the caller already holds a registry lock. Requiring the guard by reference
 /// prevents nested acquisition in read-modify-write paths while making the lock requirement
 /// explicit at call sites that need to keep it through a later save.
-pub fn load_from_locked(path: &Path, _lock: &FileLock) -> Result<Registry, String> {
+pub fn load_from_locked(path: &Path, lock: &FileLock) -> Result<Registry, String> {
+    load_from_locked_with_source(path, lock).map(|(registry, _)| registry)
+}
+
+/// [`load_from_locked`] plus the [`LoadSource`] of the result.
+pub fn load_from_locked_with_source(
+    path: &Path,
+    _lock: &FileLock,
+) -> Result<(Registry, LoadSource), String> {
     load_from_inner(path)
 }
 
@@ -2690,12 +2768,22 @@ pub fn resolved_path() -> Option<PathBuf> {
 /// Load honoring the `TOOLPORT_REGISTRY` / `CONDUIT_REGISTRY` env override (used
 /// by the gateway and tests), falling back to the default path.
 pub fn load_resolved() -> Result<Registry, String> {
-    let registry = match resolved_path() {
-        Some(path) => load_from(&path),
-        None => Ok(Registry::default()),
+    load_resolved_with_source().map(|(registry, _)| registry)
+}
+
+/// [`load_resolved`] plus where the result came from. `Ok` alone does not mean the
+/// registry on disk was read: it also covers a recovery from a backup and a
+/// default standing in for a file that could not be read, both of which are empty
+/// for reasons that are not "the user configured nothing" (SBS-900).
+pub fn load_resolved_with_source() -> Result<(Registry, LoadSource), String> {
+    let (registry, source) = match resolved_path() {
+        Some(path) => load_from_with_source(&path),
+        // No resolvable path means there is no registry to configure anything in,
+        // so an empty one is the whole truth rather than a stand-in.
+        None => Ok((Registry::default(), LoadSource::FirstRun)),
     }?;
     migrate_profile_stores(&registry)?;
-    Ok(registry)
+    Ok((registry, source))
 }
 
 /// True when a command argument looks like it carries a secret: an inline
@@ -4173,6 +4261,113 @@ mod tests {
         cleanup_quarantine(&path);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&bak).ok();
+    }
+
+    fn sample_http_client() -> HttpClient {
+        HttpClient {
+            id: "c1".into(),
+            label: "Open WebUI".into(),
+            token_sha256: sha256_hex("tok"),
+            profile: String::new(),
+        }
+    }
+
+    fn clear_registry_files(path: &Path) {
+        cleanup_quarantine(path);
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(backup_path(path)).ok();
+        std::fs::remove_file(backup_sequence_path(path)).ok();
+        for generation in backup_generations(path) {
+            std::fs::remove_file(generation).ok();
+        }
+    }
+
+    /// SBS-900: `load_from` answers `Ok` to three different questions, and the
+    /// gateway reads a security decision out of an EMPTY field (an empty
+    /// `http_clients` is what lets `--insecure-loopback` serve an open listener).
+    /// The source has to say which `Ok` this was.
+    #[test]
+    fn load_source_separates_a_real_read_from_a_recovery() {
+        let path =
+            std::env::temp_dir().join(format!("conduit-reg-source-{}.json", std::process::id()));
+        clear_registry_files(&path);
+
+        // A genuine first run: no file, no backup. Empty here IS the truth, so
+        // this must stay authoritative or `--insecure-loopback` breaks on day one.
+        let (fresh, source) = load_from_with_source(&path).unwrap();
+        assert_eq!(source, LoadSource::FirstRun);
+        assert!(source.is_authoritative());
+        assert!(fresh.http_clients.is_empty());
+
+        // State N-1: a server configured, no HTTP client registered yet.
+        let mut reg = Registry::default();
+        reg.add_server(sample_server("alpha"));
+        save_to(&path, &reg).unwrap();
+        // State N: the save that registers the FIRST http client. `save_to`
+        // snapshots the PRE-write content, so every backup on disk is now a
+        // registry with no clients at all.
+        reg.http_clients.push(sample_http_client());
+        save_to(&path, &reg).unwrap();
+
+        let (read, source) = load_from_with_source(&path).unwrap();
+        assert_eq!(source, LoadSource::File);
+        assert!(source.is_authoritative());
+        assert_eq!(read.http_clients.len(), 1);
+
+        // Corrupt the primary. Recovery succeeds from that N-1 backup and hands
+        // back every server with ZERO http_clients: byte for byte the same thing
+        // as "no client is registered" unless the source says otherwise.
+        std::fs::write(&path, "{ not json").unwrap();
+        let (recovered, source) = load_from_with_source(&path).unwrap();
+        assert_eq!(source, LoadSource::Backup);
+        assert!(
+            !source.is_authoritative(),
+            "a backup is state N-1; its empty client list is not a fact about now"
+        );
+        assert_eq!(recovered.servers.len(), 1, "self-healed from .bak");
+        assert!(
+            recovered.http_clients.is_empty(),
+            "the recovery really did lose the registered client"
+        );
+
+        clear_registry_files(&path);
+    }
+
+    /// SBS-900: `read_registry_file` used to fold every read failure into
+    /// "absent", so a registry this process was not allowed to read came back as
+    /// a first run. Unix-only: it needs a mode the current user is denied.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_registry_is_not_reported_as_a_first_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "conduit-reg-unreadable-{}.json",
+            std::process::id()
+        ));
+        clear_registry_files(&path);
+
+        let mut reg = Registry::default();
+        reg.http_clients.push(sample_http_client());
+        // A first save leaves no backup, so recovery cannot mask the read failure.
+        save_to(&path, &reg).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root ignores the mode; there is nothing to assert on such a machine.
+        if std::fs::read_to_string(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
+            clear_registry_files(&path);
+            return;
+        }
+
+        let (loaded, source) = load_from_with_source(&path).unwrap();
+        assert_eq!(source, LoadSource::Unreadable);
+        assert!(
+            !source.is_authoritative(),
+            "a default standing in for contents nobody read is not a first run"
+        );
+        assert!(loaded.http_clients.is_empty(), "it really is a default");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
+        clear_registry_files(&path);
     }
 
     #[test]

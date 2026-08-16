@@ -3718,6 +3718,7 @@ fn resolve_http_caller(
     env_token: Option<&str>,
     provided: Option<&str>,
     allow_insecure_open: bool,
+    registry_loaded: bool,
 ) -> Option<(Option<std::collections::HashSet<String>>, HttpCaller)> {
     let owner_scope = |allowed: &Option<std::collections::HashSet<String>>| {
         allowed.as_ref().map(|set| {
@@ -3782,7 +3783,11 @@ fn resolve_http_caller(
     // resolves for the server that minted it), so this is a weaker isolation
     // boundary rather than an open channel. The mode is already labelled insecure;
     // this is one more thing it gives up.
-    if allow_insecure_open && env_token.is_none() && reg.http_clients.is_empty() {
+    //
+    // SBS-900: `reg.http_clients.is_empty()` is also true when boot `load_resolved`
+    // returned Err and fell back to `Registry::default()`. That is not "no clients
+    // configured". A missing registry file is `Ok(default)` and is not this case.
+    if allow_insecure_open && env_token.is_none() && registry_loaded && reg.http_clients.is_empty() {
         return Some((
             None,
             HttpCaller {
@@ -3805,8 +3810,16 @@ fn resolve_http_scope(
     env_token: Option<&str>,
     provided: Option<&str>,
     allow_insecure_open: bool,
+    registry_loaded: bool,
 ) -> Option<Option<std::collections::HashSet<String>>> {
-    resolve_http_caller(reg, env_token, provided, allow_insecure_open).map(|(allowed, _)| allowed)
+    resolve_http_caller(
+        reg,
+        env_token,
+        provided,
+        allow_insecure_open,
+        registry_loaded,
+    )
+    .map(|(allowed, _)| allowed)
 }
 
 /// The audit label for a registered HTTP client's bearer: its `label`, or its `id`
@@ -10271,6 +10284,9 @@ struct TickOutcome {
 fn watch_registry(
     path: PathBuf,
     registry: Arc<Mutex<Registry>>,
+    // Republished with every registry swap so the HTTP auth path never reads a
+    // recovered or defaulted registry as "no clients configured" (SBS-900).
+    registry_trusted: Arc<AtomicBool>,
     router: Arc<Mutex<Arc<Router>>>,
     stdout: Arc<Mutex<std::io::Stdout>>,
     cached_tools: SharedCatalog,
@@ -10311,6 +10327,7 @@ fn watch_registry(
         let _ = watch_tick(
             &path,
             &registry,
+            &registry_trusted,
             &router,
             &stdout,
             &cached_tools,
@@ -10340,6 +10357,8 @@ fn watch_registry(
 fn watch_tick(
     path: &Path,
     registry: &Arc<Mutex<Registry>>,
+    // Published together with every swap of `registry` (SBS-900).
+    registry_trusted: &Arc<AtomicBool>,
     router: &Arc<Mutex<Arc<Router>>>,
     stdout: &Arc<Mutex<std::io::Stdout>>,
     cached_tools: &SharedCatalog,
@@ -10408,8 +10427,16 @@ fn watch_tick(
         eprintln!("toolport: registry file changed on disk");
         // Don't advance `last_mtime` until a successful load, so a half-written file
         // (caught mid-save) is retried on the next tick instead of skipped.
-        let new_reg = match registry::load_from(path) {
-            Ok(r) => r,
+        //
+        // SBS-900: `Ok` is not "we read the registry". It also covers a recovery
+        // from a backup (state N-1, so the save that registered the first HTTP
+        // client is exactly the one whose backup has none) and a default standing
+        // in for a file that could not be read. Both are indistinguishable from
+        // "no clients configured" once in memory, which is what re-opens an
+        // `--insecure-loopback` listener that auth had already closed. The verdict
+        // rides along and is published with the registry below.
+        let (new_reg, new_source) = match registry::load_from_with_source(path) {
+            Ok(loaded) => loaded,
             Err(e) => {
                 eprintln!("toolport: reload failed (will retry): {e}");
                 return TickOutcome {
@@ -10419,6 +10446,16 @@ fn watch_tick(
             }
         };
         state.last_mtime = current;
+        // Publish the new registry and how far it can be trusted as one step, under
+        // the registry lock. The HTTP auth path reads the flag while holding that
+        // lock, so it can never pair one reload's registry with another's verdict.
+        let publish_registry = |new_reg: Registry| {
+            let mut live = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry_trusted.store(new_source.is_authoritative(), Ordering::SeqCst);
+            *live = new_reg;
+        };
         // Refresh the live discovery mode from the freshly-loaded registry: a per-client
         // override edit (`client_discovery`) may be the only change, and it isn't
         // router-relevant, so resolve it here before the rebuild fast-path can return.
@@ -10442,9 +10479,7 @@ fn watch_tick(
         // also signaled a change, so that path is never dropped.
         let new_relevant = router_relevant(&new_reg);
         if downstream_changed == 0 && new_relevant == state.last_relevant {
-            *registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = new_reg;
+            publish_registry(new_reg);
             if routine_surface_changed || routine_catalog_changed {
                 notify_tools_changed(stdout, mcp_sessions);
                 eprintln!(
@@ -10522,9 +10557,10 @@ fn watch_tick(
         }
         let server_count = new_router.server_count();
         let tools = new_router.aggregated_tools();
-        *registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = new_reg;
+        // `previous_router` is snapshotted before `build_router` above (SBS-871),
+        // so it is already in scope here. Publish through `publish_registry` so
+        // the registry and its trust verdict land under one lock (SBS-900).
+        publish_registry(new_reg);
         *router
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(new_router);
@@ -10663,6 +10699,14 @@ fn watch_tick(
 #[derive(Clone)]
 struct GatewayState {
     registry: Arc<Mutex<Registry>>,
+    /// Whether `registry` above is a faithful copy of what is on disk, i.e.
+    /// whether an EMPTY field in it means the user configured nothing (SBS-900).
+    /// False after a load that was recovered from a backup or defaulted over
+    /// contents that could not be read; see [`conduit_lib::registry::LoadSource`].
+    /// Live, not a boot constant: the watcher republishes it with every registry
+    /// swap, under the `registry` lock, so a reader holding that lock can never
+    /// pair one reload's registry with another's verdict.
+    registry_trusted: Arc<AtomicBool>,
     // The live router behind a swappable Arc: dispatch clones the Arc and releases the
     // lock before the (possibly long) downstream call / approval hold, so nothing blocks
     // behind an in-flight request. Rebuilds swap in a new Arc; refresh/requarantine fork
@@ -14201,17 +14245,35 @@ fn insecure_loopback_requested(args: &[String]) -> bool {
 }
 
 /// Startup admission policy. The escape hatch is never valid for a non-loopback bind.
-fn http_bind_is_authorized(loopback: bool, auth_configured: bool, insecure_loopback: bool) -> bool {
-    auth_configured || http_allows_insecure_open(loopback, auth_configured, insecure_loopback)
+///
+/// `registry_loaded` is the boot `load_resolved` outcome (Ok=true, Err=false). A
+/// failed load must not authorize the `--insecure-loopback` open bind (SBS-900).
+fn http_bind_is_authorized(
+    loopback: bool,
+    auth_configured: bool,
+    insecure_loopback: bool,
+    registry_loaded: bool,
+) -> bool {
+    auth_configured
+        || http_allows_insecure_open(
+            loopback,
+            auth_configured,
+            insecure_loopback,
+            registry_loaded,
+        )
 }
 
-/// Activate the open-listener fallback only when the escape hatch was required at startup.
+/// Activate the open-listener fallback only when the escape hatch was required at startup
+/// and the registry actually loaded. `Registry::default()` after `load_resolved` Err
+/// also has empty `http_clients`; that must not count as "no clients configured"
+/// (SBS-900).
 fn http_allows_insecure_open(
     loopback: bool,
     auth_configured: bool,
     insecure_loopback: bool,
+    registry_loaded: bool,
 ) -> bool {
-    loopback && insecure_loopback && !auth_configured
+    loopback && insecure_loopback && !auth_configured && registry_loaded
 }
 
 fn serve_http(state: GatewayState, port: u16) {
@@ -14226,18 +14288,37 @@ fn serve_http(state: GatewayState, port: u16) {
         .filter(|t| !t.is_empty());
 
     let loopback = matches!(host.as_str(), "127.0.0.1" | "::1" | "localhost");
-    let registered_clients = state
-        .registry
-        .lock()
-        .map(|reg| !reg.http_clients.is_empty())
-        .unwrap_or(false);
+    // A poisoned lock must not read as "no clients registered": that is the input
+    // that turns auth off and lets the escape hatch serve an open listener. Every
+    // other registry lock in this file recovers the guard instead, and so does
+    // this one. The trust verdict is read under the same lock the watcher
+    // publishes it with (SBS-900).
+    let (registered_clients, registry_loaded) = {
+        let reg = state
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            !reg.http_clients.is_empty(),
+            state.registry_trusted.load(Ordering::SeqCst),
+        )
+    };
     let auth_configured = token.is_some() || registered_clients;
     let args: Vec<String> = std::env::args().collect();
     let insecure_loopback = insecure_loopback_requested(&args);
-    let allow_insecure_open =
-        http_allows_insecure_open(loopback, auth_configured, insecure_loopback);
+    let allow_insecure_open = http_allows_insecure_open(
+        loopback,
+        auth_configured,
+        insecure_loopback,
+        registry_loaded,
+    );
 
-    if !http_bind_is_authorized(loopback, auth_configured, insecure_loopback) {
+    if !http_bind_is_authorized(
+        loopback,
+        auth_configured,
+        insecure_loopback,
+        registry_loaded,
+    ) {
         if loopback {
             eprintln!(
                 "toolport-gateway: refusing to bind {host}:{port} without HTTP authentication. \
@@ -14651,9 +14732,21 @@ fn handle_connection(
             .registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Read the trust verdict for THIS registry, under the lock the watcher
+        // publishes both with, rather than the one boot started with. `reg` is the
+        // live registry the watcher swaps: a reload that recovered from a backup
+        // can drop the http_clients that closed this listener, and without a live
+        // verdict the open branch below would quietly re-open it (SBS-900).
+        let registry_loaded = state.registry_trusted.load(Ordering::SeqCst);
         // Resolve authorization, routing scope, audit attribution, and MCP
         // session ownership from one token lookup and one effective allow-set.
-        match resolve_http_caller(&reg, token.as_deref(), provided_tok, allow_insecure_open) {
+        match resolve_http_caller(
+            &reg,
+            token.as_deref(),
+            provided_tok,
+            allow_insecure_open,
+            registry_loaded,
+        ) {
             Some((allowed, resolved_caller)) => {
                 caller = Some(resolved_caller);
                 Some(allowed)
@@ -14964,10 +15057,16 @@ fn main() {
         );
         glog("WARNING: MSIX container detected but devirtualization failed (UNC view unreachable)");
     }
-    let loaded = match registry::load_resolved() {
-        Ok(r) => {
+    // SBS-900: keep the load *outcome* next to the in-memory registry. An empty
+    // `http_clients` list satisfies the `--insecure-loopback` open branch, and it
+    // is empty for three unrelated reasons: nothing configured (fine), an Err
+    // fallback to `Registry::default()`, and an Ok whose contents came from a
+    // backup or stood in for a file that could not be read. Only a load that
+    // actually saw the configured state may be read as "no clients".
+    let (loaded, registry_loaded) = match registry::load_resolved_with_source() {
+        Ok((r, source)) => {
             glog(&format!(
-                "load_resolved OK: {} servers total, {} enabled (active={})",
+                "load_resolved OK ({source:?}): {} servers total, {} enabled (active={})",
                 r.servers.len(),
                 r.enabled_servers().len(),
                 r.active_profile_id()
@@ -14977,7 +15076,14 @@ fn main() {
             // re-enable code mode after a corrupt registry (WS2-5). The watcher
             // already fails safe by not updating the flag on reload failure.
             seed_code_mode_after_registry_load(Ok(&r));
-            r
+            if !source.is_authoritative() {
+                eprintln!(
+                    "toolport-gateway: registry was recovered or could not be read ({source:?}); \
+                     its HTTP client list may be incomplete, so {INSECURE_LOOPBACK_FLAG} will not \
+                     open an unauthenticated listener. Set TOOLPORT_HTTP_TOKEN or repair the registry."
+                );
+            }
+            (r, source.is_authoritative())
         }
         Err(e) => {
             // Always surface this (not only under CONDUIT_DEBUG). A corrupt or
@@ -14991,7 +15097,7 @@ fn main() {
             );
             glog(&format!("load_resolved ERR: {e}"));
             seed_code_mode_after_registry_load(Err(()));
-            registry::Registry::default()
+            (registry::Registry::default(), false)
         }
     };
     inspect::clear();
@@ -15006,6 +15112,10 @@ fn main() {
         resolve_live_profile(&loaded, client_id.as_deref(), &env_profile)
     };
     let registry = Arc::new(Mutex::new(loaded));
+    // Travels with the registry above for the rest of the process: the watcher
+    // republishes it on every reload, and the HTTP request path reads it while
+    // holding the registry lock (SBS-900).
+    let registry_trusted = Arc::new(AtomicBool::new(registry_loaded));
     // Empty router + cached catalog: the handshake and tools/list answer instantly
     // (from cache), while downstream servers connect in the background for the
     // actual tool calls.
@@ -15171,6 +15281,7 @@ fn main() {
 
     if let Some(path) = registry::resolved_path() {
         let registry = Arc::clone(&registry);
+        let registry_trusted = Arc::clone(&registry_trusted);
         let router = Arc::clone(&router);
         let stdout = Arc::clone(&stdout);
         let cached_tools = Arc::clone(&cached_tools);
@@ -15188,6 +15299,7 @@ fn main() {
             watch_registry(
                 path,
                 registry,
+                registry_trusted,
                 router,
                 stdout,
                 cached_tools,
@@ -15208,6 +15320,7 @@ fn main() {
 
     let state = GatewayState {
         registry: Arc::clone(&registry),
+        registry_trusted: Arc::clone(&registry_trusted),
         router: Arc::clone(&router),
         cached_tools: Arc::clone(&cached_tools),
         routine_candidates: CandidateRegistry::default(),
@@ -20113,6 +20226,8 @@ mod tests {
         ));
         GatewayState {
             registry: Arc::new(Mutex::new(Registry::default())),
+            // Tests stand in for a clean boot load; the ones that care flip it.
+            registry_trusted: Arc::new(AtomicBool::new(true)),
             router: Arc::new(Mutex::new(Arc::new(Router::new()))),
             cached_tools: Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
             routine_candidates: CandidateRegistry::default(),
@@ -20693,15 +20808,115 @@ mod tests {
 
     #[test]
     fn http_bind_requires_auth_except_for_explicit_loopback_escape_hatch() {
-        assert!(http_bind_is_authorized(true, true, false));
-        assert!(http_bind_is_authorized(false, true, false));
-        assert!(http_bind_is_authorized(true, false, true));
-        assert!(!http_bind_is_authorized(true, false, false));
-        assert!(!http_bind_is_authorized(false, false, false));
-        assert!(!http_bind_is_authorized(false, false, true));
-        assert!(http_allows_insecure_open(true, false, true));
-        assert!(!http_allows_insecure_open(true, true, true));
-        assert!(!http_allows_insecure_open(false, false, true));
+        assert!(http_bind_is_authorized(true, true, false, true));
+        assert!(http_bind_is_authorized(false, true, false, true));
+        assert!(http_bind_is_authorized(true, false, true, true));
+        assert!(!http_bind_is_authorized(true, false, false, true));
+        assert!(!http_bind_is_authorized(false, false, false, true));
+        assert!(!http_bind_is_authorized(false, false, true, true));
+        assert!(http_allows_insecure_open(true, false, true, true));
+        assert!(!http_allows_insecure_open(true, true, true, true));
+        assert!(!http_allows_insecure_open(false, false, true, true));
+    }
+
+    /// SBS-900: boot `load_resolved` Err falls back to `Registry::default()`, whose
+    /// empty `http_clients` used to satisfy the `--insecure-loopback` open branch.
+    /// A failed load is not "no clients configured". A missing file is `Ok(default)`
+    /// and is not this case.
+    #[test]
+    fn failed_registry_load_does_not_open_insecure_loopback() {
+        let reg = Registry::default();
+        // Request resolver: flag + empty default after a failed load must not open.
+        assert!(
+            resolve_http_scope(&reg, None, None, true, false).is_none(),
+            "failed load must not authorize the open caller"
+        );
+        assert!(
+            resolve_http_caller(&reg, None, None, true, false).is_none(),
+            "failed load must not mint the open HttpCaller"
+        );
+        // Startup: failed load + no env token must not authorize the open bind.
+        assert!(
+            !http_allows_insecure_open(true, false, true, false),
+            "failed load must not activate the open-listener fallback"
+        );
+        assert!(
+            !http_bind_is_authorized(true, false, true, false),
+            "failed load + no env token must not authorize the open bind"
+        );
+        // Failed load + env token still binds; the token is the auth, not the hatch.
+        assert!(
+            http_bind_is_authorized(true, true, true, false),
+            "failed load + env token must still bind"
+        );
+        assert!(
+            !http_allows_insecure_open(true, true, true, false),
+            "an env token must not also open the unauthenticated branch"
+        );
+        assert_eq!(
+            resolve_http_scope(&reg, Some("envtok"), Some("envtok"), true, false),
+            Some(None),
+            "failed load + matching env token must still authorize"
+        );
+    }
+
+    /// SBS-900: a successful empty load (`Ok(Registry::default())`, including a
+    /// missing file) plus `--insecure-loopback` still opens.
+    #[test]
+    fn successful_empty_registry_load_still_opens_insecure_loopback() {
+        let reg = Registry::default();
+        assert_eq!(resolve_http_scope(&reg, None, None, true, true), Some(None));
+        assert!(resolve_http_caller(&reg, None, None, true, true).is_some());
+        assert!(http_allows_insecure_open(true, false, true, true));
+        assert!(http_bind_is_authorized(true, false, true, true));
+    }
+
+    /// SBS-900 (runtime): the boot verdict alone is not enough. `state.registry`
+    /// is the same Arc the watcher swaps, so a reload that recovered from a
+    /// backup can empty `http_clients` long after boot. The request path reads
+    /// the CURRENT verdict, so a listener that started open closes on that
+    /// reload instead of silently reverting to unauthenticated.
+    #[test]
+    fn a_reload_that_loses_trust_closes_the_open_listener() {
+        let state = http_state(true);
+        // Same flag the watcher publishes with every registry swap.
+        let trusted = Arc::clone(&state.registry_trusted);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let search = Arc::new(SearchGuard::default());
+        let confirm = Arc::new(ConfirmGuard::new());
+        // Started open: loopback, `--insecure-loopback`, and a clean empty registry.
+        std::thread::spawn(move || serve_http_loop(server, state, None, search, confirm, true));
+        std::thread::sleep(Duration::from_millis(50)); // let the listener come up
+
+        let body = modern_http_body(1, "tools/list", json!({}));
+        let headers = [
+            ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+            ("Mcp-Method", "tools/list"),
+            ("Accept", "application/json"),
+        ];
+        let open = http_post_with_headers(port, "/mcp", &body, &headers);
+        assert!(
+            open.starts_with("HTTP/1.1 200"),
+            "a clean empty registry still opens: {open}"
+        );
+
+        // The watcher swaps in a registry it could not vouch for (recovered from a
+        // backup, or defaulted over a file it could not read).
+        trusted.store(false, Ordering::SeqCst);
+        let closed = http_post_with_headers(port, "/mcp", &body, &headers);
+        assert!(
+            closed.starts_with("HTTP/1.1 401"),
+            "an untrusted live registry must not keep the listener open: {closed}"
+        );
+
+        // Trust comes back with the next clean reload; this is not a latch.
+        trusted.store(true, Ordering::SeqCst);
+        let reopened = http_post_with_headers(port, "/mcp", &body, &headers);
+        assert!(
+            reopened.starts_with("HTTP/1.1 200"),
+            "a clean reload restores the startup policy: {reopened}"
+        );
     }
 
     #[test]
@@ -20937,14 +21152,14 @@ mod tests {
     fn resolve_http_scope_auth_and_scope_policy() {
         let mut reg = Registry::default();
         // No auth configured at all -> open only under the explicit escape hatch.
-        assert_eq!(resolve_http_scope(&reg, None, None, true), Some(None));
-        assert_eq!(resolve_http_scope(&reg, None, None, false), None);
+        assert_eq!(resolve_http_scope(&reg, None, None, true, true), Some(None));
+        assert_eq!(resolve_http_scope(&reg, None, None, false, true), None);
         // Legacy env token: exact match -> unscoped; mismatch -> rejected.
         assert_eq!(
-            resolve_http_scope(&reg, Some("envtok"), Some("envtok"), false),
+            resolve_http_scope(&reg, Some("envtok"), Some("envtok"), false, true),
             Some(None)
         );
-        assert!(resolve_http_scope(&reg, Some("envtok"), Some("nope"), false).is_none());
+        assert!(resolve_http_scope(&reg, Some("envtok"), Some("nope"), false, true).is_none());
         // A registered client with an empty profile is authorized but unscoped.
         reg.http_clients.push(registry::HttpClient {
             id: "c1".into(),
@@ -20953,13 +21168,13 @@ mod tests {
             profile: String::new(),
         });
         assert_eq!(
-            resolve_http_scope(&reg, None, Some("fulltok"), false),
+            resolve_http_scope(&reg, None, Some("fulltok"), false, true),
             Some(None)
         );
         // Once any client is registered, an unknown/absent bearer is rejected
         // (the open default no longer applies).
-        assert!(resolve_http_scope(&reg, None, Some("unknown"), false).is_none());
-        assert!(resolve_http_scope(&reg, None, None, false).is_none());
+        assert!(resolve_http_scope(&reg, None, Some("unknown"), false, true).is_none());
+        assert!(resolve_http_scope(&reg, None, None, false, true).is_none());
         // A client scoped to a non-empty profile resolves to a (possibly empty)
         // allow-set; exact membership is covered by enabled_servers_for tests.
         reg.http_clients.push(registry::HttpClient {
@@ -20969,19 +21184,22 @@ mod tests {
             profile: "Default".into(),
         });
         assert!(matches!(
-            resolve_http_scope(&reg, None, Some("scopedtok"), false),
+            resolve_http_scope(&reg, None, Some("scopedtok"), false, true),
             Some(Some(_))
         ));
 
         // Removing the last registered client while the gateway is live must not
         // turn an authenticated listener into an open one. Only immutable startup
         // policy from `--insecure-loopback` enables the fallback.
-        let authenticated_startup_allows_open = http_allows_insecure_open(true, true, true);
+        let authenticated_startup_allows_open = http_allows_insecure_open(true, true, true, true);
         reg.http_clients.clear();
-        assert!(resolve_http_scope(&reg, None, None, authenticated_startup_allows_open).is_none());
-        let explicit_open_startup = http_allows_insecure_open(true, false, true);
+        assert!(
+            resolve_http_scope(&reg, None, None, authenticated_startup_allows_open, true)
+                .is_none()
+        );
+        let explicit_open_startup = http_allows_insecure_open(true, false, true, true);
         assert_eq!(
-            resolve_http_scope(&reg, None, None, explicit_open_startup),
+            resolve_http_scope(&reg, None, None, explicit_open_startup, true),
             Some(None)
         );
     }
@@ -21005,7 +21223,7 @@ mod tests {
         });
 
         let (_, caller) =
-            resolve_http_caller(&reg, None, Some("client-token"), false).unwrap();
+            resolve_http_caller(&reg, None, Some("client-token"), false, true).unwrap();
 
         // Use a real in-memory downstream route so the tools/call request reaches
         // execute_call(), which is where the audit entry is recorded.
@@ -21130,8 +21348,8 @@ mod tests {
             profile: String::new(),
         });
 
-        let (_, first) = resolve_http_caller(&reg, None, Some("tok1"), false).unwrap();
-        let (_, second) = resolve_http_caller(&reg, None, Some("tok2"), false).unwrap();
+        let (_, first) = resolve_http_caller(&reg, None, Some("tok1"), false, true).unwrap();
+        let (_, second) = resolve_http_caller(&reg, None, Some("tok2"), false, true).unwrap();
         assert_eq!(first.audit_label.as_deref(), Some("Open WebUI"));
         assert_eq!(second.audit_label.as_deref(), Some("Open WebUI"));
         assert_ne!(
@@ -21183,8 +21401,8 @@ mod tests {
             token_sha256: registry::sha256_hex("t-b"),
             profile: String::new(),
         });
-        let (_, a) = resolve_http_caller(&reg, None, Some("t-a"), false).unwrap();
-        let (_, b) = resolve_http_caller(&reg, None, Some("t-b"), false).unwrap();
+        let (_, a) = resolve_http_caller(&reg, None, Some("t-a"), false, true).unwrap();
+        let (_, b) = resolve_http_caller(&reg, None, Some("t-b"), false, true).unwrap();
         // What handle_http must pass into process_request (stable id, not label).
         assert_eq!(a.session_owner.identity, "client:alpha");
         assert_eq!(b.session_owner.identity, "client:beta");
@@ -22618,7 +22836,7 @@ mod tests {
             profile: personal,
         });
         let (allowed, caller) =
-            resolve_http_caller(&reg, None, Some("tok-personal"), false).unwrap();
+            resolve_http_caller(&reg, None, Some("tok-personal"), false, true).unwrap();
         let set = allowed.expect("Personal client is scoped");
         assert!(set.contains("team-slack"));
         assert!(
@@ -26144,6 +26362,7 @@ mod tests {
         let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
 
         let registry = Arc::new(Mutex::new(Registry::default()));
+        let registry_trusted = Arc::new(AtomicBool::new(true));
         let router = Arc::new(Mutex::new(Arc::new(Router::new())));
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
         let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default())));
@@ -26163,6 +26382,7 @@ mod tests {
         let _ = watch_tick(
             &reg_path,
             &registry,
+            &registry_trusted,
             &router,
             &stdout,
             &cached_tools,
@@ -26183,6 +26403,95 @@ mod tests {
             profile_slot.lock().unwrap().is_none(),
             "HTTP mode must not adopt the active profile after a registry reload"
         );
+        assert!(
+            registry_trusted.load(Ordering::SeqCst),
+            "a clean reload keeps the registry trustworthy"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// SBS-900: the watcher swaps the live registry on ANY `Ok`, and `Ok` covers a
+    /// recovery from a backup. `save_to` snapshots the PRE-write content, so the
+    /// save that registered the FIRST http client is exactly the one whose backup
+    /// still has none: that reload hands the request path an empty client list and
+    /// used to re-open a listener that auth had already closed. The reload has to
+    /// publish how much it can be trusted along with the registry it swaps in.
+    #[test]
+    fn watch_tick_marks_a_recovered_registry_untrusted() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("toolport-sbs900-tick-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        let reg_path = dir.join("registry.json");
+        // State N-1: nothing registered, so `--insecure-loopback` served an open
+        // listener. State N: the first HTTP client, which closed it.
+        conduit_lib::registry::save_to(&reg_path, &Registry::default()).unwrap();
+        let mut with_client = Registry::default();
+        with_client.http_clients.push(registry::HttpClient {
+            id: "c1".into(),
+            label: "Open WebUI".into(),
+            token_sha256: registry::sha256_hex("tok"),
+            profile: String::new(),
+        });
+        conduit_lib::registry::save_to(&reg_path, &with_client).unwrap();
+
+        let registry = Arc::new(Mutex::new(with_client));
+        let registry_trusted = Arc::new(AtomicBool::new(true));
+        let router = Arc::new(Mutex::new(Arc::new(Router::new())));
+        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default())));
+        let profile_slot = Arc::new(Mutex::new(None));
+        let downstream_dirty = Arc::new(AtomicU8::new(0));
+        let client_root = Arc::new(Mutex::new(None));
+        let server_handler: ServerRequestHandler = Arc::new(|_| None);
+        let rebuild_lock = Arc::new(Mutex::new(()));
+
+        // Corrupt the primary, exactly as the incident did.
+        std::fs::write(&reg_path, "{ not json").unwrap();
+        let mut state = WatchLoopState {
+            last_mtime: None,
+            last_relevant: json!({}),
+            last_routines_mtime: None,
+        };
+        let _ = watch_tick(
+            &reg_path,
+            &registry,
+            &registry_trusted,
+            &router,
+            &stdout,
+            &cached_tools,
+            &profile_slot,
+            None,
+            None,
+            true,
+            &downstream_dirty,
+            &server_handler,
+            &client_root,
+            None,
+            None,
+            None,
+            &rebuild_lock,
+            &mut state,
+        );
+
+        let live = registry.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            live.http_clients.is_empty(),
+            "the recovery really did lose the registered client"
+        );
+        let trusted = registry_trusted.load(Ordering::SeqCst);
+        assert!(
+            !trusted,
+            "a recovered registry must not be read as 'no clients configured'"
+        );
+        // Which is what the request path asks before serving an open caller.
+        assert!(
+            resolve_http_scope(&live, None, None, true, trusted).is_none(),
+            "the open branch must stay shut on a recovered registry"
+        );
+        drop(live);
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -26210,6 +26519,7 @@ mod tests {
         let mut reg = Registry::default();
         reg.quarantine_on_drift = true;
         let registry = Arc::new(Mutex::new(reg));
+        let registry_trusted = Arc::new(AtomicBool::new(true));
         let router = Arc::new(Mutex::new(Arc::new(Router::new())));
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
         let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default())));
@@ -26232,6 +26542,7 @@ mod tests {
         let load = watch_tick(
             &reg_path,
             &registry,
+            &registry_trusted,
             &router,
             &stdout,
             &cached_tools,
@@ -26262,6 +26573,7 @@ mod tests {
         let steady = watch_tick(
             &reg_path,
             &registry,
+            &registry_trusted,
             &router,
             &stdout,
             &cached_tools,
@@ -26286,6 +26598,7 @@ mod tests {
         let after = watch_tick(
             &reg_path,
             &registry,
+            &registry_trusted,
             &router,
             &stdout,
             &cached_tools,
@@ -26331,6 +26644,7 @@ mod tests {
         let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
 
         let registry = Arc::new(Mutex::new(Registry::default()));
+        let registry_trusted = Arc::new(AtomicBool::new(true));
         let original_router = Arc::new(Router::new());
         let router = Arc::new(Mutex::new(Arc::clone(&original_router)));
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
@@ -26360,6 +26674,7 @@ mod tests {
         let outcome = watch_tick(
             &path,
             &registry,
+            &registry_trusted,
             &router,
             &stdout,
             &cached_tools,
@@ -26404,6 +26719,7 @@ mod tests {
         let catalog_change = watch_tick(
             &path,
             &registry,
+            &registry_trusted,
             &router,
             &stdout,
             &cached_tools,
