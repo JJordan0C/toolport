@@ -48,6 +48,7 @@ const props = {
   onClientsRefresh: vi.fn(),
   onBrowseCatalog: vi.fn(),
   onOpenPlayground: vi.fn(),
+  onOpenRules: vi.fn(),
   onFinish: vi.fn(),
 };
 
@@ -60,7 +61,7 @@ describe("Onboarding dialog accessibility", () => {
     // Welcome
     expect(screen.getByRole("dialog")).toHaveAccessibleName("Welcome to Toolport");
 
-    await user.click(screen.getByRole("button", { name: /Get started/ }));
+    await user.click(screen.getByRole("button", { name: /Set up MCP servers/ }));
     expect(screen.getByRole("dialog")).toHaveAccessibleName("Add your first servers");
 
     await user.click(screen.getByRole("button", { name: /I'll add servers later/ }));

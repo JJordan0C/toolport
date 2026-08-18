@@ -5,6 +5,7 @@ import {
   Check,
   Copy,
   Download,
+  FileText,
   KeyRound,
   Link2,
   Loader2,
@@ -61,6 +62,8 @@ interface Props {
   onProbe: () => Promise<ProbeResult[]>;
   /** Close the wizard and open the Playground (the in-app verify fallback). */
   onOpenPlayground: () => void;
+  /** Close the wizard and open Agent rules, for someone who came for that and not MCP. */
+  onOpenRules: () => void;
   /** Mark onboarding complete (skipped or finished) and close. */
   onFinish: () => void;
 }
@@ -78,9 +81,19 @@ export function Onboarding({
   onBrowseCatalog,
   onProbe,
   onOpenPlayground,
+  onOpenRules,
   onFinish,
 }: Props) {
   const [step, setStep] = useState(initialStep);
+  /**
+   * Which door the user came through (SBS-826).
+   *
+   * Toolport's first run used to assume MCP: the second step was "add a server", so someone
+   * who installed it to sync their agent rules had to add an MCP server they did not want, or
+   * bail. `rules` drops that step. Both paths still run client detection, because connecting a
+   * client is what makes either feature do anything.
+   */
+  const [path, setPath] = useState<"mcp" | "rules">("mcp");
   // A team member who was handed an invite code shouldn't have to click through
   // the solo flow to find a place to enter it. This branch drops them straight
   // into the join step and, on success, the team's servers arrive locally.
@@ -96,38 +109,58 @@ export function Onboarding({
   const serverCount = registry.servers.filter((s) => !isGatewayServer(s)).length;
   const connectedCount = clients.filter((c) => c.gatewayInstalled).length;
 
-  const steps = [
+  const welcome = (
     <Welcome
       key="welcome"
       present={present}
-      onNext={() => setStep(1)}
+      onChoosePath={(chosen) => {
+        setPath(chosen);
+        setStep(1);
+      }}
       onJoinTeam={() => setJoining(true)}
-    />,
-    <AddServers
-      key="add"
-      registry={registry}
-      importable={importable}
-      onImport={onRegistryChange}
-      onBrowseCatalog={onBrowseCatalog}
-      onNext={() => setStep(2)}
-    />,
+    />
+  );
+  const connect = (
     <ConnectClients
       key="connect"
       present={present}
       onConnected={onClientsRefresh}
-      onNext={() => setStep(3)}
-    />,
+      onNext={() => setStep(path === "rules" ? 2 : 3)}
+    />
+  );
+  const done = (
     <Done
       key="done"
+      path={path}
       registry={registry}
       clients={clients}
       serverCount={serverCount}
       connectedCount={connectedCount}
       onProbe={onProbe}
       onOpenPlayground={onOpenPlayground}
+      onOpenRules={onOpenRules}
       onFinish={onFinish}
-    />,
-  ];
+    />
+  );
+
+  // The rules path has no "add a server" step, so the array is shorter and the progress
+  // indicator counts the steps this user will actually see rather than the MCP ones.
+  const steps =
+    path === "rules"
+      ? [welcome, connect, done]
+      : [
+          welcome,
+          <AddServers
+            key="add"
+            registry={registry}
+            importable={importable}
+            onImport={onRegistryChange}
+            onBrowseCatalog={onBrowseCatalog}
+            onNext={() => setStep(2)}
+          />,
+          connect,
+          done,
+        ];
 
   return (
     <Dialog open onOpenChange={(o) => !o && onFinish()}>
@@ -211,11 +244,11 @@ function StepHeader({
 
 function Welcome({
   present,
-  onNext,
+  onChoosePath,
   onJoinTeam,
 }: {
   present: DetectedClient[];
-  onNext: () => void;
+  onChoosePath: (path: "mcp" | "rules") => void;
   onJoinTeam: () => void;
 }) {
   const names = present.map((c) => c.name);
@@ -243,7 +276,7 @@ function Welcome({
   return (
     <>
       <StepHeader icon={<Waypoints className="size-5" />} title="Welcome to Toolport">
-        One local gateway for all your MCP servers, shared by every AI tool.
+        One place to set up and control every AI tool on your machine.
       </StepHeader>
       <div className="grid gap-2.5">
         {benefits.map(({ icon: Icon, title, body }) => (
@@ -259,10 +292,34 @@ function Welcome({
         ))}
       </div>
       <p className="text-sm text-muted-foreground">{found}</p>
-      <Button onClick={onNext} className="self-start">
-        Get started
-        <ArrowRight className="size-4" />
-      </Button>
+      {/* Two doors, because two different people install this (SBS-826). Someone here for
+          rules used to be walked into "add an MCP server" and had to add one they did not
+          want, or leave. Both paths still connect a client, which is what makes either
+          feature reach anything. */}
+      <div className="grid gap-2">
+        <Button onClick={() => onChoosePath("mcp")} className="justify-start">
+          <Waypoints className="size-4" />
+          <span className="flex flex-col items-start">
+            <span>Set up MCP servers</span>
+            <span className="text-2xs font-normal opacity-80">
+              Connect servers once and share them with every AI tool
+            </span>
+          </span>
+        </Button>
+        <Button
+          variant="outline"
+          onClick={() => onChoosePath("rules")}
+          className="justify-start"
+        >
+          <FileText className="size-4" />
+          <span className="flex flex-col items-start">
+            <span>Write rules for my agents</span>
+            <span className="text-2xs font-normal text-muted-foreground">
+              One set of instructions, applied to every AI tool. No MCP server needed
+            </span>
+          </span>
+        </Button>
+      </div>
       <div className="flex flex-col gap-1.5 border-t pt-4">
         <button
           type="button"
@@ -790,22 +847,30 @@ function ConnectClients({
 }
 
 function Done({
+  path,
   registry,
   clients,
   serverCount,
   connectedCount,
   onProbe,
   onOpenPlayground,
+  onOpenRules,
   onFinish,
 }: {
+  path: "mcp" | "rules";
   registry: Registry;
   clients: DetectedClient[];
   serverCount: number;
   connectedCount: number;
   onProbe: () => Promise<ProbeResult[]>;
   onOpenPlayground: () => void;
+  onOpenRules: () => void;
   onFinish: () => void;
 }) {
+  // Someone who came for rules has no servers ON PURPOSE. Judging their setup by server
+  // count would tell them they have not finished when they have, which is the bounce
+  // SBS-826 exists to remove.
+  const rulesPath = path === "rules";
   // Probe what was just added so we report the truth, not a blanket "you're set up"
   // over a server that can't actually start (a missing runtime is the #1 first-run
   // failure). Auth-pending servers are an expected next step, not a fault, so they're
@@ -843,7 +908,9 @@ function Done({
   const nameFor = (id: string) => registry.servers.find((s) => s.id === id)?.name ?? id;
   const broken = (health ?? []).filter((r) => !r.ok && !r.authRequired);
 
-  const configured = serverCount > 0 && connectedCount > 0;
+  const configured = rulesPath
+    ? connectedCount > 0
+    : serverCount > 0 && connectedCount > 0;
   // Verification states only apply once setup is actually complete: with no client
   // connected the step reports what's missing, and must not dress the finish button
   // or the status blocks in "Checking…" / "couldn't verify" language.
@@ -853,7 +920,7 @@ function Done({
   // The client to verify against: the first one Toolport is actually wired into.
   const verifyClient = clients.find((c) => c.gatewayInstalled) ?? null;
   const missing = [
-    serverCount === 0 ? "added a server" : null,
+    !rulesPath && serverCount === 0 ? "added a server" : null,
     connectedCount === 0 ? "connected a client" : null,
   ]
     .filter(Boolean)
@@ -872,7 +939,14 @@ function Done({
                 : "Setup started"
         }
       >
-        {ready ? (
+        {ready && rulesPath ? (
+          <>
+            Toolport is wired into {connectedCount} tool
+            {connectedCount === 1 ? "" : "s"}. Write your rules once on the next screen
+            and Toolport puts them in each tool&apos;s own rules file, so they all follow
+            the same instructions without you editing four files by hand.
+          </>
+        ) : ready ? (
           <>
             Toolport now manages {serverCount} server
             {serverCount === 1 ? "" : "s"} across {connectedCount} connected tool
@@ -952,18 +1026,30 @@ function Done({
         </div>
       )}
 
-      {ready && verifyClient && (
+      {ready && !rulesPath && verifyClient && (
         <VerifyCall client={verifyClient} onOpenPlayground={onOpenPlayground} />
       )}
 
-      <Button onClick={onFinish} className="self-start">
-        {checkingHealth || verificationFailed
-          ? "Continue without verification"
-          : ready
-            ? "Start using Toolport"
-            : "Got it"}
-        <ArrowRight className="size-4" />
-      </Button>
+      {rulesPath ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <Button onClick={onOpenRules}>
+            Set up agent rules
+            <ArrowRight className="size-4" />
+          </Button>
+          <Button variant="ghost" onClick={onFinish}>
+            Not now
+          </Button>
+        </div>
+      ) : (
+        <Button onClick={onFinish} className="self-start">
+          {checkingHealth || verificationFailed
+            ? "Continue without verification"
+            : ready
+              ? "Start using Toolport"
+              : "Got it"}
+          <ArrowRight className="size-4" />
+        </Button>
+      )}
     </>
   );
 }

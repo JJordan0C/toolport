@@ -1166,6 +1166,13 @@ function App() {
               setShowOnboarding(false);
               selectView("playground");
             }}
+            onOpenRules={() => {
+              // Mark onboarding done, not merely hidden: someone who finished the rules
+              // path IS set up, and re-showing the wizard on next launch because they
+              // never added a server would be the same MCP assumption again (SBS-826).
+              finishOnboarding();
+              selectView("rules");
+            }}
             onFinish={finishOnboarding}
           />
         </Suspense>
