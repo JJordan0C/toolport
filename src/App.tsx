@@ -102,6 +102,7 @@ const SettingsView = lazy(() =>
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/Callout";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { GitHubStarPrompt, type StarSurface } from "@/components/GitHubStarPrompt";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -165,6 +166,12 @@ function App() {
   // Toolport into their tools.
   const [onboardingStep, setOnboardingStep] = useState(0);
   const [resumeAtConnect, setResumeAtConnect] = useState(false);
+  // Set when the wizard is completed in this session, which is the only trigger
+  // for the GitHub star card (see GitHubStarPrompt).
+  const [justOnboarded, setJustOnboarded] = useState(false);
+  // The star prompt shares the bottom-right corner with the toast stack, so
+  // toasts are offset upward while it is on screen instead of covering it.
+  const [starSurface, setStarSurface] = useState<StarSurface>(null);
 
   const lastProbeRef = useRef(0);
   const probeFlightRef = useRef(createSingleFlight<ProbeResult[]>());
@@ -698,6 +705,7 @@ function App() {
     // Drop the pre-rename key so brand remnants do not linger in DevTools.
     localStorage.removeItem("conduit.onboarded");
     setOnboarded(true);
+    setJustOnboarded(true);
     setShowOnboarding(false);
     setResumeAtConnect(false);
     setOnboardingStep(0);
@@ -1170,6 +1178,11 @@ function App() {
           />
         </Suspense>
       )}
+      <GitHubStarPrompt
+        justOnboarded={justOnboarded}
+        enabledCount={enabledCount}
+        onVisibleChange={setStarSurface}
+      />
       <PendingApprovals />
       {/* Quarantine has no global signal otherwise: the first sign used to be an agent
           call failing, with the only fix buried in Settings (SOU-293). */}
@@ -1262,7 +1275,17 @@ function App() {
           </dl>
         </DialogContent>
       </Dialog>
-      <Toaster theme={resolvedTheme} position="bottom-right" />
+      <Toaster
+        theme={resolvedTheme}
+        position="bottom-right"
+        offset={
+          starSurface === "chip"
+            ? { bottom: "3.5rem" }
+            : starSurface
+              ? { bottom: "10rem" }
+              : undefined
+        }
+      />
     </TooltipProvider>
   );
 }
