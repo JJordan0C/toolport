@@ -37,34 +37,54 @@ export const RETURNING_MIN_ENABLED_SERVERS = 1;
  */
 export type StarStage = "card" | "returning" | "later" | "done";
 
+/**
+ * Set the first time localStorage refuses a read or a write.
+ *
+ * Storage is the only thing that remembers a spent ask, so once it is gone the
+ * honest answer is to stop asking rather than to ask again on every mount. This
+ * is module state on purpose: it has to outlive the component that discovered
+ * the failure.
+ */
+let storageBroken = false;
+
+function readRaw(key: string): string | null {
+  if (storageBroken) return null;
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    storageBroken = true;
+    return null;
+  }
+}
+
 function onboardedAlready(): boolean {
   return (
-    localStorage.getItem("toolport.onboarded") === "1" ||
+    readRaw("toolport.onboarded") === "1" ||
     // Pre-rename key, still present on installs that onboarded as Conduit.
-    localStorage.getItem("conduit.onboarded") === "1"
+    readRaw("conduit.onboarded") === "1"
   );
 }
 
 /** Resolve the stage to start this session at. */
 export function readStarStage(): StarStage {
-  let raw: string | null;
-  try {
-    raw = localStorage.getItem(STAR_PROMPT_KEY);
-  } catch {
-    // Without storage a spent ask can't be remembered, so the prompt would come
-    // back every launch. That is exactly the nag this feature must not be.
-    return "done";
-  }
+  const raw = readRaw(STAR_PROMPT_KEY);
+  if (storageBroken) return "done";
   if (raw === "done" || raw === "later") return raw;
   // No record at all. An install that has already onboarded predates this
   // prompt, so it gets the single existing-user card rather than nothing.
-  return onboardedAlready() ? "returning" : "card";
+  const stage = onboardedAlready() ? "returning" : "card";
+  return storageBroken ? "done" : stage;
 }
 
 export function writeStarStage(stage: "later" | "done"): void {
+  if (storageBroken) return;
+  // "done" is terminal. The effect that spends an ask when it is shown can flush
+  // after a click on Star has already finished the ask, and without this guard
+  // that late write would reopen it and bring the chip back next launch.
+  if (stage === "later" && readRaw(STAR_PROMPT_KEY) === "done") return;
   try {
     localStorage.setItem(STAR_PROMPT_KEY, stage);
   } catch {
-    // Best effort. In-memory state still suppresses the prompt for this session.
+    storageBroken = true;
   }
 }

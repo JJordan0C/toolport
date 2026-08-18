@@ -1,55 +1,97 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { readStarStage, writeStarStage, STAR_PROMPT_KEY } from "./starPrompt";
 
-beforeEach(() => localStorage.clear());
+// The module carries a "storage is broken" latch that must outlive a component,
+// so each test gets a fresh copy of it rather than a leaked one.
+let mod: typeof import("./starPrompt");
+
+beforeEach(async () => {
+  vi.resetModules();
+  localStorage.clear();
+  mod = await import("./starPrompt");
+});
+
 afterEach(() => vi.restoreAllMocks());
 
 describe("readStarStage", () => {
   it("starts a brand-new install at the onboarding card", () => {
-    expect(readStarStage()).toBe("card");
+    expect(mod.readStarStage()).toBe("card");
   });
 
   it("starts an install that predates the prompt at the one-off card", () => {
     localStorage.setItem("toolport.onboarded", "1");
-    expect(readStarStage()).toBe("returning");
+    expect(mod.readStarStage()).toBe("returning");
   });
 
   it("honours the pre-rename onboarding key", () => {
     localStorage.setItem("conduit.onboarded", "1");
-    expect(readStarStage()).toBe("returning");
+    expect(mod.readStarStage()).toBe("returning");
   });
 
   it("prefers a recorded stage over the predates-the-prompt guess", () => {
     // Otherwise an existing user would get the one-off card on every launch.
     localStorage.setItem("toolport.onboarded", "1");
-    writeStarStage("done");
-    expect(readStarStage()).toBe("done");
+    mod.writeStarStage("done");
+    expect(mod.readStarStage()).toBe("done");
   });
 
   it("round-trips the two stages that are written", () => {
-    writeStarStage("later");
-    expect(readStarStage()).toBe("later");
-    writeStarStage("done");
-    expect(readStarStage()).toBe("done");
+    mod.writeStarStage("later");
+    expect(mod.readStarStage()).toBe("later");
+    mod.writeStarStage("done");
+    expect(mod.readStarStage()).toBe("done");
   });
 
   it("ignores a garbage value", () => {
-    localStorage.setItem(STAR_PROMPT_KEY, "yes-please");
-    expect(readStarStage()).toBe("card");
+    localStorage.setItem(mod.STAR_PROMPT_KEY, "yes-please");
+    expect(mod.readStarStage()).toBe("card");
+  });
+});
+
+describe("done is terminal", () => {
+  it("refuses to downgrade a finished ask back to later", () => {
+    // The effect that spends an ask when it is shown can flush after a click on
+    // Star has already finished it. Without this the chip would come back.
+    mod.writeStarStage("done");
+    mod.writeStarStage("later");
+    expect(mod.readStarStage()).toBe("done");
   });
 
-  it("stays silent when storage is unavailable", () => {
+  it("still allows the ordinary later write", () => {
+    mod.writeStarStage("later");
+    expect(localStorage.getItem(mod.STAR_PROMPT_KEY)).toBe("later");
+  });
+});
+
+describe("when storage is unusable", () => {
+  it("stays silent when a read is refused", () => {
     // A spent ask that can't be recorded would mean asking on every launch.
     vi.spyOn(localStorage, "getItem").mockImplementation(() => {
       throw new Error("denied");
     });
-    expect(readStarStage()).toBe("done");
+    expect(mod.readStarStage()).toBe("done");
   });
 
-  it("does not throw when a write is refused", () => {
-    vi.spyOn(localStorage, "setItem").mockImplementation(() => {
+  it("stays silent for the rest of the session after a write is refused", () => {
+    const setItem = vi.spyOn(localStorage, "setItem").mockImplementation(() => {
       throw new Error("quota");
     });
-    expect(() => writeStarStage("done")).not.toThrow();
+
+    expect(() => mod.writeStarStage("done")).not.toThrow();
+
+    // The write is what would have recorded the ask as spent. Since it did not
+    // land, reading must not hand back a fresh ask to show again.
+    setItem.mockRestore();
+    expect(mod.readStarStage()).toBe("done");
+  });
+
+  it("does not write again once storage has failed", () => {
+    const setItem = vi.spyOn(localStorage, "setItem").mockImplementationOnce(() => {
+      throw new Error("quota");
+    });
+    mod.writeStarStage("later");
+
+    setItem.mockClear();
+    mod.writeStarStage("done");
+    expect(setItem).not.toHaveBeenCalled();
   });
 });

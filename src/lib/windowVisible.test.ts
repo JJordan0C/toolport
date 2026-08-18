@@ -9,8 +9,11 @@ vi.mock("@/lib/api", () => ({
 
 /** Handlers registered for the Rust show/hide event, so a test can fire it. */
 let handlers: Array<(e: { payload: boolean }) => void> = [];
+/** Set by a test to simulate running outside the desktop shell entirely. */
+let listenFails = false;
 vi.mock("@tauri-apps/api/event", () => ({
   listen: (_name: string, handler: (e: { payload: boolean }) => void) => {
+    if (listenFails) return Promise.reject(new Error("no tauri"));
     handlers.push(handler);
     return Promise.resolve(() => {
       handlers = handlers.filter((h) => h !== handler);
@@ -33,6 +36,7 @@ function setDocumentHidden(hidden: boolean) {
 
 beforeEach(() => {
   handlers = [];
+  listenFails = false;
   mainWindowVisible.mockReset();
   mainWindowVisible.mockResolvedValue(true);
   setDocumentHidden(false);
@@ -81,6 +85,40 @@ describe("useWindowVisible", () => {
 
     setDocumentHidden(false);
     expect(result.current).toBe(true);
+  });
+
+  it("does not let a slow seed overwrite a newer event", async () => {
+    // The seed is a snapshot of when the effect ran. If the window is hidden
+    // between then and the answer, the event is the truth and must win.
+    let resolveSeed: (v: boolean) => void = () => {};
+    mainWindowVisible.mockReturnValue(
+      new Promise<boolean>((r) => {
+        resolveSeed = r;
+      }),
+    );
+    const { result } = renderHook(() => useWindowVisible());
+    await waitFor(() => expect(handlers).toHaveLength(1));
+
+    emitVisible(false);
+    expect(result.current).toBe(false);
+
+    await act(async () => {
+      resolveSeed(true); // stale: taken before the window was hidden
+    });
+    expect(result.current).toBe(false);
+  });
+
+  it("survives a listener that never registers", async () => {
+    // Outside the desktop shell there is no native event stream at all. The
+    // hook must fall back to the webview signal instead of throwing.
+    listenFails = true;
+    const { result, unmount } = renderHook(() => useWindowVisible());
+
+    await waitFor(() => expect(result.current).toBe(true));
+    setDocumentHidden(true);
+    expect(result.current).toBe(false);
+
+    expect(() => unmount()).not.toThrow();
   });
 
   it("falls back to the webview when there is no desktop shell", async () => {

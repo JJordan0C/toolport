@@ -27,24 +27,32 @@ export function useWindowVisible(): boolean {
   useEffect(() => {
     let cancelled = false;
     let shown = false;
+    // A live show/hide event always beats the seed. The seed is a snapshot of
+    // the moment the effect ran, so once an event has spoken, a seed resolving
+    // afterwards is stale and would put the hook back on the wrong answer.
+    let eventArrived = false;
     const apply = () => {
       if (!cancelled) setVisible(shown && !document.hidden);
     };
+    const seed = (v: boolean) => {
+      if (eventArrived) return;
+      shown = v;
+      apply();
+    };
 
     void mainWindowVisible()
-      .then((v) => {
-        shown = v;
-        apply();
-      })
-      .catch(() => {
-        // Not the desktop app (a browser, a test): trust the webview alone.
-        shown = true;
-        apply();
-      });
+      .then(seed)
+      // Not the desktop app (a browser, a test): trust the webview alone.
+      .catch(() => seed(true));
 
     const unlisten = listen<boolean>("team-window-visible", (e) => {
+      eventArrived = true;
       shown = e.payload;
       apply();
+    }).catch(() => {
+      // No native event stream, so there is nothing to unsubscribe. The webview
+      // signal still applies, and the seed above has already had its say.
+      return () => {};
     });
     document.addEventListener("visibilitychange", apply);
 
