@@ -19,7 +19,18 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn().mockResolvedValue(vi.fn()),
 }));
 
+const { openExternal } = vi.hoisted(() => ({ openExternal: vi.fn() }));
+vi.mock("@/lib/openUrl", () => ({ openExternal }));
+
 import { TeamsView } from "./TeamsView";
+import { TEAMS_CREATE_URL, TEAMS_PRICING_URL, TEAMS_SELFHOST_URL } from "@/lib/teamUrl";
+import {
+  TEAMS_BASE_PRICE,
+  TEAMS_FREE_LINE,
+  TEAMS_FREE_SEATS,
+  TEAMS_PAID_LINE,
+  TEAMS_SEAT_PRICE,
+} from "@/lib/teamsPlan";
 
 const registry: Registry = {
   version: 1,
@@ -33,6 +44,9 @@ const registry: Registry = {
     lastVersion: 6,
   },
 };
+
+/** The same registry with no team on it, which is what every free user sees. */
+const noTeam: Registry = { ...registry, team: null };
 
 describe("TeamsView shared-server update", () => {
   beforeEach(() => {
@@ -135,5 +149,116 @@ describe("TeamsView shared-server update", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Update shared servers" }));
     await waitFor(() => expect(api.teamPushPreview).toHaveBeenCalledTimes(2));
+  });
+});
+
+/** The disconnected Teams tab is the only sales page Toolport Teams gets in front of a
+ * free user, and it is also the join form for someone who already has a code. These
+ * tests hold both halves: the pitch has to be there, and it must not have pushed the
+ * form down or broken it. */
+describe("TeamsView disconnected pitch", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    openExternal.mockClear();
+  });
+
+  it("keeps the connect form ahead of the pitch in the DOM", () => {
+    render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
+
+    const form = screen.getByRole("heading", { name: "Have an invite or connect code?" });
+    const pitch = screen.getByRole("heading", { name: "No team yet?" });
+
+    // Someone who came here holding a code is the conversion this page already has. If
+    // the pitch ever lands first in the DOM it also lands first on a narrow window,
+    // where the lanes stack, and that person has to scroll past an ad to paste a code.
+    expect(form.compareDocumentPosition(pitch)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  });
+
+  it("still connects with a pasted invite code", async () => {
+    const onRegistryChange = vi.fn();
+    api.teamConnect.mockResolvedValue({ status: "connected", registry: noTeam });
+
+    render(<TeamsView registry={noTeam} onRegistryChange={onRegistryChange} />);
+    await userEvent.type(
+      screen.getByPlaceholderText("Paste your invite or connect code"),
+      "invite-abc",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    await waitFor(() =>
+      expect(api.teamConnect).toHaveBeenCalledWith(
+        "https://teams.toolport.app",
+        "invite-abc",
+        undefined,
+      ),
+    );
+    expect(onRegistryChange).toHaveBeenCalledWith(noTeam);
+  });
+
+  it("offers a way to start a team, which the desktop app cannot do itself", async () => {
+    render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole("button", { name: /Create a free team/ }));
+
+    // The hosted app reads both of these: `intent` restores team creation after the
+    // sign-in round trip, `from` attributes the app tab separately from the marketing
+    // funnel. Dropping either silently degrades to the generic manage view.
+    expect(openExternal).toHaveBeenCalledWith(TEAMS_CREATE_URL);
+    expect(TEAMS_CREATE_URL).toContain("intent=create-team");
+    expect(TEAMS_CREATE_URL).toContain("from=app-teams-tab");
+  });
+
+  it("states the free tier and what the paid tier actually buys", () => {
+    render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
+
+    expect(screen.getByText(TEAMS_FREE_LINE)).toBeInTheDocument();
+    expect(screen.getByText(TEAMS_PAID_LINE)).toBeInTheDocument();
+    // Team costs the same at the free seat count as Free does; the difference is
+    // governance. Quoting a per-person price on its own would read as a seat paywall.
+    expect(TEAMS_PAID_LINE).toMatch(/access control/i);
+    expect(TEAMS_FREE_LINE).toContain(String(TEAMS_FREE_SEATS));
+  });
+
+  it("keeps self-hosting a first-class option, not a footnote", async () => {
+    render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
+
+    expect(screen.getByText(/self-hosted on your own network/i)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Self-host it/ }));
+    expect(openExternal).toHaveBeenCalledWith(TEAMS_SELFHOST_URL);
+  });
+
+  it("links out for the authoritative price", async () => {
+    render(<TeamsView registry={noTeam} onRegistryChange={vi.fn()} />);
+
+    await userEvent.click(screen.getByRole("button", { name: /Pricing/ }));
+    expect(openExternal).toHaveBeenCalledWith(TEAMS_PRICING_URL);
+  });
+
+  it("shows none of the pitch once a team is connected", () => {
+    render(<TeamsView registry={registry} onRegistryChange={vi.fn()} />);
+
+    // The ask happens once, on a tab the person chose to open, and stops the moment it
+    // has been answered. A member should never see marketing for the thing they joined.
+    expect(screen.queryByRole("heading", { name: "No team yet?" })).toBeNull();
+    expect(screen.queryByText(TEAMS_FREE_LINE)).toBeNull();
+    expect(screen.queryByText(TEAMS_PAID_LINE)).toBeNull();
+  });
+});
+
+/** The app quotes a price in exactly one place. This is the guard that the copy and the
+ * numbers behind it cannot drift apart inside the app; toolport.app/teams#pricing stays
+ * the authority for whether the numbers themselves are still right. */
+describe("Teams plan copy", () => {
+  it("builds its copy from the shared numbers", () => {
+    expect(TEAMS_PAID_LINE).toContain(`$${TEAMS_BASE_PRICE}/month`);
+    expect(TEAMS_PAID_LINE).toContain(`$${TEAMS_SEAT_PRICE} per person`);
+    expect(TEAMS_PAID_LINE).toContain(`up to ${TEAMS_FREE_SEATS}`);
+    expect(TEAMS_PAID_LINE).toMatch(/same price hosted or self-hosted/i);
+  });
+
+  it("uses no em dashes or en dashes", () => {
+    for (const line of [TEAMS_FREE_LINE, TEAMS_PAID_LINE]) {
+      expect(line).not.toMatch(/[—–]/);
+    }
   });
 });

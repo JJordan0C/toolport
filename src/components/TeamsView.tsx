@@ -8,6 +8,8 @@ import {
   Server,
   AlertTriangle,
   FileText,
+  ArrowUpRight,
+  Check,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { Badge } from "@/components/ui/badge";
@@ -27,7 +29,16 @@ import {
   teamInstructionsStatus,
   setServerEnabled,
 } from "@/lib/api";
-import { HOSTED_TEAMS_URL, teamUrlError } from "@/lib/teamUrl";
+import {
+  HOSTED_TEAMS_URL,
+  TEAMS_CREATE_URL,
+  TEAMS_MARKETING_URL,
+  TEAMS_PRICING_URL,
+  TEAMS_SELFHOST_URL,
+  teamUrlError,
+} from "@/lib/teamUrl";
+import { TEAMS_FREE_LINE, TEAMS_PAID_LINE, TEAMS_TRIAL_DAYS } from "@/lib/teamsPlan";
+import { openExternal } from "@/lib/openUrl";
 import { isEnabled, activeProfile } from "@/lib/types";
 import type { TeamPushPreview } from "@/lib/api";
 import type { Registry, InstructionsStatusView } from "@/lib/types";
@@ -290,7 +301,10 @@ export function TeamsView({
   };
 
   return (
-    <div className="mx-auto max-w-2xl">
+    // The connected view is a single column of cards and stays narrow. The
+    // disconnected one runs two lanes side by side, which needs the extra width to
+    // keep the connect form's fields from turning into a column of stubs.
+    <div className={team ? "mx-auto max-w-2xl" : "mx-auto max-w-4xl"}>
       <div className="mb-5 flex items-center gap-2">
         <Users className="size-5 text-muted-foreground" />
         <h2 className="text-base font-semibold">Toolport Teams</h2>
@@ -313,28 +327,166 @@ export function TeamsView({
       )}
 
       {!team ? (
-        <div className="rounded-xl border bg-card p-5">
-          <h3 className="text-sm font-medium">Connect to a team</h3>
-          <p className="mt-1 mb-4 max-w-prose text-sm text-muted-foreground">
-            Join your team's Toolport Teams server and its shared MCP servers appear in
-            your active profile, kept in sync as your admin updates them.
-          </p>
-          <div className="mb-5 grid gap-2.5 sm:grid-cols-3">
+        <div className="grid gap-4">
+          <div>
+            <h3 className="text-sm font-medium">
+              Everyone gets the same MCP servers. Nobody shares a key.
+            </h3>
+            <p className="mt-1 max-w-prose text-sm text-muted-foreground">
+              A Toolport Teams server holds the shared server list and its config. Each
+              person still vaults their own credentials on their own machine.
+            </p>
+          </div>
+
+          {/* Two lanes, and the order matters. Someone who opened this tab holding an
+              invite code is the one conversion this page already has, so the form is
+              first in the DOM and first on screen at every width; the pitch sits beside
+              it, never above it. Below `lg` the lanes stack and the form stays first. */}
+          <div className="grid gap-4 lg:grid-cols-5 lg:items-start">
+            <div className="rounded-xl border bg-card p-5 lg:col-span-3">
+              <h3 className="text-sm font-medium">Have an invite or connect code?</h3>
+              <p className="mt-1 mb-4 text-sm text-muted-foreground">
+                Paste it here and the team's shared servers appear in your active profile,
+                kept in sync as your admin updates them.
+              </p>
+              <div className="grid gap-3">
+                <label className="grid gap-1 text-sm">
+                  <span className="text-muted-foreground">Team server URL</span>
+                  <Input
+                    placeholder="https://toolport.yourcompany.com"
+                    value={serverUrl}
+                    onChange={(e) => setServerUrl(e.target.value)}
+                  />
+                  <span className="text-xs text-muted-foreground">
+                    Defaults to hosted Toolport Teams. Self-hosting? Replace it with your
+                    own server URL.
+                  </span>
+                </label>
+                <label className="grid gap-1 text-sm">
+                  <span className="text-muted-foreground">Invite or connect code</span>
+                  <Input
+                    placeholder="Paste your invite or connect code"
+                    value={inviteCode}
+                    onChange={(e) => setInviteCode(e.target.value)}
+                  />
+                  <span className="text-xs text-muted-foreground">
+                    An invite code joins you to a team. A connect code links this device
+                    to a seat you already have.
+                  </span>
+                </label>
+                <label className="grid gap-1 text-sm">
+                  <span className="text-muted-foreground">Your name (optional)</span>
+                  <Input
+                    placeholder="e.g. Tyler"
+                    value={memberName}
+                    onChange={(e) => setMemberName(e.target.value)}
+                  />
+                </label>
+                <div>
+                  {pending ? (
+                    <div className="flex items-center gap-3 rounded-lg border border-primary/40 bg-primary/5 p-3 text-sm">
+                      <RefreshCw className="size-4 shrink-0 animate-spin text-primary" />
+                      <span className="text-muted-foreground">
+                        Waiting for an admin to approve your request. Leave this open, it
+                        finishes on its own once they approve.
+                      </span>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="ml-auto shrink-0"
+                        onClick={() => {
+                          setPending(null);
+                          setNotice(null);
+                        }}
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  ) : (
+                    <Button onClick={onConnect} disabled={busy !== null}>
+                      {busy === "connect" ? "Connecting…" : "Connect"}
+                    </Button>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-primary/25 bg-primary/[0.04] p-5 lg:col-span-2">
+              <h3 className="text-sm font-medium">No team yet?</h3>
+              <p className="mt-1 mb-3 text-sm text-muted-foreground">
+                Pick the MCP servers once and everyone's Claude, Cursor, and other agents
+                get the same stack.
+              </p>
+              <ul className="mb-3 grid gap-2">
+                {[
+                  TEAMS_FREE_LINE,
+                  "Hosted by us or self-hosted on your own network, same features either way.",
+                  "Keys never reach the server, so there is no shared secret to rotate.",
+                ].map((point) => (
+                  <li
+                    key={point}
+                    className="flex gap-2 text-2xs leading-relaxed text-muted-foreground"
+                  >
+                    <Check className="mt-0.5 size-3.5 shrink-0 text-primary" />
+                    <span>{point}</span>
+                  </li>
+                ))}
+              </ul>
+              <p className="mb-4 text-2xs leading-relaxed text-muted-foreground">
+                {TEAMS_PAID_LINE}
+              </p>
+              {/* The desktop app has no create-a-team flow, so this hands off to the
+                  hosted app rather than pretending to start one here. */}
+              <Button className="w-full" onClick={() => openExternal(TEAMS_CREATE_URL)}>
+                Create a free team
+                <ArrowUpRight className="size-4" />
+              </Button>
+              <p className="mt-2 text-2xs text-muted-foreground">
+                Opens in your browser. Google, GitHub, or an email link, no card. Team
+                features are free to try for {TEAMS_TRIAL_DAYS} days.
+              </p>
+              <div className="mt-4 flex flex-wrap gap-x-4 gap-y-1 border-t pt-3 text-2xs">
+                <button
+                  type="button"
+                  onClick={() => openExternal(TEAMS_MARKETING_URL)}
+                  className="text-muted-foreground transition hover:text-foreground"
+                >
+                  How it works →
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openExternal(TEAMS_PRICING_URL)}
+                  className="text-muted-foreground transition hover:text-foreground"
+                >
+                  Pricing →
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openExternal(TEAMS_SELFHOST_URL)}
+                  className="text-muted-foreground transition hover:text-foreground"
+                >
+                  Self-host it →
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid gap-2.5 sm:grid-cols-3">
             {[
               {
                 icon: Server,
-                title: "Shared server set",
-                body: "Your admin curates the MCP servers; they show up in your profile.",
-              },
-              {
-                icon: ShieldCheck,
-                title: "Keys stay local",
-                body: "The team holds config only, never a secret. You vault keys on your machine.",
+                title: "New teammate, day one",
+                body: "Send one code instead of walking someone through every server by hand. Their agents come up already configured.",
               },
               {
                 icon: RefreshCw,
-                title: "Always in sync",
-                body: "One source of truth; updates arrive when you Sync.",
+                title: "No more config drift",
+                body: "Six people, six slightly different server lists, and a bug only one of them can reproduce. One shared set ends that.",
+              },
+              {
+                icon: ShieldCheck,
+                title: "No shared secrets",
+                body: "The team server stores config, never a credential. Every key stays in its owner's OS keychain.",
               },
             ].map(({ icon: Icon, title, body }) => (
               <div
@@ -350,66 +502,6 @@ export function TeamsView({
                 </p>
               </div>
             ))}
-          </div>
-          <div className="grid gap-3">
-            <label className="grid gap-1 text-sm">
-              <span className="text-muted-foreground">Team server URL</span>
-              <Input
-                placeholder="https://toolport.yourcompany.com"
-                value={serverUrl}
-                onChange={(e) => setServerUrl(e.target.value)}
-              />
-              <span className="text-xs text-muted-foreground">
-                Defaults to hosted Toolport Teams. Self-hosting? Replace it with your own
-                server URL.
-              </span>
-            </label>
-            <label className="grid gap-1 text-sm">
-              <span className="text-muted-foreground">Invite or connect code</span>
-              <Input
-                placeholder="Paste your invite or connect code"
-                value={inviteCode}
-                onChange={(e) => setInviteCode(e.target.value)}
-              />
-              <span className="text-xs text-muted-foreground">
-                An invite code joins you to a team. A connect code links this device to a
-                seat you already have.
-              </span>
-            </label>
-            <label className="grid gap-1 text-sm">
-              <span className="text-muted-foreground">Your name (optional)</span>
-              <Input
-                placeholder="e.g. Tyler"
-                value={memberName}
-                onChange={(e) => setMemberName(e.target.value)}
-              />
-            </label>
-            <div>
-              {pending ? (
-                <div className="flex items-center gap-3 rounded-lg border border-primary/40 bg-primary/5 p-3 text-sm">
-                  <RefreshCw className="size-4 shrink-0 animate-spin text-primary" />
-                  <span className="text-muted-foreground">
-                    Waiting for an admin to approve your request. Leave this open, it
-                    finishes on its own once they approve.
-                  </span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="ml-auto shrink-0"
-                    onClick={() => {
-                      setPending(null);
-                      setNotice(null);
-                    }}
-                  >
-                    Cancel
-                  </Button>
-                </div>
-              ) : (
-                <Button onClick={onConnect} disabled={busy !== null}>
-                  {busy === "connect" ? "Connecting…" : "Connect"}
-                </Button>
-              )}
-            </div>
           </div>
         </div>
       ) : (
