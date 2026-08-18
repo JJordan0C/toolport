@@ -54,6 +54,12 @@ export function GitHubStarPrompt({
   const [dismissed, setDismissed] = useState(false);
   const [cardReady, setCardReady] = useState(false);
   const [returningReady, setReturningReady] = useState(false);
+  // The most servers that have been enabled at once this session. The count is
+  // a gate for reaching the ask, not a condition to keep meeting: without the
+  // high-water mark, toggling a server off and back on retracts a prompt and
+  // then shows it again, which is flicker for an ask that is already spent.
+  const [peakEnabled, setPeakEnabled] = useState(enabledCount);
+  if (enabledCount > peakEnabled) setPeakEnabled(enabledCount);
   // Nothing is shown, and so nothing is spent, while the app sits in the tray.
   // The gateway can enable servers from there, which would otherwise let the
   // chip appear and burn its one showing with no window on screen.
@@ -66,9 +72,9 @@ export function GitHubStarPrompt({
         ? "card"
         : stage === "returning" &&
             returningReady &&
-            enabledCount >= RETURNING_MIN_ENABLED_SERVERS
+            peakEnabled >= RETURNING_MIN_ENABLED_SERVERS
           ? "returning"
-          : stage === "later" && enabledCount >= CHIP_MIN_ENABLED_SERVERS
+          : stage === "later" && peakEnabled >= CHIP_MIN_ENABLED_SERVERS
             ? "chip"
             : null;
 

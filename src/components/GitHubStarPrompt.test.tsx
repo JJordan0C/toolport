@@ -208,6 +208,77 @@ describe("an ask is spent when it is shown", () => {
   });
 });
 
+describe("a server toggled off and back on", () => {
+  it("does not make the chip flicker away and return", async () => {
+    // The count is a gate for reaching the ask, not a condition to keep
+    // meeting. The ask is already spent, so a second showing is pure flicker.
+    localStorage.setItem(STAR_PROMPT_KEY, "later");
+    const { rerender } = render(
+      <GitHubStarPrompt justOnboarded={false} enabledCount={3} />,
+    );
+    expect(chip()).not.toBeNull();
+
+    rerender(<GitHubStarPrompt justOnboarded={false} enabledCount={2} />);
+    expect(chip()).not.toBeNull();
+
+    rerender(<GitHubStarPrompt justOnboarded={false} enabledCount={3} />);
+    expect(chip()).not.toBeNull();
+  });
+
+  it("does not make the existing-user card flicker either", async () => {
+    existingInstall();
+    const { rerender } = render(
+      <GitHubStarPrompt justOnboarded={false} enabledCount={1} />,
+    );
+    await flushDelays();
+    expect(returningCard()).not.toBeNull();
+
+    rerender(<GitHubStarPrompt justOnboarded={false} enabledCount={0} />);
+    expect(returningCard()).not.toBeNull();
+  });
+
+  it("still waits for the threshold the first time", () => {
+    localStorage.setItem(STAR_PROMPT_KEY, "later");
+    const { rerender } = render(
+      <GitHubStarPrompt justOnboarded={false} enabledCount={2} />,
+    );
+    expect(chip()).toBeNull();
+    // A dip before the threshold was ever met must not bank a high-water mark
+    // the user never actually reached.
+    rerender(<GitHubStarPrompt justOnboarded={false} enabledCount={1} />);
+    expect(chip()).toBeNull();
+  });
+
+  it("reports one surface change, not a flicker, to the toast offset", () => {
+    const onVisibleChange = vi.fn();
+    localStorage.setItem(STAR_PROMPT_KEY, "later");
+    const { rerender } = render(
+      <GitHubStarPrompt
+        justOnboarded={false}
+        enabledCount={4}
+        onVisibleChange={onVisibleChange}
+      />,
+    );
+    onVisibleChange.mockClear();
+
+    rerender(
+      <GitHubStarPrompt
+        justOnboarded={false}
+        enabledCount={1}
+        onVisibleChange={onVisibleChange}
+      />,
+    );
+    rerender(
+      <GitHubStarPrompt
+        justOnboarded={false}
+        enabledCount={4}
+        onVisibleChange={onVisibleChange}
+      />,
+    );
+    expect(onVisibleChange).not.toHaveBeenCalled();
+  });
+});
+
 describe("while the app sits in the tray", () => {
   it("shows nothing and spends nothing", async () => {
     windowVisible = false;
