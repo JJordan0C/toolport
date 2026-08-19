@@ -19,6 +19,7 @@ import { Callout } from "@/components/Callout";
 import { RuleStateBadge } from "@/components/RuleStateBadge";
 import { TransportPill } from "@/components/TransportPill";
 import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   teamConnect,
   teamJoinPoll,
@@ -300,6 +301,27 @@ export function TeamsView({
     );
   };
 
+  // `registry` is null until the first `getRegistry()` resolves, and stays null for the
+  // rest of the session if that call fails. `registry?.team ?? null` folds that state into
+  // "no team", which would show a member of a team the sales pitch for the team they are
+  // already in — the one audience this page must never pitch to. Nothing below can tell
+  // the two apart, so answer the question here: not loaded yet is neither state.
+  if (registry === null) {
+    return (
+      <div className="mx-auto max-w-2xl">
+        <div className="mb-5 flex items-center gap-2">
+          <Users className="size-5 text-muted-foreground" />
+          <h2 className="text-base font-semibold">Toolport Teams</h2>
+        </div>
+        <div className="flex flex-col gap-2" aria-label="Loading Toolport Teams">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <Skeleton key={i} className="h-14 w-full rounded-lg" />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   return (
     // The connected view is a single column of cards and stays narrow. The
     // disconnected one runs two lanes side by side, which needs the extra width to
@@ -343,7 +365,9 @@ export function TeamsView({
               first in the DOM and first on screen at every width; the pitch sits beside
               it, never above it. Below `lg` the lanes stack and the form stays first. */}
           <div className="grid gap-4 lg:grid-cols-5 lg:items-start">
-            <div className="rounded-xl border bg-card p-5 lg:col-span-3">
+            <div
+              className={`rounded-xl border bg-card p-5 ${pending ? "lg:col-span-5" : "lg:col-span-3"}`}
+            >
               <h3 className="text-sm font-medium">Have an invite or connect code?</h3>
               <p className="mt-1 mb-4 text-sm text-muted-foreground">
                 Paste it here and the team's shared servers appear in your active profile,
@@ -411,98 +435,108 @@ export function TeamsView({
               </div>
             </div>
 
-            <div className="rounded-xl border border-primary/25 bg-primary/[0.04] p-5 lg:col-span-2">
-              <h3 className="text-sm font-medium">No team yet?</h3>
-              <p className="mt-1 mb-3 text-sm text-muted-foreground">
-                Pick the MCP servers once and everyone's Claude, Cursor, and other agents
-                get the same stack.
-              </p>
-              <ul className="mb-3 grid gap-2">
-                {[
-                  TEAMS_FREE_LINE,
-                  "Hosted by us or self-hosted on your own network, same features either way.",
-                  "Keys never reach the server, so there is no shared secret to rotate.",
-                ].map((point) => (
-                  <li
-                    key={point}
-                    className="flex gap-2 text-2xs leading-relaxed text-muted-foreground"
-                  >
-                    <Check className="mt-0.5 size-3.5 shrink-0 text-primary" />
-                    <span>{point}</span>
-                  </li>
-                ))}
-              </ul>
-              <p className="mb-4 text-2xs leading-relaxed text-muted-foreground">
-                {TEAMS_PAID_LINE}
-              </p>
-              {/* The desktop app has no create-a-team flow, so this hands off to the
+            {/* Someone waiting on an admin has already picked a team, so the ask is
+                answered: no "No team yet?", no prices, no second team to create beside
+                the one they are joining. The lane is dropped rather than dimmed, and the
+                form takes the full width while the wait lasts. */}
+            {!pending && (
+              <div className="rounded-xl border border-primary/25 bg-primary/[0.04] p-5 lg:col-span-2">
+                <h3 className="text-sm font-medium">No team yet?</h3>
+                <p className="mt-1 mb-3 text-sm text-muted-foreground">
+                  Pick the MCP servers once and everyone's Claude, Cursor, and other
+                  agents get the same stack.
+                </p>
+                <ul className="mb-3 grid gap-2">
+                  {[
+                    TEAMS_FREE_LINE,
+                    "Hosted by us or self-hosted on your own network, same features either way.",
+                    "Keys never reach the server, so there is no shared secret to rotate.",
+                  ].map((point) => (
+                    <li
+                      key={point}
+                      className="flex gap-2 text-2xs leading-relaxed text-muted-foreground"
+                    >
+                      <Check className="mt-0.5 size-3.5 shrink-0 text-primary" />
+                      <span>{point}</span>
+                    </li>
+                  ))}
+                </ul>
+                <p className="mb-4 text-2xs leading-relaxed text-muted-foreground">
+                  {TEAMS_PAID_LINE}
+                </p>
+                {/* The desktop app has no create-a-team flow, so this hands off to the
                   hosted app rather than pretending to start one here. */}
-              <Button className="w-full" onClick={() => openExternal(TEAMS_CREATE_URL)}>
-                Create a free team
-                <ArrowUpRight className="size-4" />
-              </Button>
-              <p className="mt-2 text-2xs text-muted-foreground">
-                Opens in your browser. Google, GitHub, or an email link, no card. Team
-                features are free to try for {TEAMS_TRIAL_DAYS} days.
-              </p>
-              <div className="mt-4 flex flex-wrap gap-x-4 gap-y-1 border-t pt-3 text-2xs">
-                <button
-                  type="button"
-                  onClick={() => openExternal(TEAMS_MARKETING_URL)}
-                  className="text-muted-foreground transition hover:text-foreground"
-                >
-                  How it works →
-                </button>
-                <button
-                  type="button"
-                  onClick={() => openExternal(TEAMS_PRICING_URL)}
-                  className="text-muted-foreground transition hover:text-foreground"
-                >
-                  Pricing →
-                </button>
-                <button
-                  type="button"
-                  onClick={() => openExternal(TEAMS_SELFHOST_URL)}
-                  className="text-muted-foreground transition hover:text-foreground"
-                >
-                  Self-host it →
-                </button>
+                <Button className="w-full" onClick={() => openExternal(TEAMS_CREATE_URL)}>
+                  Create a free team
+                  <ArrowUpRight className="size-4" />
+                </Button>
+                <p className="mt-2 text-2xs text-muted-foreground">
+                  Opens in your browser. Google, GitHub, or an email link, no card. Team
+                  features are free to try for {TEAMS_TRIAL_DAYS} days.
+                </p>
+                <div className="mt-4 flex flex-wrap gap-x-4 gap-y-1 border-t pt-3 text-2xs">
+                  <button
+                    type="button"
+                    onClick={() => openExternal(TEAMS_MARKETING_URL)}
+                    className="text-muted-foreground transition hover:text-foreground"
+                  >
+                    How it works →
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openExternal(TEAMS_PRICING_URL)}
+                    className="text-muted-foreground transition hover:text-foreground"
+                  >
+                    Pricing →
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openExternal(TEAMS_SELFHOST_URL)}
+                    className="text-muted-foreground transition hover:text-foreground"
+                  >
+                    Self-host it →
+                  </button>
+                </div>
               </div>
-            </div>
+            )}
           </div>
 
-          <div className="grid gap-2.5 sm:grid-cols-3">
-            {[
-              {
-                icon: Server,
-                title: "New teammate, day one",
-                body: "Send one code instead of walking someone through every server by hand. Their agents come up already configured.",
-              },
-              {
-                icon: RefreshCw,
-                title: "No more config drift",
-                body: "Six people, six slightly different server lists, and a bug only one of them can reproduce. One shared set ends that.",
-              },
-              {
-                icon: ShieldCheck,
-                title: "No shared secrets",
-                body: "The team server stores config, never a credential. Every key stays in its owner's OS keychain.",
-              },
-            ].map(({ icon: Icon, title, body }) => (
-              <div
-                key={title}
-                className="rounded-lg border border-border/60 bg-muted/20 p-3"
-              >
-                <div className="flex items-center gap-1.5 text-sm font-medium">
-                  <Icon className="size-3.5 text-primary" />
-                  {title}
+          {/* Same reason as the lane above: these three are the argument for having a
+              team at all, and it is settled once a request is out. */}
+          {!pending && (
+            <div className="grid gap-2.5 sm:grid-cols-3">
+              {[
+                {
+                  icon: Server,
+                  title: "New teammate, day one",
+                  body: "Send one code instead of walking someone through every server by hand. Their agents come up already configured.",
+                },
+                {
+                  icon: RefreshCw,
+                  title: "No more config drift",
+                  body: "Six people, six slightly different server lists, and a bug only one of them can reproduce. One shared set ends that.",
+                },
+                {
+                  icon: ShieldCheck,
+                  title: "No shared secrets",
+                  body: "The team server stores config, never a credential. Every key stays in its owner's OS keychain.",
+                },
+              ].map(({ icon: Icon, title, body }) => (
+                <div
+                  key={title}
+                  className="rounded-lg border border-border/60 bg-muted/20 p-3"
+                >
+                  <div className="flex items-center gap-1.5 text-sm font-medium">
+                    <Icon className="size-3.5 text-primary" />
+                    {title}
+                  </div>
+                  <p className="mt-1 text-2xs leading-relaxed text-muted-foreground">
+                    {body}
+                  </p>
                 </div>
-                <p className="mt-1 text-2xs leading-relaxed text-muted-foreground">
-                  {body}
-                </p>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       ) : (
         <div className="grid gap-4">
