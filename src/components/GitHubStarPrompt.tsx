@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { CircleCheck, Star, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { openExternal } from "@/lib/openUrl";
-import { useWindowVisible } from "@/lib/windowVisible";
+import { modalLayerOpen, useModalOpen, useWindowVisible } from "@/lib/windowVisible";
 import {
   CHIP_MIN_ENABLED_SERVERS,
   RETURNING_MIN_ENABLED_SERVERS,
@@ -60,13 +60,17 @@ export function GitHubStarPrompt({
   // then shows it again, which is flicker for an ask that is already spent.
   const [peakEnabled, setPeakEnabled] = useState(enabledCount);
   if (enabledCount > peakEnabled) setPeakEnabled(enabledCount);
-  // Nothing is shown, and so nothing is spent, while the app sits in the tray.
-  // The gateway can enable servers from there, which would otherwise let the
-  // chip appear and burn its one showing with no window on screen.
+  // Nothing is shown, and so nothing is spent, unless the corner is genuinely
+  // reachable. The app sits in the tray and the gateway can enable servers from
+  // there, which would otherwise let the chip appear and burn its one showing
+  // with no window on screen; a modal dialog is the same problem one layer up,
+  // since it covers the corner, traps focus and aria-hides everything under it.
   const windowVisible = useWindowVisible();
+  const modalOpen = useModalOpen();
+  const reachable = windowVisible && !modalOpen;
 
   const surface: StarSurface =
-    dismissed || !windowVisible
+    dismissed || !reachable
       ? null
       : stage === "card" && justOnboarded && cardReady
         ? "card"
@@ -85,18 +89,40 @@ export function GitHubStarPrompt({
   }, [stage, justOnboarded]);
 
   useEffect(() => {
-    if (stage !== "returning" || !windowVisible) return;
+    if (stage !== "returning" || !reachable) return;
     const timer = setTimeout(() => setReturningReady(true), RETURNING_DELAY_MS);
     return () => clearTimeout(timer);
-  }, [stage, windowVisible]);
+  }, [stage, reachable]);
+
+  // Finishing the wizard is what makes this install definitely a new one, and
+  // that fact is only in storage while the session lasts. The card itself is
+  // delayed and gated on the window, so a launch that hides to the tray in
+  // between would record nothing at all, and the next launch would read an
+  // onboarding flag with no star record and mistake a day-old install for a
+  // months-old one. Booking the chip fallback here costs a new user nothing:
+  // it is the same value the card writes when it appears.
+  useEffect(() => {
+    if (stage === "card" && justOnboarded) writeStarStage("later");
+  }, [stage, justOnboarded]);
 
   // Showing is what spends the ask. Quitting without answering must not earn a
   // second showing of the same surface. The new-user card falls back to the
   // chip; everything else is the last ask this install gets.
+  //
+  // Recorded a beat after the render rather than during it, because "shown" is
+  // a claim about the screen and the screen is not settled yet. A dialog going
+  // up in the same beat raises its overlay through a portal, which React mounts
+  // on a later commit, so a surface can render into a corner that is about to
+  // be covered. Letting the DOM settle and re-reading it is what stops the one
+  // ask being spent behind a blurred overlay nobody can click through.
   useEffect(() => {
-    if (!surface) return;
-    writeStarStage(surface === "card" ? "later" : "done");
-  }, [surface]);
+    if (!surface || modalOpen) return;
+    const spend = setTimeout(() => {
+      if (modalLayerOpen()) return;
+      writeStarStage(surface === "card" ? "later" : "done");
+    });
+    return () => clearTimeout(spend);
+  }, [surface, modalOpen]);
 
   useEffect(() => {
     onVisibleChange?.(surface);

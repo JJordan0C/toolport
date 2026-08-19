@@ -84,6 +84,39 @@ describe("when storage is unusable", () => {
     expect(mod.readStarStage()).toBe("done");
   });
 
+  it("stays silent across a relaunch while writes keep failing", async () => {
+    // The module latch only lasts a session. A store that serves reads but
+    // refuses writes — quota exceeded, a locked webview store — would otherwise
+    // derive a fresh ask on every launch and show the card forever.
+    vi.spyOn(localStorage, "setItem").mockImplementation(() => {
+      throw new Error("quota");
+    });
+    expect(mod.readStarStage()).toBe("done");
+
+    vi.resetModules();
+    const relaunched = await import("./starPrompt");
+    expect(relaunched.readStarStage()).toBe("done");
+  });
+
+  it("gives the ask back once writes work again", async () => {
+    // A quota that was freed between launches is a working store, and pretending
+    // otherwise would silently retire the prompt on a healthy install.
+    const setItem = vi.spyOn(localStorage, "setItem").mockImplementation(() => {
+      throw new Error("quota");
+    });
+    expect(mod.readStarStage()).toBe("done");
+
+    setItem.mockRestore();
+    vi.resetModules();
+    const relaunched = await import("./starPrompt");
+    expect(relaunched.readStarStage()).toBe("card");
+  });
+
+  it("leaves nothing behind after probing the write path", () => {
+    expect(mod.readStarStage()).toBe("card");
+    expect(localStorage.length).toBe(0);
+  });
+
   it("does not write again once storage has failed", () => {
     const setItem = vi.spyOn(localStorage, "setItem").mockImplementationOnce(() => {
       throw new Error("quota");

@@ -19,6 +19,10 @@
 export const STAR_PROMPT_KEY = "toolport.starPrompt";
 export const STAR_REPO_URL = "https://github.com/tsouth89/toolport";
 
+/** Written and deleted at read time to find out whether a spent ask could be
+ *  recorded at all. Never read back, so a leftover from a crash is harmless. */
+const STORAGE_PROBE_KEY = "toolport.starPrompt.probe";
+
 /** Enabled servers before the chip is allowed to appear. The point is to ask
  *  someone who got value out of the app, not someone who just installed it. */
 export const CHIP_MIN_ENABLED_SERVERS = 3;
@@ -57,6 +61,28 @@ function readRaw(key: string): string | null {
   }
 }
 
+/**
+ * Whether a spent ask could actually be recorded.
+ *
+ * The invariant this prompt promises is "an ask that cannot be recorded is
+ * treated as already spent". A latch in module state cannot keep that promise,
+ * because a quota-exceeded or blocked store fails writes while still serving
+ * reads: the stage would be derived from scratch on every relaunch and the card
+ * would come back forever. So the write path is probed, not remembered, and the
+ * probe re-runs on each launch. Storage that recovers gets its ask back, which
+ * is the honest reading of a store that works again.
+ */
+function canRecord(): boolean {
+  try {
+    localStorage.setItem(STORAGE_PROBE_KEY, "1");
+    localStorage.removeItem(STORAGE_PROBE_KEY);
+    return true;
+  } catch {
+    storageBroken = true;
+    return false;
+  }
+}
+
 function onboardedAlready(): boolean {
   return (
     readRaw("toolport.onboarded") === "1" ||
@@ -68,12 +94,14 @@ function onboardedAlready(): boolean {
 /** Resolve the stage to start this session at. */
 export function readStarStage(): StarStage {
   const raw = readRaw(STAR_PROMPT_KEY);
-  if (storageBroken) return "done";
-  if (raw === "done" || raw === "later") return raw;
+  if (storageBroken || raw === "done") return "done";
+  // Every remaining stage can still put something on screen, and showing it is
+  // what spends it. Refuse to show what cannot be written down afterwards.
+  if (!canRecord()) return "done";
+  if (raw === "later") return "later";
   // No record at all. An install that has already onboarded predates this
   // prompt, so it gets the single existing-user card rather than nothing.
-  const stage = onboardedAlready() ? "returning" : "card";
-  return storageBroken ? "done" : stage;
+  return onboardedAlready() ? "returning" : "card";
 }
 
 export function writeStarStage(stage: "later" | "done"): void {
