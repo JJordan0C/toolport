@@ -76,6 +76,39 @@ describe("Onboarding first-run paths (SBS-826)", () => {
     expect(screen.getByRole("heading", { name: "You're set up" })).toBeInTheDocument();
   });
 
+  it("does not send a rules user with no client back to add servers", async () => {
+    const user = userEvent.setup();
+    // No connected client, so the step reports what is still missing. On the rules path
+    // the only missing thing is the client - the MCP wording sent them to add the very
+    // thing they just declined, and said "do both" for a single item (SBS-826 review).
+    render(<Onboarding {...props()} />);
+
+    await user.click(screen.getByRole("button", { name: /Write rules for my agents/ }));
+    await user.click(screen.getByRole("button", { name: /Skip for now/ }));
+
+    expect(screen.getByText(/You haven't connected a client yet/)).toBeInTheDocument();
+    expect(screen.queryByText(/add\s+or import servers/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/do both/)).not.toBeInTheDocument();
+  });
+
+  it("never probes for servers a rules user does not have", async () => {
+    const user = userEvent.setup();
+    const onProbe = vi.fn().mockResolvedValue([]);
+    render(<Onboarding {...props({ clients: [connected], onProbe })} />);
+
+    await user.click(screen.getByRole("button", { name: /Write rules for my agents/ }));
+    await user.click(screen.getByRole("button", { name: /Skip for now/ }));
+
+    // The health check is about servers, and this path has none. The related first-paint
+    // flash of the "Checking server health…" live region is fixed by gating the
+    // verification states on `serverCount`, but it cannot be asserted here: `render`
+    // flushes effects inside `act`, so the pre-effect paint a real user sees never
+    // reaches the DOM this test reads.
+    expect(onProbe).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Checking server health/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Checking your setup" })).toBeNull();
+  });
+
   it("hands a finished rules user to the Rules tab, and marks onboarding done", async () => {
     const user = userEvent.setup();
     const onOpenRules = vi.fn();

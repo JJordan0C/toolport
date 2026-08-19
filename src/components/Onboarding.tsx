@@ -297,7 +297,10 @@ function Welcome({
           want, or leave. Both paths still connect a client, which is what makes either
           feature reach anything. */}
       <div className="grid gap-2">
-        <Button onClick={() => onChoosePath("mcp")} className="justify-start">
+        <Button
+          onClick={() => onChoosePath("mcp")}
+          className="h-auto justify-start py-2 whitespace-normal"
+        >
           <Waypoints className="size-4" />
           <span className="flex flex-col items-start">
             <span>Set up MCP servers</span>
@@ -309,7 +312,7 @@ function Welcome({
         <Button
           variant="outline"
           onClick={() => onChoosePath("rules")}
-          className="justify-start"
+          className="h-auto justify-start py-2 whitespace-normal"
         >
           <FileText className="size-4" />
           <span className="flex flex-col items-start">
@@ -911,20 +914,26 @@ function Done({
   const configured = rulesPath
     ? connectedCount > 0
     : serverCount > 0 && connectedCount > 0;
+  // The probe is about servers, and the rules path is the only way to be `configured`
+  // with none. Gating the verification states on there being something to verify keeps
+  // a rules finish from painting "Checking your setup" and the "Checking server
+  // health…" status — a live region a screen reader announces — for servers that do
+  // not exist. `health` is null on the first paint even when the effect sets it to []
+  // synchronously, so without this the flash is guaranteed, not a race (SBS-826 review).
+  const verifying = serverCount > 0;
   // Verification states only apply once setup is actually complete: with no client
   // connected the step reports what's missing, and must not dress the finish button
   // or the status blocks in "Checking…" / "couldn't verify" language.
-  const checkingHealth = configured && health === null && !probeFailed;
-  const verificationFailed = configured && probeFailed;
-  const ready = configured && health !== null && !probeFailed;
+  const checkingHealth = configured && verifying && health === null && !probeFailed;
+  const verificationFailed = configured && verifying && probeFailed;
+  const ready = configured && (!verifying || (health !== null && !probeFailed));
   // The client to verify against: the first one Toolport is actually wired into.
   const verifyClient = clients.find((c) => c.gatewayInstalled) ?? null;
-  const missing = [
+  const missingParts = [
     !rulesPath && serverCount === 0 ? "added a server" : null,
     connectedCount === 0 ? "connected a client" : null,
-  ]
-    .filter(Boolean)
-    .join(" or ");
+  ].filter((part): part is string => part !== null);
+  const missing = missingParts.join(" or ");
   return (
     <>
       <StepHeader
@@ -944,7 +953,7 @@ function Done({
             Toolport is wired into {connectedCount} tool
             {connectedCount === 1 ? "" : "s"}. Write your rules once on the next screen
             and Toolport puts them in each tool&apos;s own rules file, so they all follow
-            the same instructions without you editing four files by hand.
+            the same instructions without you editing each tool's file by hand.
           </>
         ) : ready ? (
           <>
@@ -965,10 +974,20 @@ function Done({
             Your servers and client are connected, but Toolport could not verify server
             health. Retry the check below or continue without verification.
           </>
+        ) : rulesPath ? (
+          // The MCP wording below would send a rules user to add the very thing they
+          // just declined, and "do both" is wrong when only one thing is missing
+          // (SBS-826 review).
+          <>
+            You haven't connected a client yet. Connect one any time from the main screen
+            and Toolport writes your rules into that tool's own rules file. No MCP server
+            needed.
+          </>
         ) : (
           <>
-            You haven't {missing} yet. You can do both any time from the main screen: add
-            or import servers, then connect a client so your tools share them.
+            You haven't {missing} yet. You can{" "}
+            {missingParts.length > 1 ? "do both" : "do that"} any time from the main
+            screen: add or import servers, then connect a client so your tools share them.
           </>
         )}
       </StepHeader>
