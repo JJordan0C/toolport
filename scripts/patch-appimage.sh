@@ -201,7 +201,12 @@ fi
 # against the host's wayland (see the header). Searched across the whole AppDir
 # rather than a fixed path, so a linuxdeploy layout change cannot make this
 # silently miss them; the post-repack check below re-runs the same search.
-mapfile -t wayland_libs < <(find "$appdir" -type f -name 'libwayland-*.so*' | sort)
+#
+# Symlinks count. Today linuxdeploy copies these four as plain files, but it does
+# emit `.so` symlinks elsewhere in this AppDir, so a future bundle could ship the
+# SONAME as a link. Matching only `-type f` would then remove the target, leave
+# the link, and still pass the verification below.
+mapfile -t wayland_libs < <(find "$appdir" \( -type f -o -type l \) -name 'libwayland-*.so*' | sort)
 if [ ${#wayland_libs[@]} -eq 0 ]; then
   # Not fatal: nothing bundled means nothing to unbundle, which is the state
   # this step is trying to reach. Worth saying out loud, because it also means
@@ -238,10 +243,10 @@ if [ ! -x "$repacked/AppRun" ]; then
   echo "error: AppRun is missing or not executable after the repack." >&2
   exit 1
 fi
-survivors=$(find "$repacked" -type f -name 'libwayland-*.so*')
-if [ -n "$survivors" ]; then
+mapfile -t survivors < <(find "$repacked" \( -type f -o -type l \) -name 'libwayland-*.so*' | sort)
+if [ ${#survivors[@]} -gt 0 ]; then
   echo "error: bundled wayland libraries survived the repack:" >&2
-  printf '  %s\n' $survivors >&2
+  printf '  %s\n' "${survivors[@]}" >&2
   echo "Shipping them breaks EGL on every Mesa driver; see the header." >&2
   exit 1
 fi

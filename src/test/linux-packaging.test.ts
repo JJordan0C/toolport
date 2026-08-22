@@ -153,14 +153,33 @@ describe("the AppImage does not bundle the host's wayland libraries", () => {
   it("removes every libwayland-* it finds in the AppDir", () => {
     // Searched across the whole AppDir rather than one fixed path, so a
     // linuxdeploy layout change cannot make the removal silently miss them.
-    expect(patchScript).toMatch(/find "\$appdir" -type f -name 'libwayland-\*\.so\*'/);
+    expect(patchScript).toMatch(
+      /find "\$appdir" \\\( -type f -o -type l \\\) -name 'libwayland-\*\.so\*'/,
+    );
   });
 
   it("fails the release if any survive the repack", () => {
     // A silent miss here ships an AppImage that opens a grey window on every
     // Mesa driver, which is the bug this whole step exists to prevent.
-    expect(patchScript).toMatch(/find "\$repacked" -type f -name 'libwayland-\*\.so\*'/);
+    expect(patchScript).toMatch(
+      /find "\$repacked" \\\( -type f -o -type l \\\) -name 'libwayland-\*\.so\*'/,
+    );
     expect(patchScript).toContain("survived the repack");
+  });
+
+  it("matches symlinks, not just regular files", () => {
+    // linuxdeploy copies these four as plain files today, but it does emit `.so`
+    // symlinks elsewhere in the same AppDir. Were the SONAME ever a link,
+    // `-type f` would remove the target, ship a dangling `libwayland-client.so.0`
+    // that the loader still finds by SONAME, and pass verification. Asserted on
+    // BOTH searches: a one-sided fix is the silent-success case again.
+    const searches =
+      patchScript.match(/find "\$(?:appdir|repacked)"[^|\n]*libwayland[^|\n]*/g) ?? [];
+    expect(searches).toHaveLength(2);
+    for (const search of searches) {
+      expect(search).toContain("-type l");
+      expect(search).not.toMatch(/-type f -name/);
+    }
   });
 
   it("leaves the rest of the bundle alone", () => {
