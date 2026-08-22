@@ -5180,20 +5180,63 @@ fn open_external(url: String) -> Result<(), String> {
         return Err("only http and https URLs can be opened".into());
     }
     let host = parsed.host_str().ok_or("URL has no host")?;
-    // `host_str` keeps IPv6 literals in brackets; strip them before parsing.
-    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
-        if crate::oauth::ip_is_link_local(&ip) {
-            return Err("refusing to open a link-local/metadata address".into());
-        }
-    } else if host.eq_ignore_ascii_case("metadata.google.internal")
-        || host.eq_ignore_ascii_case("metadata")
-    {
-        // These names resolve to the metadata service without a link-local
-        // literal ever appearing in the URL. Mirrors the same pair in openUrl.ts.
+    if host_reaches_metadata(host) {
         return Err("refusing to open a link-local/metadata address".into());
     }
     crate::oauth::open_browser(parsed.as_str());
     Ok(())
+}
+
+/// Hosts that must never reach the OS browser.
+///
+/// This mirrors `isLinkLocalHost` in `src/lib/openUrl.ts` case for case, and the
+/// tests below use that file's vectors. It has to: the point of checking here is
+/// that a compromised renderer cannot `invoke` its way past the frontend guard,
+/// and a backend check that is a strict subset of the frontend one does not do
+/// that. `oauth::ip_is_link_local` alone is such a subset - it has no opinion on
+/// CGNAT, unspecified or broadcast addresses - so it is one input here, not the
+/// whole answer.
+///
+/// Deliberately narrower than `oauth::ip_is_private`: loopback and RFC1918 LAN
+/// hosts are legitimate browser targets (locally served docs, an intranet page).
+/// Only the ranges that reach a metadata service are refused.
+fn host_reaches_metadata(host: &str) -> bool {
+    // WHATWG keeps a trailing dot on named hosts and brackets on IPv6 literals.
+    let host = host.trim_matches(['[', ']']);
+    let host = host.strip_suffix('.').unwrap_or(host);
+    // Well-known metadata names resolve to the service without a link-local
+    // literal ever appearing in the URL, so match them directly.
+    if host.eq_ignore_ascii_case("metadata.google.internal") || host.eq_ignore_ascii_case("metadata")
+    {
+        return true;
+    }
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    ip_reaches_metadata(&ip)
+}
+
+fn ip_reaches_metadata(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    // Covers 169.254/16 (incl. 169.254.169.254), fe80::/10, fd00:ec2::254, and
+    // the IPv4-mapped forms of the first.
+    if crate::oauth::ip_is_link_local(ip) {
+        return true;
+    }
+    let v4 = match ip {
+        IpAddr::V4(v4) => Some(*v4),
+        IpAddr::V6(v6) => {
+            if v6.is_unspecified() {
+                return true; // `::`
+            }
+            v6.to_ipv4_mapped()
+        }
+    };
+    let Some(v4) = v4 else { return false };
+    let [a, b, ..] = v4.octets();
+    // CGNAT 100.64/10 (Alibaba/OCI metadata), "this network" 0/8 (0.0.0.0
+    // reaches loopback/IMDS on some stacks), and the broadcast address.
+    (a == 100 && b & 0xc0 == 64) || a == 0 || v4.is_broadcast()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -8100,3 +8143,49 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod opener_host_tests {
+    use super::host_reaches_metadata;
+
+    /// The vectors are lifted from `src/lib/openUrl.test.ts`. Keeping them
+    /// identical is the point: this guard exists so a compromised renderer
+    /// cannot `invoke` past the frontend one, which it could if the backend
+    /// refused a smaller set.
+    #[test]
+    fn refuses_every_host_the_renderer_refuses() {
+        for host in [
+            "169.254.169.254",
+            "169.254.169.254.", // WHATWG keeps the trailing dot
+            "100.100.100.200",  // CGNAT 100.64/10
+            "0.0.0.0",
+            "255.255.255.255",
+            "[fe80::1]",
+            "[::ffff:169.254.169.254]",
+            "[::]",
+            "[fd00:ec2::254]",
+            "metadata.google.internal",
+            "metadata",
+            "METADATA.GOOGLE.INTERNAL",
+        ] {
+            assert!(host_reaches_metadata(host), "{host} should be refused");
+        }
+    }
+
+    /// Narrower than `ip_is_private` on purpose: locally served docs and an
+    /// intranet page are ordinary browsing.
+    #[test]
+    fn keeps_loopback_lan_and_the_public_internet_reachable() {
+        for host in [
+            "example.com",
+            "localhost",
+            "127.0.0.1",
+            "192.168.1.10",
+            "10.0.0.5",
+            "[::1]",
+            "100.32.0.1", // 100.32/11, outside CGNAT
+            "1.1.1.1",
+        ] {
+            assert!(!host_reaches_metadata(host), "{host} should be allowed");
+        }
+    }
+}
