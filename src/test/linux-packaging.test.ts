@@ -6,9 +6,12 @@
 //    Wayland session whose Xwayland cannot survive the app that is fatal: the
 //    first launch kills Xwayland session-wide and every launch after it blocks
 //    forever on the orphaned X socket with no window and no error.
-// 2. Arch gets a native package (`toolport-bin`) instead of the fat AppImage,
-//    whose bundled Ubuntu 22.04 WebKitGTK cannot initialise EGL against a
-//    current Mesa.
+// 2. The AppImage must not bundle libwayland-*. AppRun puts the bundle on
+//    LD_LIBRARY_PATH, so the HOST's Mesa - which is deliberately not bundled -
+//    resolves against it, and libEGL_mesa fails to load with
+//    `undefined symbol: wl_fixes_interface`. The window then never paints.
+// 3. Arch also gets a native package (`toolport-bin`), now as a preference
+//    rather than a workaround.
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -39,7 +42,7 @@ function workflow(name: string): Workflow {
   return parse(read(".github", "workflows", name)) as Workflow;
 }
 
-const PATCH_SCRIPT = "scripts/patch-appimage-gdk-backend.sh";
+const PATCH_SCRIPT = "scripts/patch-appimage.sh";
 const patchScript = read(...PATCH_SCRIPT.split("/"));
 
 // The exact line linuxdeploy-plugin-gtk writes, trailing comment and all.
@@ -143,6 +146,31 @@ describe("AppImage GDK_BACKEND is a default, not an override", () => {
     expect(patchScript).toContain("cannot restore");
     // And no -no-xattrs, which would throw away anything that did survive.
     expect(patchScript).not.toContain("-no-xattrs");
+  });
+});
+
+describe("the AppImage does not bundle the host's wayland libraries", () => {
+  it("removes every libwayland-* it finds in the AppDir", () => {
+    // Searched across the whole AppDir rather than one fixed path, so a
+    // linuxdeploy layout change cannot make the removal silently miss them.
+    expect(patchScript).toMatch(/find "\$appdir" -type f -name 'libwayland-\*\.so\*'/);
+  });
+
+  it("fails the release if any survive the repack", () => {
+    // A silent miss here ships an AppImage that opens a grey window on every
+    // Mesa driver, which is the bug this whole step exists to prevent.
+    expect(patchScript).toMatch(/find "\$repacked" -type f -name 'libwayland-\*\.so\*'/);
+    expect(patchScript).toContain("survived the repack");
+  });
+
+  it("leaves the rest of the bundle alone", () => {
+    // Not a general "unbundle system libraries" pass: the payload still needs
+    // its own GTK and WebKitGTK. Only the wayland family goes.
+    const removals = patchScript.match(/^\s*rm -f .*$/gm) ?? [];
+    expect(removals.length).toBeGreaterThan(0);
+    for (const line of removals) {
+      expect(line).toContain("$lib");
+    }
   });
 });
 
@@ -358,55 +386,35 @@ describe("the AUR package ships to Arch", () => {
   });
 });
 
-describe("install.sh routes Arch users without hanging or eating itself", () => {
+describe("install.sh installs the AppImage on Arch", () => {
   const installer = read("scripts", "install.sh");
 
-  it("detects pacman and names the AUR package", () => {
+  it("does not reach for an AUR helper on the user's behalf", () => {
+    // The AppImage works on Mesa as of 1.16.0, so the AUR detour is gone. It
+    // mattered most under `curl ... | bash`, where a helper's PKGBUILD review
+    // prompt reads stdin - which IS the rest of this script.
+    for (const helper of ["paru", "yay", "pamac", "pikaur", "trizen"]) {
+      expect(installer).not.toMatch(new RegExp(`^\\s*"?\\$?${helper}\\b.*-S`, "m"));
+    }
+    expect(installer).not.toContain("for helper in");
+    expect(installer).not.toContain("--skipreview");
+  });
+
+  it("still points Arch users at toolport-bin if they want a package", () => {
     expect(installer).toContain("command -v pacman");
     expect(installer).toContain("toolport-bin");
   });
 
-  it("gives each helper flags that actually skip its review prompt", () => {
-    // pacman's --noconfirm does NOT cover an AUR helper's own PKGBUILD review.
-    expect(installer).toContain("--skipreview");
-    expect(installer).toContain("--answerdiff None");
-    expect(installer).toContain("--answerclean None");
+  it("falls through to the AppImage install", () => {
+    const arch = installer.slice(installer.indexOf("command -v pacman"));
+    expect(arch).toContain("Installed the AppImage");
   });
 
-  it("never lets a helper read the piped installer from stdin", () => {
-    // Documented entry point is `curl ... | bash`, so stdin IS this script. A
-    // helper that prompts would swallow the rest of it.
-    expect(installer).toMatch(/"\$helper" "\$\{helper_args\[@\]\}" <\/dev\/null/);
-  });
-
-  it("tries every installed helper before giving up on the AUR", () => {
-    // A `break` after the first failure would skip a helper that would work.
-    const arch = installer.slice(installer.indexOf("for helper in"));
-    const loop = arch.slice(0, arch.indexOf("\n    done"));
-    expect(loop).toContain("could not install toolport-bin");
-    expect(loop).not.toMatch(/^\s*break\s*$/m);
-  });
-
-  it("tries Omarchy's wrapper, which the docs tell those users to run", () => {
-    expect(installer).toContain("omarchy) helper_args=(pkg aur add toolport-bin)");
-  });
-
-  it("tries pamac, which is all a stock Manjaro has", () => {
-    // The README names Manjaro. A default Manjaro ships pamac and usually none
-    // of paru/yay, so without this the named distro skips every branch and
-    // lands on the AppImage this whole change exists to avoid there.
-    expect(installer).toContain("pamac) helper_args=(build --no-confirm toolport-bin)");
-    expect(installer).toMatch(/^ *for helper in [a-z ]*\bpamac\b/m);
-  });
-
-  it("cannot reach a real AUR helper from the bash installer tests", () => {
-    // These tests only shimmed curl and uname, so on an Arch or Manjaro box the
-    // Arch branch found the REAL pacman and paru and sudo-installed from the
-    // actual AUR mid-test. Ubuntu CI never runs this file, so that only ever
-    // fired on a maintainer's own machine.
+  it("is covered by the bash installer tests, with pacman shimmed", () => {
+    // Without the shim, running those tests on an Arch box would exercise the
+    // host's real package manager mid-test.
     const harness = read("scripts", "install.Tests.bash");
     expect(harness).toContain('cat > "$shim_dir/pacman"');
-    expect(harness).toMatch(/for helper in paru yay pamac pikaur trizen omarchy/);
-    expect(harness).toContain("helper-stdin.log");
+    expect(harness).toContain("no AUR helper was invoked");
   });
 });

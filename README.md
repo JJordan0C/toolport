@@ -347,18 +347,24 @@ parameters.
 
 Prebuilt installers are published on the
 [Releases](https://github.com/tsouth89/toolport/releases) page. Toolport runs on
-**Windows, macOS, and Linux**. On Linux, install the package that links your
-system's WebKitGTK: the **`.deb`** on Debian/Ubuntu, and **`toolport-bin` from
-the AUR** on Arch and its derivatives (Manjaro, EndeavourOS, Omarchy). The
-**AppImage** is a portable, no-root fallback for other distros; it bundles
-Ubuntu 22.04's WebKitGTK, which a rolling release's Mesa is too new for (see
-Troubleshooting). To run from source, see Development below.
+**Windows, macOS, and Linux**. On Linux, take the **`.deb`** on Debian/Ubuntu
+and the **AppImage** everywhere else, including Arch and its derivatives
+(Manjaro, EndeavourOS, Omarchy). The AppImage needs no root and works on both
+Mesa and the proprietary NVIDIA driver. To run from source, see Development
+below.
 
-**Exception: Arch with the proprietary NVIDIA driver.** The EGL failure that
-motivates the native package is a _Mesa_ one, and NVIDIA's EGL is a separate
-implementation that does not hit it. On those machines the advice inverts: the
-native package is the one that breaks, and the **AppImage is the working
-install** (see Troubleshooting). Pick by driver, not by distro.
+**If you are on 1.15.0 or older on Arch, update.** Those AppImages bundled
+wayland 1.20, which the host's Mesa then loaded instead of its own; `libEGL_mesa`
+failed to link, and the window opened grey and never painted. It looked like an
+AMD-only bug because NVIDIA's EGL does not use that library. 1.16.0 stops
+bundling those libraries and the split is gone (see Troubleshooting). If you
+worked around it with the native package, you can stay there, nothing is broken;
+you just no longer have to.
+
+**Prefer a real package on Arch?** `toolport-bin` repackages the same `.deb`
+payload against your system's WebKitGTK, so it upgrades and removes through
+pacman. It is a preference now rather than a workaround, and the installer
+script no longer reaches for it on your behalf.
 
 ```bash
 # Arch / Manjaro / EndeavourOS
@@ -368,14 +374,13 @@ paru -S toolport-bin        # or: yay -S toolport-bin
 omarchy pkg aur add toolport-bin
 ```
 
-**Arch, right now:** AUR account registration is paused upstream, so
-`toolport-bin` is not published yet and the commands above will not find it.
-Build the identical package from this repo in the meantime, no AUR account
-needed:
+AUR account registration is paused upstream, so `toolport-bin` is not published
+yet and the commands above will not find it. Build the identical package from
+this repo in the meantime, no AUR account needed:
 
 ```bash
 git clone https://github.com/tsouth89/toolport && cd toolport
-scripts/render-aur.sh 1.15.0 ./aur     # use the released version
+scripts/render-aur.sh 1.16.0 ./aur     # use the released version
 cd aur && makepkg -si
 ```
 
@@ -469,47 +474,50 @@ The frontend is typechecked with `npx tsc --noEmit`.
   you to click **Start Server** on the `toolport` MCP entry the first time, that's VS
   Code's own MCP handling, not Toolport. After that it reconnects on its own.
 - **Linux: the AppImage shows no window, or a grey empty one (`EGL_BAD_PARAMETER`).**
-  Install the native package instead: the **`.deb`** on Debian/Ubuntu, or
-  **`toolport-bin`** on Arch/Manjaro/EndeavourOS/Omarchy (`paru -S toolport-bin`
-  once it is on the AUR; until then build it from this repo, see Install above).
-  Both link your system's WebKitGTK, and that is the whole fix. The AppImage bundles Ubuntu 22.04's WebKitGTK, which has no
-  `WebKitGPUProcess` and cannot initialise EGL against a current Mesa, so on a
-  rolling release the GTK shell starts while `WebKitWebProcess` aborts every
-  launch and you get a grey window. None of `WEBKIT_DISABLE_DMABUF_RENDERER`,
-  `WEBKIT_DISABLE_COMPOSITING_MODE` or `WEBKIT_FORCE_SANDBOX=0` avoids that one.
-  (This is a packaging/GPU-stack issue, not a Toolport bug.)
+  Fixed in 1.16.0; update. On 1.15.0 and older the process would start, put a
+  window on screen, and never paint it, with `WebKitWebProcess` dying at launch:
 
-  **On NVIDIA's proprietary driver, do the opposite: use the AppImage.**
-  Everything above is a _Mesa_ failure. NVIDIA ships its own EGL, never hits it,
-  and there the native package is the broken one. `conduit` from the `.deb`
-  payload exits immediately at startup with:
+  ```
+  Could not create default EGL display: EGL_BAD_PARAMETER. Aborting...
+  ```
+
+  The cause was the AppImage bundling wayland's client libraries. `AppRun` puts
+  the bundle on `LD_LIBRARY_PATH`, which the loader then also applies to the
+  host's GPU drivers, and those are deliberately _not_ bundled. So a current
+  Mesa got resolved against Ubuntu 22.04's wayland 1.20 and could not load at
+  all:
+
+  ```
+  /usr/lib/libEGL_mesa.so.0: undefined symbol: wl_fixes_interface
+  ```
+
+  `wl_fixes_interface` arrived in wayland 1.23. This read as an AMD-only bug for
+  a long time, but it was never about the GPU: NVIDIA's proprietary EGL is a
+  separate implementation that does not link `libwayland-client`, so it was the
+  only stack that survived. Every Mesa driver hit it, on X11 as well as Wayland.
+  1.16.0 stops bundling those four libraries, so the host's are used and both
+  drivers work. It was not the bundled WebKitGTK, which is current.
+
+  If a grey window survives the update, that is a different problem, and on a
+  virtualized GPU it is usually EGL itself: try
+  `EGL_PLATFORM=surfaceless ./Toolport_*.AppImage`, and turn on 3D acceleration
+  if you are in a VM.
+
+- **Arch + proprietary NVIDIA: `toolport-bin` exits at startup, but the AppImage
+  works.** This one runs the other way round, and it is a system-stack problem,
+  not a Toolport one: the native package links your system GTK/WebKitGTK, and on
+  NVIDIA that combination exits immediately with
 
   ```
   Gdk-Message: Error 71 (Protocol error) dispatching to Wayland display.
   ```
 
-  Forcing `GDK_BACKEND=x11` gets past that, but the window then cannot allocate
-  any buffers and the app is unusable:
-
-  ```
-  Failed to create GBM buffer of size 1240x820: Invalid argument
-  ```
-
-  The AppImage bundles its own GTK and WebKitGTK, sidesteps both, and renders
-  correctly. Verified on Omarchy (Hyprland via uwsm), RTX 4070 SUPER,
-  `nvidia-open-dkms` 610.57.04, against system GTK 3.24.52 / WebKitGTK 2.52.6.
-
-  Note Omarchy already exports `GDK_BACKEND=wayland,x11,*` (from
-  `/usr/share/omarchy/default/hypr/envs.lua`), so the AppImage's own
-  `GDK_BACKEND="${GDK_BACKEND:-x11}"` default never applies and it runs on
-  Wayland, which is the path that works. Don't override it.
-
-  **If the AppImage is all you have** (a distro with no `.deb` and no AUR), the
-  older workarounds are still worth a try, because a virtualized GPU can fail EGL
-  for reasons that have nothing to do with the bundled WebKit: run
-  `EGL_PLATFORM=surfaceless ./Toolport_*.AppImage`, and in a VM turn on 3D
-  acceleration. They will not fix the rolling-Mesa case above, so if the window
-  opens grey rather than not at all, they are not your problem.
+  `GDK_BACKEND=x11` gets past that, but the window then cannot allocate buffers
+  (`Failed to create GBM buffer of size 1240x820: Invalid argument`) and the app
+  is unusable. The AppImage carries its own GTK and WebKitGTK and sidesteps both,
+  which is why it is the default recommendation on Arch. Observed on Omarchy
+  (Hyprland via uwsm), RTX 4070 SUPER, `nvidia-open-dkms` 610.57.04, against
+  system GTK 3.24.52 / WebKitGTK 2.52.6.
 
 - **Linux: the first launch killed Xwayland, and now nothing happens at all.**
   Fixed in 1.15.0. Older AppImages forced `GDK_BACKEND=x11` in a way nothing could

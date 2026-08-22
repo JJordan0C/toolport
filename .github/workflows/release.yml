@@ -196,7 +196,17 @@ jobs:
           # signing can do. The "Sign + notarize + package (macOS)" step below owns
           # ALL macOS signing, notarization, dmg, and updater-artifact generation.
 
-      # linuxdeploy-plugin-gtk hard-forces `GDK_BACKEND=x11` in an AppRun hook that is
+      # Two AppDir fixes, one extract/repack. See scripts/patch-appimage.sh for the
+      # full reasoning; both self-verify and FAIL the release rather than ship silently.
+      #
+      # linuxdeploy bundles libwayland-*, and AppRun puts the bundle on LD_LIBRARY_PATH,
+      # so the HOST's Mesa (never bundled) resolves against Ubuntu 22.04's wayland 1.20
+      # and `libEGL_mesa.so.0` fails to load with `undefined symbol: wl_fixes_interface`.
+      # WebKitWebProcess then aborts on `EGL_BAD_PARAMETER` and the window never paints.
+      # NVIDIA's EGL doesn't link libwayland-client, which is why this only ever looked
+      # like an AMD bug. The script unbundles those four libs so the host's are used.
+      #
+      # linuxdeploy-plugin-gtk also hard-forces `GDK_BACKEND=x11` in an AppRun hook that is
       # sourced AFTER the caller's environment, so `GDK_BACKEND=wayland` is silently
       # ignored. Harmless on Ubuntu/Debian; on a Wayland session whose Xwayland cannot
       # survive the app (reproduced on Arch/Hyprland in a VMware guest, vmwgfx driver)
@@ -209,7 +219,7 @@ jobs:
       # It rewrites the AppImage in place, which invalidates the updater signature
       # `tauri build` just produced, so re-sign here. Skipped when no signing key is
       # configured (forks), exactly like the unsigned artifacts the build already emits.
-      - name: Make the AppImage's X11 backend overridable, then re-sign
+      - name: Unbundle wayland, make the X11 backend overridable, then re-sign
         if: matrix.os == 'ubuntu-22.04'
         shell: bash
         run: |
@@ -220,7 +230,7 @@ jobs:
             exit 1
           fi
           image=${images[0]}
-          bash scripts/patch-appimage-gdk-backend.sh "$image"
+          bash scripts/patch-appimage.sh "$image"
           if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
             rm -f "$image.sig"
             npx tauri signer sign "$image"

@@ -239,55 +239,40 @@ fi
 echo "    output: $(printf '%s' "$curl_fail_output" | tr '\n' ' ' | cut -c1-150)"
 rm -rf "$workdir"
 
-echo "Arch: the AUR helper loop"
+echo "Arch: installs the AppImage and leaves the AUR alone"
+# The AppImage stopped bundling wayland in 1.16.0, so it works on Mesa as well as
+# NVIDIA and Arch no longer needs steering to a native package. `toolport-bin` is
+# still documented for anyone who wants one; the installer must not reach for an
+# AUR helper on the user's behalf, least of all under `curl ... | bash`.
 arch_workdir="$(mktemp -d)"
 arch_shim="$arch_workdir/shim"; arch_home="$arch_workdir/home"; arch_bin="$arch_workdir/bin"
 mkdir -p "$arch_home" "$arch_bin"
 make_shim "$arch_shim" "$(fake_release "sha256:$fake_sha256" 64)"
-# Feed the script on stdin, the way `curl ... | bash` does. Without this the
-# stdin assertion below is unfalsifiable: run with a file argument and no pipe,
-# a helper's `cat` reads 0 bytes whether or not install.sh redirects, so the
-# check passes on a script that forgot to.
-arch_stdin_sentinel="TOOLPORT_TEST_STDIN_MUST_NOT_BE_READ"
 set +e
-arch_output="$(cd "$arch_workdir" && printf '%s
-' "$arch_stdin_sentinel"   | PATH="$arch_shim:$PATH" HOME="$arch_home" XDG_BIN_HOME="$arch_bin"     TOOLPORT_TEST_AUR_HELPER=yay bash "$INSTALL_SH" 2>&1)"
+arch_output="$(cd "$arch_workdir" && PATH="$arch_shim:$PATH" HOME="$arch_home" \
+  XDG_BIN_HOME="$arch_bin" bash "$INSTALL_SH" 2>&1)"
 arch_rc=$?
 set -e
 arch_argv="$(cat "$arch_shim/helper-argv.log" 2>/dev/null || true)"
 
-check "installs through the AUR helper" "Launch Toolport from your app menu" "$arch_output"
+check "installs the AppImage on Arch" "Installed the AppImage" "$arch_output"
+check "still points at toolport-bin for those who want it" "toolport-bin" "$arch_output"
 if [ "$arch_rc" = "0" ]; then
   echo "  ok: exit code 0"; pass=$((pass + 1))
 else
   echo "  FAIL: exit code $arch_rc (wanted 0)"; fail=$((fail + 1))
 fi
-# A failing first helper must not end the loop, or a working second one never runs.
-check "tries paru before yay" "paru -S" "$arch_argv"
-check "falls through to yay after paru fails" "yay -S" "$arch_argv"
-# pacman's --noconfirm does not cover a helper's own PKGBUILD review prompt.
-check "passes paru --skipreview" "--skipreview" "$arch_argv"
-check "passes yay's answer flags" "--answerdiff None" "$arch_argv"
-# The AUR path succeeded, so the AppImage must not also have been installed.
-if [ ! -e "$arch_bin/toolport" ]; then
-  echo "  ok: no AppImage installed once the helper succeeded"; pass=$((pass + 1))
+if [ -z "$arch_argv" ]; then
+  echo "  ok: no AUR helper was invoked"; pass=$((pass + 1))
 else
-  echo "  FAIL: AppImage installed even though the AUR helper succeeded"; fail=$((fail + 1))
+  echo "  FAIL: an AUR helper ran: $(printf '%s' "$arch_argv" | head -c 80)"; fail=$((fail + 1))
 fi
-# The documented entry point is `curl ... | bash`, so stdin is the script itself.
-# A helper that prompts would eat the rest of it; install.sh hands it /dev/null.
-arch_stdin_seen="$(cat "$arch_shim/helper-stdin.log" 2>/dev/null || true)"
-if [ -z "$arch_stdin_seen" ]; then
-  echo "  ok: no helper read from the installer's piped stdin"; pass=$((pass + 1))
+if [ -x "$arch_bin/toolport" ]; then
+  echo "  ok: AppImage installed to XDG_BIN_HOME"; pass=$((pass + 1))
 else
-  echo "  FAIL: a helper consumed stdin: $(printf '%s' "$arch_stdin_seen" | head -c 80)"; fail=$((fail + 1))
+  echo "  FAIL: no AppImage at $arch_bin/toolport"; fail=$((fail + 1))
 fi
-echo "    argv: $(printf '%s' "$arch_argv" | tr '
-' ' ' | cut -c1-160)"
 rm -rf "$arch_workdir"
-
-echo "Arch: every helper failing still installs something"
-run_check "falls back to the AppImage" "Installed the AppImage" 0 "$(fake_release "sha256:$fake_sha256" 64)"
 
 echo
 echo "$pass passed, $fail failed"

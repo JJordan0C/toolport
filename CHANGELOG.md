@@ -4,6 +4,27 @@ All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 Entries before the rename below shipped under the project's former name, Conduit.
 
+## [1.16.0] - Unreleased
+
+### Fixed
+
+- **Linux: the AppImage opens a grey empty window on Mesa (`EGL_BAD_PARAMETER`).**
+  This was diagnosed in 1.15.0 as the bundled Ubuntu 22.04 WebKitGTK being too
+  old for a current Mesa, and a native Arch package was added to route around it.
+  That diagnosis was wrong. The bundled WebKitGTK is 2.50.4 and is not involved.
+  The AppImage was bundling **wayland 1.20**, and since `AppRun` puts the bundle
+  on `LD_LIBRARY_PATH` the loader applied it to the _host's_ GPU drivers too -
+  which are deliberately not bundled - so `libEGL_mesa.so.0` failed to load with
+  `undefined symbol: wl_fixes_interface` (added in wayland 1.23), `eglGetDisplay`
+  returned nothing, and `WebKitWebProcess` aborted at launch. It presented as an
+  AMD-only bug purely because NVIDIA's proprietary EGL does not link
+  `libwayland-client`; every Mesa driver hit it, on X11 as well as Wayland.
+  `scripts/patch-appimage.sh` now unbundles `libwayland-*` so the host's copies
+  are used, and fails the release if any survive the repack. The AppImage works
+  on Mesa and NVIDIA alike, so `scripts/install.sh` installs it on Arch instead
+  of reaching for an AUR helper. `toolport-bin` is still published and still a
+  good choice if you want a real package; it is no longer a workaround.
+
 ## [1.15.0] - 2026-08-20
 
 ### Security
