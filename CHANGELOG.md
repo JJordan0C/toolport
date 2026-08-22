@@ -25,6 +25,32 @@ Entries before the rename below shipped under the project's former name, Conduit
   of reaching for an AUR helper. `toolport-bin` is still published and still a
   good choice if you want a real package; it is no longer a workaround.
 
+- **Linux: spawned processes inherited the AppImage's bundled library paths.**
+  `AppRun` exports `LD_LIBRARY_PATH`, `GTK_PATH`, `GIO_EXTRA_MODULES`,
+  `PYTHONHOME` and friends into Toolport, and every child inherited them. Right
+  for our own bundled payload, poison for anything else: a _system_ binary loaded
+  Ubuntu 22.04's glib or brotli instead of the host's and died at dynamic-link
+  time on a rolling release, before running any of its own code. In practice
+  clicking **Authenticate** on an OAuth server said "opening browser" and nothing
+  happened, because the browser `xdg-open` launched exited with
+  `undefined symbol: BrotliDecoderAttachDictionary`. The same hazard applied to
+  any stdio MCP server that is a native binary or pulls a native node/python
+  module. Anything that is not our own payload is now spawned with those
+  variables removed (new `hostenv` module); `XDG_DATA_DIRS` keeps its host
+  entries so `xdg-open` can still find `.desktop` files, and nothing else in the
+  environment is touched, so a server's own `env` block still wins. A no-op
+  outside an AppImage, so the `.deb`, the AUR package and dev builds are
+  unaffected.
+
+### Changed
+
+- **External links no longer go through `tauri-plugin-opener`.** The plugin
+  spawns with our inherited environment and offers no hook to change it, so under
+  an AppImage every link in the UI hit the bug above. They now go through an
+  `open_external` command that reuses the same sanitised spawn as the OAuth
+  flow. The `http`/`https`-only and link-local/metadata guards are unchanged and
+  are now enforced on the IPC boundary as well as in the renderer.
+
 ## [1.15.0] - 2026-08-20
 
 ### Security

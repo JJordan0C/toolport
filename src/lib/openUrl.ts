@@ -1,4 +1,4 @@
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { invoke } from "@tauri-apps/api/core";
 
 /**
  * Open an external link, but only real web URLs.
@@ -7,8 +7,15 @@ import { openUrl } from "@tauri-apps/plugin-opener";
  * homepage, an auth hint's docs link), which is not fully trusted. Handing a
  * `file://` (Windows SMB -> NTLM-hash leak) or a custom-scheme handler URI to
  * the OS opener is a real risk, so allow only `http`/`https` through. The
- * backend also validates at the source (see `catalog.rs`); this is the matching
- * frontend guard so every `openUrl` call site is covered.
+ * backend also validates at the source (see `catalog.rs`), and the `open_external`
+ * command re-checks on the IPC boundary; this is the matching frontend guard so
+ * every call site is covered.
+ *
+ * Goes through our own `open_external` command rather than
+ * `tauri-plugin-opener`: the plugin spawns the browser with whatever environment
+ * we inherited, and under an AppImage that means the bundle's library paths, so
+ * the browser dies on `undefined symbol` and the link silently never opens
+ * (see `hostenv.rs`).
  *
  * Link-local and metadata-range hosts are refused too: clicking "docs" on an
  * untrusted registry entry must not reach `http://169.254.169.254/…` (IMDSv1)
@@ -35,7 +42,9 @@ export function openExternal(url: string | null | undefined): Promise<void> {
     console.warn(`openExternal: refusing to open link-local/metadata URL: ${url}`);
     return Promise.resolve();
   }
-  return openUrl(url);
+  return invoke<void>("open_external", { url }).catch((error: unknown) => {
+    console.warn(`openExternal: could not open ${url}: ${String(error)}`);
+  });
 }
 
 /** Link-local and metadata address ranges only — deliberately narrower than

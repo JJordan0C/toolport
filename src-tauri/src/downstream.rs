@@ -1598,10 +1598,12 @@ pub fn augmented_path() -> &'static str {
         };
         // Best effort: the login shell's PATH (covers nvm/asdf/homebrew/volta).
         if let Ok(shell) = std::env::var("SHELL") {
-            if let Ok(out) = std::process::Command::new(&shell)
-                .args(["-ilc", "printf %s \"$PATH\""])
-                .output()
-            {
+            let mut cmd = std::process::Command::new(&shell);
+            // The user's login shell is a host binary, and this probe fails
+            // silently: an AppImage's library paths could make it die at link
+            // time and we would just report a shorter PATH (see hostenv).
+            crate::hostenv::strip_bundled_env(&mut cmd);
+            if let Ok(out) = cmd.args(["-ilc", "printf %s \"$PATH\""]).output() {
                 if out.status.success() {
                     for d in String::from_utf8_lossy(&out.stdout).split(':') {
                         push(d.to_string(), &mut dirs_list);
@@ -3238,6 +3240,10 @@ impl StdioTransport {
         let spawn_args = container_args.as_slice();
         let resolved = resolve_command(spawn_command);
         let mut cmd = Command::new(&resolved);
+        // A downstream server is not our bundled payload, so it must not inherit
+        // an AppImage's library and plugin paths (see hostenv). Applied BEFORE the
+        // server's own `env` below, so anything it configures deliberately wins.
+        crate::hostenv::strip_bundled_env(&mut cmd);
         cmd.args(spawn_args)
             .envs(env.iter().cloned())
             .stdin(Stdio::piped())

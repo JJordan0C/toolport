@@ -1358,7 +1358,7 @@ fn redact_secret(text: &str, secret: &str) -> String {
     text.replace(secret, "***")
 }
 
-fn open_browser(url: &str) {
+pub(crate) fn open_browser(url: &str) {
     // NOT `cmd /C start` on Windows: cmd treats `&` in the URL as a command
     // separator and truncates it. rundll32 passes the URL through verbatim.
     #[cfg(windows)]
@@ -1367,8 +1367,15 @@ fn open_browser(url: &str) {
         .spawn();
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
+    // xdg-open is a host binary, and so is the browser it goes on to exec, so
+    // neither may inherit an AppImage's bundled library paths - it makes the
+    // browser die on `undefined symbol` and the sign-in silently never opens.
     #[cfg(all(unix, not(target_os = "macos")))]
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    {
+        let mut cmd = std::process::Command::new("xdg-open");
+        crate::hostenv::strip_bundled_env(&mut cmd);
+        let _ = cmd.arg(url).spawn();
+    }
 }
 
 fn validate_authorization_response_issuer(

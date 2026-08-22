@@ -1,29 +1,34 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { openUrl } = vi.hoisted(() => ({ openUrl: vi.fn() }));
+const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 
-vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
 // Import after mock so the module binds to the mock.
 const { openExternal } = await import("./openUrl");
 
 describe("openExternal", () => {
   beforeEach(() => {
-    openUrl.mockClear();
+    invoke.mockClear();
+    invoke.mockResolvedValue(undefined);
   });
 
   it("allows http and https URLs through to the opener", async () => {
     await openExternal("https://example.com/docs");
     await openExternal("http://localhost:3000");
-    expect(openUrl).toHaveBeenCalledWith("https://example.com/docs");
-    expect(openUrl).toHaveBeenCalledWith("http://localhost:3000");
-    expect(openUrl).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenCalledWith("open_external", {
+      url: "https://example.com/docs",
+    });
+    expect(invoke).toHaveBeenCalledWith("open_external", {
+      url: "http://localhost:3000",
+    });
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 
   it("keeps loopback and private-LAN docs reachable", async () => {
     await openExternal("http://127.0.0.1:8080/docs");
     await openExternal("http://192.168.1.10/manual");
-    expect(openUrl).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 
   it("refuses link-local and cloud-metadata hosts", async () => {
@@ -37,7 +42,14 @@ describe("openExternal", () => {
     await openExternal("http://[fd00:ec2::254]/latest/meta-data/");
     await openExternal("http://metadata.google.internal/computeMetadata/v1/");
     await openExternal("http://metadata/computeMetadata/v1/");
-    expect(openUrl).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  // These are all fire-and-forget click handlers, so a backend that refuses the
+  // URL or cannot find a browser must not reject into an unhandled rejection.
+  it("swallows a rejection from the backend", async () => {
+    invoke.mockRejectedValue("no browser");
+    await expect(openExternal("https://example.com")).resolves.toBeUndefined();
   });
 
   it("refuses file:, javascript:, malformed, and empty inputs", async () => {
@@ -48,6 +60,6 @@ describe("openExternal", () => {
     await openExternal(null);
     await openExternal(undefined);
     await openExternal(42 as unknown as string);
-    expect(openUrl).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalled();
   });
 });

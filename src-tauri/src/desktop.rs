@@ -3528,8 +3528,11 @@ fn open_data_dir() -> Result<(), String> {
     let program = "open";
     #[cfg(target_os = "linux")]
     let program = "xdg-open";
-    std::process::Command::new(program)
-        .arg(&dir)
+    let mut cmd = std::process::Command::new(program);
+    // The file manager this launches is a host binary, so it must not inherit an
+    // AppImage's bundled library paths (see hostenv).
+    crate::hostenv::strip_bundled_env(&mut cmd);
+    cmd.arg(&dir)
         .spawn()
         .map_err(|e| format!("could not open the data directory: {e}"))?;
     Ok(())
@@ -5157,6 +5160,42 @@ fn is_launch_at_login_enabled(app: AppHandle) -> Result<bool, String> {
     }
 }
 
+/// Open a web link in the user's browser.
+///
+/// This replaces `tauri-plugin-opener` for the frontend. The plugin spawns with
+/// our inherited environment and offers no hook to change it, so under an
+/// AppImage the browser it launches inherits the bundle's library paths and dies
+/// on `undefined symbol` before drawing anything (see `hostenv`). Going through
+/// `oauth::open_browser` gives every link the same sanitised spawn the OAuth
+/// sign-in already uses, on all three platforms.
+///
+/// SECURITY: some of these URLs come from registry/vendor data, which is not
+/// fully trusted. `openUrl.ts` refuses anything that is not an `http`/`https`
+/// URL with a non-link-local host; this is the matching guard on the IPC
+/// boundary, which the renderer cannot talk its way around.
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    let parsed = url::Url::parse(&url).map_err(|_| "not a URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("only http and https URLs can be opened".into());
+    }
+    let host = parsed.host_str().ok_or("URL has no host")?;
+    // `host_str` keeps IPv6 literals in brackets; strip them before parsing.
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        if crate::oauth::ip_is_link_local(&ip) {
+            return Err("refusing to open a link-local/metadata address".into());
+        }
+    } else if host.eq_ignore_ascii_case("metadata.google.internal")
+        || host.eq_ignore_ascii_case("metadata")
+    {
+        // These names resolve to the metadata service without a link-local
+        // literal ever appearing in the URL. Mirrors the same pair in openUrl.ts.
+        return Err("refusing to open a link-local/metadata address".into());
+    }
+    crate::oauth::open_browser(parsed.as_str());
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // `generate_context!()` must expand exactly once in this crate: on macOS dev
@@ -5229,7 +5268,6 @@ pub fn run() {
             show_main_window(app);
         }))
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
@@ -5386,6 +5424,7 @@ pub fn run() {
             enable_launch_at_login,
             disable_launch_at_login,
             is_launch_at_login_enabled,
+            open_external,
         ])
         // Close-to-tray: the window's X hides it instead of quitting, so the gateway and
         // approval broker keep running (HITL only works while the app is alive). Quit is
@@ -8060,3 +8099,4 @@ mod tests {
         );
     }
 }
+
