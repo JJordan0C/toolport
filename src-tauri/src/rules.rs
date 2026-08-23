@@ -895,6 +895,191 @@ pub fn project_preview(id: &str, key: &str) -> Result<Option<RulesPreview>, Stri
 /// no-ops when the on-disk block already matches, so a normal launch touches no files. Exists so
 /// a client updated (or reinstalled) since the last apply picks the rules back up without the
 /// user opening the Rules tab.
+/// A rules file already on this machine that a new set can start from (SBS-1035).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportCandidate {
+    pub client_id: String,
+    pub client_name: String,
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// What importing a file yields: the user's own text, with anything Toolport wrote removed.
+/// Nothing is saved and the source file is not touched; the caller seeds an editor with it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedRules {
+    pub path: String,
+    /// A suggested set name: "Imported from <client>" when the file is a client's, else from
+    /// the file name.
+    pub name: String,
+    pub content: String,
+    /// True when a Toolport block or owned-file header was stripped on the way in.
+    pub stripped_ours: bool,
+}
+
+/// Largest file `import_file` will read. A rules file is prose; anything past this is not one.
+const MAX_IMPORT_BYTES: u64 = 1024 * 1024;
+
+/// Rules files the detected clients already have, for "Start from a file". Read-only.
+pub fn import_candidates() -> Vec<ImportCandidate> {
+    import_candidates_for(&installed_targets(), dirs::home_dir().as_deref())
+}
+
+/// The per-client candidate list, over an explicit target set so it can be tested without a
+/// machine scan. Three sources, all the user's own writing:
+///
+/// * a sentinel-block target IS the user's file (`~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`,
+///   `.goosehints`): everything outside Toolport's block is theirs;
+/// * an owned-file target is entirely ours, so the candidates are the OTHER `.md` files in
+///   that rules directory (`~/.roo/rules/*.md`, Kiro steering, Cline rules);
+/// * Claude Code keeps its global memory in `~/.claude/CLAUDE.md`, beside the rules directory
+///   rather than in it, so that file is added for the clients that resolve there.
+///
+/// Deduplicated by path (Gemini CLI and Antigravity name one file), absent or empty files
+/// skipped, ordered by client name then path.
+fn import_candidates_for(
+    installed: &[ClientTarget],
+    home: Option<&std::path::Path>,
+) -> Vec<ImportCandidate> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut push = |client: &ClientTarget, path: std::path::PathBuf| {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return;
+        };
+        if !meta.is_file() || meta.len() == 0 {
+            return;
+        }
+        if !seen.insert(path.clone()) {
+            return;
+        }
+        out.push(ImportCandidate {
+            client_id: client.id.clone(),
+            client_name: client.name.clone(),
+            path: path.to_string_lossy().to_string(),
+            bytes: meta.len(),
+        });
+    };
+    for client in installed {
+        let Some(target) = &client.target else {
+            continue;
+        };
+        match target.strategy {
+            Strategy::SentinelBlock => push(client, target.path.clone()),
+            Strategy::OwnedFile => {
+                if let Some(dir) = target.path.parent() {
+                    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+                        .map(|rd| {
+                            rd.flatten()
+                                .map(|e| e.path())
+                                .filter(|p| p.extension().is_some_and(|e| e == "md"))
+                                .filter(|p| {
+                                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                                    !instructions::ALL_SCOPES
+                                        .iter()
+                                        .any(|s| s.owned_file_name() == name)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    files.sort();
+                    for f in files {
+                        push(client, f);
+                    }
+                }
+                if matches!(client.id.as_str(), "claude-code" | "vscode") {
+                    if let Some(home) = home {
+                        push(client, home.join(".claude").join("CLAUDE.md"));
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.client_name.cmp(&b.client_name).then(a.path.cmp(&b.path)));
+    out
+}
+
+/// Read `path` and return the user's own text from it, with any Toolport block (either
+/// scope) or owned-file header removed. Never writes: the file is read once and left exactly
+/// as it was, and nothing is saved - the caller puts the text in an editor for the user to
+/// review and save. Refuses a file that is too large to be rules, one that is not UTF-8, and
+/// one whose remainder still carries a marker lookalike (which `save_set` would refuse anyway;
+/// better to say so before the editor fills with it).
+pub fn import_file(path: &str, client_name: Option<&str>) -> Result<ImportedRules, String> {
+    use std::io::Read;
+    let p = std::path::Path::new(path);
+    // One handle for the check and the read, so a file swapped between the two cannot get a
+    // larger body past the size limit; and the read itself is bounded regardless.
+    let mut file = std::fs::File::open(p).map_err(|e| format!("Could not read {path}: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("Could not read {path}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{path} is not a file."));
+    }
+    let mut raw = Vec::new();
+    file.by_ref()
+        .take(MAX_IMPORT_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("Could not read {path}: {e}"))?;
+    if raw.len() as u64 > MAX_IMPORT_BYTES {
+        return Err(format!(
+            "{path} is larger than {MAX_IMPORT_BYTES} bytes, which is too large to be a rules file."
+        ));
+    }
+    let text = String::from_utf8(raw)
+        .map_err(|_| format!("{path} is not UTF-8 text, so it cannot be imported as rules."))?;
+    let (content, stripped_ours) = strip_toolport_artifacts(&text);
+    if instructions::content_carries_a_marker(&content) {
+        return Err(format!(
+            "{path} contains text that looks like Toolport's own marker comments outside any \
+             block Toolport wrote. Remove those lines from the file (or from the text after \
+             pasting it in) and try again."
+        ));
+    }
+    let name = match client_name.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(client) => format!("Imported from {client}"),
+        None => format!(
+            "Imported from {}",
+            p.file_name().and_then(|n| n.to_str()).unwrap_or("file")
+        ),
+    };
+    Ok(ImportedRules {
+        path: path.to_string(),
+        name,
+        content,
+        stripped_ours,
+    })
+}
+
+/// Everything in `text` that is the user's: an owned file of ours is entirely ours (empty
+/// remainder); otherwise every block of either scope is cut out in place. Surrounding blank
+/// lines are trimmed because this seeds an editor, not a file.
+fn strip_toolport_artifacts(text: &str) -> (String, bool) {
+    // An owned file of ours opens with a complete one-line header comment. Only that exact
+    // shape counts; a line that merely starts like the header (a lookalike, or a truncated
+    // copy) is the user's text and is kept rather than silently dropped as "ours".
+    let first_line = text.trim_start().lines().next().unwrap_or("");
+    if instructions::ALL_SCOPES.iter().any(|s| {
+        first_line.starts_with(s.owned_header_prefix()) && first_line.trim_end().ends_with("-->")
+    }) {
+        return (String::new(), true);
+    }
+    let mut out = text.to_string();
+    let mut stripped = false;
+    for scope in instructions::ALL_SCOPES {
+        // A file can hold more than one block of a scope only if someone hand-copied it; cut
+        // them all, bounded by the fact that each removal shortens the text.
+        while let Some(rest) = instructions::remove_block(&out, scope) {
+            out = rest;
+            stripped = true;
+        }
+    }
+    (out.trim().to_string(), stripped)
+}
+
 pub fn apply_on_startup() {
     match crate::registry::load_resolved_with_source() {
         Ok((_, source)) if !source.is_authoritative() => {
@@ -1186,6 +1371,141 @@ mod tests {
             "the uncleanable path stays on record"
         );
         assert!(agents.exists());
+    }
+
+    // ---- import an existing file as a seed (SBS-1035) ----
+
+    #[test]
+    fn import_strips_toolport_blocks_and_leaves_the_source_untouched() {
+        let s = Scratch::new();
+        let path = s.path("AGENTS.md");
+        let mine = "# My rules\n\nBe terse.\n";
+        std::fs::write(&path, mine).unwrap();
+        // Both a team block and a personal block land in the same file; both are ours.
+        assert_eq!(
+            instructions::write_target(&sentinel(path.clone()), "set1", 1, "personal text"),
+            ApplyState::Applied
+        );
+        let team = Target {
+            scope: Scope::Team,
+            ..sentinel(path.clone())
+        };
+        assert_eq!(
+            instructions::write_target(&team, "team1", 1, "org text"),
+            ApplyState::Applied
+        );
+        let before = std::fs::read(&path).unwrap();
+
+        let imported = import_file(path.to_str().unwrap(), Some("Codex")).expect("imports");
+        assert_eq!(imported.content, "# My rules\n\nBe terse.");
+        assert!(imported.stripped_ours);
+        assert_eq!(imported.name, "Imported from Codex");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "import is read-only");
+
+        // Without a client name the file name names the set.
+        let plain = import_file(path.to_str().unwrap(), None).unwrap();
+        assert_eq!(plain.name, "Imported from AGENTS.md");
+    }
+
+    #[test]
+    fn import_of_a_file_that_is_only_ours_yields_an_empty_seed() {
+        let s = Scratch::new();
+        let path = s.path("toolport-rules.md");
+        assert_eq!(
+            instructions::write_target(&owned(path.clone()), "set1", 1, "ours"),
+            ApplyState::Applied
+        );
+        let imported = import_file(path.to_str().unwrap(), Some("Claude Code")).unwrap();
+        assert_eq!(imported.content, "");
+        assert!(imported.stripped_ours, "an owned file is entirely Toolport's");
+
+        // A line that only LOOKS like the header is the user's text, not ours.
+        let lookalike = s.path("lookalike.md");
+        std::fs::write(&lookalike, format!("{} but not really\nrules\n", Scope::Team.owned_header_prefix())).unwrap();
+        let imported = import_file(lookalike.to_str().unwrap(), None).unwrap();
+        assert!(imported.content.contains("but not really"), "{}", imported.content);
+        assert!(!imported.stripped_ours);
+
+        // A file with nothing of ours in it imports verbatim (trimmed) and says so.
+        let theirs = s.path("CLAUDE.md");
+        std::fs::write(&theirs, "\n\nAlways run tests.\n\n").unwrap();
+        let imported = import_file(theirs.to_str().unwrap(), None).unwrap();
+        assert_eq!(imported.content, "Always run tests.");
+        assert!(!imported.stripped_ours);
+    }
+
+    #[test]
+    fn import_refuses_marker_lookalikes_oversize_and_non_utf8() {
+        let s = Scratch::new();
+        let lookalike = s.path("weird.md");
+        std::fs::write(
+            &lookalike,
+            format!("rules\n{} stray\n", Scope::Personal.sentinel_start_prefix()),
+        )
+        .unwrap();
+        let err = import_file(lookalike.to_str().unwrap(), None).unwrap_err();
+        assert!(err.contains("marker"), "{err}");
+
+        let big = s.path("big.md");
+        std::fs::write(&big, vec![b'a'; (MAX_IMPORT_BYTES + 1) as usize]).unwrap();
+        let err = import_file(big.to_str().unwrap(), None).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+
+        let binary = s.path("bin.md");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00, 0x41]).unwrap();
+        let err = import_file(binary.to_str().unwrap(), None).unwrap_err();
+        assert!(err.contains("UTF-8"), "{err}");
+
+        let missing = s.path("nope.md");
+        assert!(import_file(missing.to_str().unwrap(), None).is_err());
+    }
+
+    #[test]
+    fn import_candidates_are_the_users_own_files_not_ours() {
+        let s = Scratch::new();
+        let home = s.path("home");
+        // Claude Code: an owned-file target; the rules dir holds our file (excluded), a sibling
+        // the user wrote (included), and a non-markdown file (excluded). Plus ~/.claude/CLAUDE.md.
+        let rules_dir = home.join(".claude").join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(rules_dir.join("toolport-rules.md"), "ours").unwrap();
+        std::fs::write(rules_dir.join("toolport-team-rules.md"), "org").unwrap();
+        std::fs::write(rules_dir.join("style.md"), "mine").unwrap();
+        std::fs::write(rules_dir.join("notes.txt"), "not rules").unwrap();
+        std::fs::write(home.join(".claude").join("CLAUDE.md"), "memory").unwrap();
+        // Codex: a sentinel target that exists; Gemini + Antigravity share one file; a
+        // sentinel target that does not exist yet; an empty file; an unsupported client.
+        let agents = s.path("AGENTS.md");
+        std::fs::write(&agents, "codex rules").unwrap();
+        let gemini = s.path("GEMINI.md");
+        std::fs::write(&gemini, "gemini rules").unwrap();
+        let empty = s.path("empty.md");
+        std::fs::write(&empty, "").unwrap();
+        let installed = vec![
+            client("claude-code", Some(owned(rules_dir.join("toolport-rules.md")))),
+            client("codex", Some(sentinel(agents.clone()))),
+            client("gemini-cli", Some(sentinel(gemini.clone()))),
+            client("antigravity", Some(sentinel(gemini.clone()))),
+            client("goose", Some(sentinel(s.path("missing/.goosehints")))),
+            client("pi", Some(sentinel(empty))),
+            client("cursor", None),
+        ];
+        let found = import_candidates_for(&installed, Some(&home));
+        let paths: Vec<(&str, String)> = found
+            .iter()
+            .map(|c| (c.client_id.as_str(), c.path.clone()))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("claude-code", home.join(".claude").join("CLAUDE.md").to_string_lossy().to_string()),
+                ("claude-code", rules_dir.join("style.md").to_string_lossy().to_string()),
+                ("codex", agents.to_string_lossy().to_string()),
+                ("gemini-cli", gemini.to_string_lossy().to_string()),
+            ],
+            "ours excluded, non-md excluded, shared file once, missing and empty skipped"
+        );
+        assert!(found.iter().all(|c| c.bytes > 0));
     }
 
     // ---- registry-level set management (no filesystem) ----

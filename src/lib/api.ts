@@ -22,6 +22,8 @@ import type {
   ProbeResult,
   Registry,
   RoutineSuggestion,
+  RulesImportCandidate,
+  RulesImportedFile,
   RulesPreview,
   RulesView,
   SavingsSummary,
@@ -640,6 +642,25 @@ export function rulesProjectPreview(
   key: string,
 ): Promise<RulesPreview | null> {
   return invoke<RulesPreview | null>("rules_project_preview", { id, key });
+}
+
+/** Rules files the detected clients already have, for "Start from a file". Read-only. */
+export function rulesImportCandidates(): Promise<RulesImportCandidate[]> {
+  return invoke<RulesImportCandidate[]>("rules_import_candidates");
+}
+
+/**
+ * Read one file as the seed for a new set. Read-only: nothing is saved and the file is left as it
+ * was; the caller puts the text in the editor for the user to review and save.
+ */
+export function rulesImportFile(
+  path: string,
+  clientName?: string,
+): Promise<RulesImportedFile> {
+  return invoke<RulesImportedFile>("rules_import_file", {
+    path,
+    clientName: clientName ?? null,
+  });
 }
 
 export interface TeamPushPreview {

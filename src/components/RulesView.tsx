@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { Eye, FileText, FolderPlus, Plus, RefreshCw, X } from "lucide-react";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { Eye, FileText, FileUp, FolderPlus, Plus, RefreshCw, X } from "lucide-react";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Callout } from "@/components/Callout";
@@ -10,6 +10,8 @@ import {
   rulesApply,
   rulesApplyClient,
   rulesDeleteSet,
+  rulesImportCandidates,
+  rulesImportFile,
   rulesPreview,
   rulesProjectAdd,
   rulesProjectApply,
@@ -26,6 +28,7 @@ import { forgetRulesDraft, getRulesDraft, setRulesDraft } from "@/lib/rulesDraft
 import { lineDiff } from "@/lib/lineDiff";
 import type {
   InstructionsApplyState,
+  RulesImportCandidate,
   RulesPreview,
   RulesProjectFileStatus,
   RulesProjectStatus,
@@ -45,6 +48,10 @@ const PREVIEW_BLOCKED_REASON: Partial<Record<InstructionsApplyState, string>> = 
   error: "the file could not be read or written, so it was left untouched.",
 };
 const BLOCKING_STATES = new Set(Object.keys(PREVIEW_BLOCKED_REASON));
+function formatBytes(n: number): string {
+  return n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`;
+}
+
 const RESERVED_MARKERS = [
   "<!-- toolport:rules:start",
   "<!-- toolport:rules:end -->",
@@ -90,6 +97,12 @@ export function RulesView() {
     clientName: string;
     onDisk: string;
   } | null>(null);
+
+  // "Start from a file" (SBS-1035). `null` = panel closed; `candidates: null` = still looking.
+  const [importing, setImporting] = useState<{
+    candidates: RulesImportCandidate[] | null;
+  } | null>(null);
+  const [importNote, setImportNote] = useState<string | null>(null);
 
   /**
    * The preview card renders after the clients list, so on a window too short to reach it the
@@ -301,7 +314,7 @@ export function RulesView() {
 
   async function addProject() {
     try {
-      const picked = await openDialog({
+      const picked = await openFileDialog({
         directory: true,
         multiple: false,
         title: "Choose a project folder",
@@ -323,6 +336,69 @@ export function RulesView() {
       setError(String(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  /**
+   * Start a new set from a rules file already on disk (SBS-1035). Opens a panel listing the
+   * files the detected clients already read - the user's own text, which is almost always where
+   * their rules live before Toolport - plus a picker for anything else.
+   */
+  async function openImport() {
+    setError(null);
+    setImportNote(null);
+    setImporting({ candidates: null });
+    try {
+      setImporting({ candidates: await rulesImportCandidates() });
+    } catch (e) {
+      setImporting(null);
+      setError(String(e));
+    }
+  }
+
+  /**
+   * Import one file as a NEW set. The file is read and never written. The set is created with
+   * the file's text and is NOT selected: selecting a set applies it to every switched-on
+   * client, and that is the user's call to make with the new chip in front of them, not a side
+   * effect of importing. (Creating it empty and selecting it, to land the text as a draft,
+   * would have applied an EMPTY set first and wiped those clients' files.) The backend selects
+   * the new set only when nothing else was selected, the same rule New set follows.
+   */
+  async function importFrom(path: string, clientName?: string) {
+    setImporting(null);
+    let note: string | null = null;
+    const known = new Set((data?.sets ?? []).map((s) => s.id));
+    await run(async () => {
+      await flushDraft();
+      const imported = await rulesImportFile(path, clientName);
+      const created = await rulesSaveSet(imported.name, imported.content);
+      // A set id can be reused after a delete ("Imported from Codex" again), and a draft held
+      // for the deleted one would otherwise be restored over the imported text.
+      const fresh = created.sets.find((s) => !known.has(s.id));
+      if (fresh) forgetRulesDraft(fresh.id);
+      const nowActive = created.activeSetId !== data?.activeSetId;
+      note =
+        (imported.strippedOurs
+          ? `Created "${imported.name}" from your own text in ${imported.path}; the block Toolport had written there was left out. `
+          : `Created "${imported.name}" from ${imported.path}. `) +
+        (nowActive
+          ? "It is now your applied set. The file itself was not changed."
+          : "Pick it above to edit and apply it. The file itself was not changed.");
+      return created;
+    }, true);
+    setImportNote(note);
+  }
+
+  async function importFromPicker() {
+    try {
+      const picked = await openFileDialog({
+        multiple: false,
+        directory: false,
+        title: "Choose a rules file",
+      });
+      if (typeof picked === "string") await importFrom(picked);
+    } catch (e) {
+      setError(`Couldn't open the file picker: ${e}`);
     }
   }
 
@@ -442,7 +518,75 @@ export function RulesView() {
             <Plus className="size-3.5" />
             New set
           </Button>
+          <Button variant="outline" size="sm" disabled={busy} onClick={openImport}>
+            <FileUp className="size-3.5" />
+            Start from a file
+          </Button>
         </div>
+
+        {importing && (
+          <div className="mb-3 rounded-lg border bg-muted/20 p-3 text-xs">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <span className="font-medium text-foreground">
+                Start a new set from a file
+              </span>
+              <button
+                type="button"
+                className="text-muted-foreground hover:text-foreground"
+                onClick={() => setImporting(null)}
+              >
+                Close
+              </button>
+            </div>
+            <p className="mb-2 text-muted-foreground">
+              Toolport reads the file and creates a new set from your text. Anything
+              Toolport itself wrote into the file is left out, and the file is not
+              changed. Nothing is applied until you pick the new set.
+            </p>
+            {importing.candidates === null ? (
+              <p className="mb-2 text-muted-foreground">Looking for rules files…</p>
+            ) : importing.candidates.length === 0 ? (
+              <p className="mb-2 text-muted-foreground">
+                No rules files found for the detected clients.
+              </p>
+            ) : (
+              <ul className="mb-2 grid gap-1">
+                {importing.candidates.map((c) => (
+                  <li key={c.path}>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => importFrom(c.path, c.clientName)}
+                      className="flex w-full items-center justify-between gap-3 rounded-md border px-2 py-1 text-left transition-colors hover:bg-accent disabled:opacity-50"
+                    >
+                      <span className="truncate">
+                        <span className="text-foreground">{c.clientName}</span>{" "}
+                        <span className="font-mono text-muted-foreground">{c.path}</span>
+                      </span>
+                      <span className="shrink-0 text-muted-foreground">
+                        {formatBytes(c.bytes)}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={busy}
+              onClick={importFromPicker}
+            >
+              Choose a file…
+            </Button>
+          </div>
+        )}
+
+        {importNote && (
+          <Callout variant="info" className="mb-3 text-xs">
+            {importNote}
+          </Callout>
+        )}
 
         {active ? (
           <>
@@ -488,7 +632,8 @@ export function RulesView() {
           </p>
         ) : (
           <p className="text-sm text-muted-foreground">
-            No rule set yet. Create one and it applies to the clients you switch on below.
+            No rule set yet. Create one, or start from a rules file you already have, and
+            it applies to the clients you switch on below.
           </p>
         )}
       </div>
