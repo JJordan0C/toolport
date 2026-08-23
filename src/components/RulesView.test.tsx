@@ -214,7 +214,7 @@ describe("RulesView", () => {
     expect(api.rulesSetActive).toHaveBeenCalledWith("personal");
   });
 
-  it("starts a new set from an existing rules file as an unsaved draft", async () => {
+  it("starts a new set from an existing rules file without selecting (and so applying) it", async () => {
     api.rulesImportCandidates.mockResolvedValue([
       {
         clientId: "codex",
@@ -232,11 +232,10 @@ describe("RulesView", () => {
     const withNew = view({
       sets: [
         { id: "work", name: "Work", content: "Always run tests.", revision: 2 },
-        { id: "imp", name: "Imported from Codex", content: "", revision: 1 },
+        { id: "imp", name: "Imported from Codex", content: "Be terse.", revision: 1 },
       ],
     });
     api.rulesSaveSet.mockResolvedValue(withNew);
-    api.rulesSetActive.mockResolvedValue({ ...withNew, activeSetId: "imp" });
 
     render(<RulesView />);
     await screen.findByLabelText("Rules");
@@ -248,18 +247,22 @@ describe("RulesView", () => {
     expect(screen.getByText(/the file is not\s+changed/)).toBeInTheDocument();
     await userEvent.click(candidate);
 
-    // The text is in the editor, on the new set, UNSAVED: the set was created empty and the
-    // imported text is the draft, so nothing reached a client yet.
-    await waitFor(() => expect(screen.getByLabelText("Rules")).toHaveValue("Be terse."));
-    expect(screen.getByLabelText("Rule set name")).toHaveValue("Imported from Codex");
+    // The set is created WITH the text and not selected: selecting applies, and that is the
+    // user's call. The editor still shows the set that was active; the new chip is there.
+    await waitFor(() =>
+      expect(api.rulesSaveSet).toHaveBeenCalledWith("Imported from Codex", "Be terse."),
+    );
     expect(api.rulesImportFile).toHaveBeenCalledWith("/home/a/.codex/AGENTS.md", "Codex");
-    expect(api.rulesSaveSet).toHaveBeenCalledWith("Imported from Codex", "");
-    expect(api.rulesSetActive).toHaveBeenCalledWith("imp");
-    expect(screen.getByRole("button", { name: "Save and apply" })).toBeEnabled();
-    // It says what happened, including that Toolport's own block was left out.
+    expect(api.rulesSetActive).not.toHaveBeenCalled();
+    expect(
+      await screen.findByRole("button", { name: "Imported from Codex" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Rules")).toHaveValue("Always run tests.");
+    // It says what happened: Toolport's own block was left out, and nothing applied yet.
     expect(
       screen.getByText(/block Toolport had written there was left out/),
     ).toBeInTheDocument();
+    expect(screen.getByText(/Pick it above to edit and apply it/)).toBeInTheDocument();
     expect(dialog.open).not.toHaveBeenCalled();
   });
 

@@ -279,27 +279,29 @@ export function RulesView() {
   }
 
   /**
-   * Import one file as a NEW set. The file is read and never written; its text lands in the
-   * editor as an UNSAVED draft on a fresh set, so nothing reaches any client until the user has
-   * looked at it and pressed Save and apply. Same create-then-select shape as `newSet`; the
-   * text rides in as that set's held draft so the reseat restores it instead of the empty
-   * content the set was created with.
+   * Import one file as a NEW set. The file is read and never written. The set is created with
+   * the file's text and is NOT selected: selecting a set applies it to every switched-on
+   * client, and that is the user's call to make with the new chip in front of them, not a side
+   * effect of importing. (Creating it empty and selecting it, to land the text as a draft,
+   * would have applied an EMPTY set first and wiped those clients' files.) The backend selects
+   * the new set only when nothing else was selected, the same rule New set follows.
    */
   async function importFrom(path: string, clientName?: string) {
-    const known = new Set((data?.sets ?? []).map((s) => s.id));
     setImporting(null);
     let note: string | null = null;
     await run(async () => {
       await flushDraft();
       const imported = await rulesImportFile(path, clientName);
-      const created = await rulesSaveSet(imported.name, "");
-      const fresh = created.sets.find((s) => !known.has(s.id));
-      if (!fresh) return created;
-      setRulesDraft(fresh.id, { name: imported.name, content: imported.content });
-      note = imported.strippedOurs
-        ? `Imported your own text from ${imported.path}; the block Toolport had written there was left out. The file itself was not changed. Review, then Save and apply.`
-        : `Imported ${imported.path}. The file itself was not changed. Review, then Save and apply.`;
-      return rulesSetActive(fresh.id);
+      const created = await rulesSaveSet(imported.name, imported.content);
+      const nowActive = created.activeSetId !== data?.activeSetId;
+      note =
+        (imported.strippedOurs
+          ? `Created "${imported.name}" from your own text in ${imported.path}; the block Toolport had written there was left out. `
+          : `Created "${imported.name}" from ${imported.path}. `) +
+        (nowActive
+          ? "It is now your applied set. The file itself was not changed."
+          : "Pick it above to edit and apply it. The file itself was not changed.");
+      return created;
     }, true);
     setImportNote(note);
   }
@@ -453,9 +455,9 @@ export function RulesView() {
               </button>
             </div>
             <p className="mb-2 text-muted-foreground">
-              Toolport reads the file and puts your text in the editor as a new, unsaved
-              set. Anything Toolport itself wrote into the file is left out, and the file
-              is not changed. Review, then Save and apply.
+              Toolport reads the file and creates a new set from your text. Anything
+              Toolport itself wrote into the file is left out, and the file is not
+              changed. Nothing is applied until you pick the new set.
             </p>
             {importing.candidates === null ? (
               <p className="mb-2 text-muted-foreground">Looking for rules files…</p>

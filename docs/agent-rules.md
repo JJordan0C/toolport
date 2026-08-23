@@ -42,8 +42,10 @@ Most people already have rules somewhere before they open this tab: a `~/.claude
 a `~/.codex/AGENTS.md`, a `GEMINI.md`, a `.goosehints`. **Start from a file** (next to
 **New set**) lists the rules files the detected clients already read, with their sizes, and
 offers a file picker for anything else. Picking one creates a new set named after the client
-("Imported from Codex") and puts the file's text in the editor as an **unsaved** draft, so you
-can look it over before **Save and apply** sends it anywhere.
+("Imported from Codex") from the file's text. The new set is **not** selected for you -
+selecting a set applies it to every client you have switched on, and that is your call to
+make with the new set in front of you - unless no set was selected at all, in which case it
+becomes the applied set, as any first set does.
 
 Two rules, both of them about not surprising you:
 
