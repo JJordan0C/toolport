@@ -30,6 +30,19 @@ Entries before the rename below shipped under the project's former name, Conduit
   the descriptor and `registry.json` alike, and can switch human approval off directly;
   that is a sandboxing question (SBS-185), not an authentication one.
 
+- **Teams: a member's consent to a review server no longer follows the server's id
+  when its command changes.** Team servers that run a local command or point at a LAN
+  address arrive off and stay off until the member reviews and enables them; that
+  enablement was carried across syncs by id alone, so an org config that kept the id
+  and swapped the command re-enabled the new command with no re-consent, and a public
+  remote server that had been auto-enabled (no member action at all) became a local
+  command that ran on the next gateway start. Consent is now bound to what the member
+  enabled - transport, command, args, env keys, cwd, url - and is carried over only
+  when the new entry matches; a changed definition arrives off and is counted in the
+  "needs review" notice, which now counts only the servers that are actually off rather
+  than every review server including the ones already consented to. A rename or a tool
+  allow-list change does not re-prompt. (SBS-1017)
+
 ## [1.16.0] - 2026-08-22
 
 ### Fixed
