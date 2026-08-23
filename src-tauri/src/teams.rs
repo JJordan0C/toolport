@@ -991,19 +991,24 @@ fn apply_instructions_to(
         .iter()
         .map(|target| target.path.to_string_lossy().to_string())
         .collect();
+    // With no content desired, nothing of ours belongs on disk, so EVERY recorded path is
+    // obsolete - not only the ones whose client disappeared. A path on this record whose
+    // file still carries a block (one adopted from a lost race, SBS-914) is otherwise
+    // "still current" here and never looked at again.
     let obsolete: Vec<&String> = prev_targets
         .iter()
-        .filter(|old| !target_paths.iter().any(|current| current == *old))
+        .filter(|old| desired.is_none() || !target_paths.iter().any(|current| current == *old))
         .collect();
     if content_unchanged && !needs_apply {
         if obsolete.is_empty() {
             return; // content unchanged and every target is still where we left it
         }
-        // Only the target set changed. Clean up paths for clients that disappeared without
+        // Only the target set changed (or nothing is wanted any more). Clean up without
         // rewriting still-current files or advancing their marker to an unrelated config version.
         let mut retained = Vec::new();
         for old in prev_targets {
-            let still_current = target_paths.iter().any(|current| current == &old);
+            let still_current =
+                desired.is_some() && target_paths.iter().any(|current| current == &old);
             if still_current
                 || !instructions::remove_recorded(
                     std::path::Path::new(&old),
@@ -1074,6 +1079,33 @@ fn apply_instructions_to(
     let new_content = desired.map(str::to_string);
     let mut recorded_targets = written.clone();
     recorded_targets.extend(keep);
+    record_applied_instructions(team_id, new_content, version, recorded_targets, &written);
+}
+
+/// Persist the outcome of one apply: the content+version watermark and the recorded set, by
+/// compare-and-set on `team_id`. When the set loses - the team changed or was cleared while
+/// the files were being written - the files just written have no record that would ever
+/// clean them, and the answer used to be to delete them on the spot. That was the wrong
+/// repair (SBS-914): a winner that switched teams wrote ITS block to those same paths, under
+/// the same markers, so `remove_recorded` there strips the winner's block; and if the
+/// winner's own write had failed, it strips the only good block while the UI reports the
+/// new config. So instead:
+///
+/// * a team is still connected -> hand the paths to ITS record. Its next reconcile sees a
+///   path whose content is not its own as Stale and rewrites it - or, if it wants no content
+///   at all, cleans every recorded path - which is exactly the reconciliation the record
+///   exists to drive. Nothing is deleted here.
+/// * no team remains (a disconnect won) -> an empty file is the correct end state, and
+///   removing our block is what disconnect does to everything it had on record. Only here
+///   is removal right, because only here is nothing left that could want the block.
+fn record_applied_instructions(
+    team_id: &str,
+    new_content: Option<String>,
+    version: i64,
+    recorded_targets: Vec<String>,
+    written: &[String],
+) {
+    use crate::instructions;
     let recorded = crate::registry::update(|reg| {
         if let Some(t) = reg.team.as_mut() {
             if t.team_id == team_id {
@@ -1085,8 +1117,27 @@ fn apply_instructions_to(
         }
         Ok(false)
     });
-    if !matches!(recorded, Ok((_, true))) {
-        for path in &written {
+    if matches!(recorded, Ok((_, true))) {
+        return;
+    }
+    // Adopt into whichever team is connected, content or not. A winner still mid-connect has
+    // content None for a moment and fills it right after, so "no content" cannot be read as
+    // "will never reconcile"; instead `apply_instructions_to` cleans EVERY recorded path when
+    // no content is desired, so an adopted block under a content-less team is removed on that
+    // team's next pass rather than carried forever.
+    let adopted = crate::registry::update(|reg| {
+        if let Some(t) = reg.team.as_mut() {
+            for path in written {
+                if !t.team_instructions_targets.contains(path) {
+                    t.team_instructions_targets.push(path.clone());
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    });
+    if !matches!(adopted, Ok((_, true))) {
+        for path in written {
             let _ = instructions::remove_recorded(
                 std::path::Path::new(path),
                 instructions::Scope::Team,
@@ -1443,17 +1494,23 @@ pub fn disconnect() -> Result<(), String> {
     // Capture the recorded instructions files before clearing the connection, so we can delete
     // them AFTER the registry lock releases (FS side-effects on external client files don't
     // belong inside the lock — same discipline as the writer and `report_usage`).
-    let instr_targets = crate::registry::load()
-        .ok()
-        .and_then(|r| r.team)
-        .map(|t| t.team_instructions_targets)
-        .unwrap_or_default();
-    crate::registry::update(|reg| {
+    // Captured INSIDE the update that clears the connection, not by a separate load before
+    // it: a lost-race adoption (`record_applied_instructions`) can append a path to the record
+    // between a load and the clear, and a list read before it would not have that path, so
+    // the block it names would survive the disconnect with nothing left that would ever clean
+    // it. Under the lock the adoption either landed already (and is in this list) or sees no
+    // team and removes its own block.
+    let (_, instr_targets) = crate::registry::update(|reg| {
+        let targets = reg
+            .team
+            .as_ref()
+            .map(|t| t.team_instructions_targets.clone())
+            .unwrap_or_default();
         if let Some(conn) = reg.team.clone() {
             remove_team(reg, &conn.team_id);
         }
         reg.team = None;
-        Ok(())
+        Ok(targets)
     })?;
     for path in &instr_targets {
         // Leaving the team clears the record either way, so there is nothing to carry a failure
@@ -2474,6 +2531,99 @@ mod tests {
         let (_, _, recorded) = loaded_instructions();
         assert!(!path.exists(), "the repaired recorded path should be cleaned");
         assert!(recorded.is_empty(), "a successful retry may forget the path");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// SBS-914: losing the compare-and-set must not delete what we wrote. A team switch that
+    /// won the race gets the paths on its own record and reconciles them; only a disconnect
+    /// (no team left) makes an empty file the right end state.
+    #[test]
+    fn a_lost_record_race_hands_written_paths_to_the_winner_instead_of_deleting_them() {
+        use crate::instructions::{self, ApplyState, Scope, Strategy, Target};
+
+        let _env = crate::clients::env_test_lock();
+        let _dirs = crate::registry::data_dir_test_lock();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-sbs914-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data = crate::registry::DataDirOverride::set(scratch.join("data"));
+        let path = scratch.join("AGENTS.md");
+        let key = path.to_string_lossy().to_string();
+        let target = Target {
+            path: path.clone(),
+            strategy: Strategy::SentinelBlock,
+            scope: Scope::Team,
+            char_cap: None,
+            blocked_if_present: None,
+        };
+        // `connect` gives the team instruction content (the realistic winner of a switch);
+        // `team_c` below is the content-less case.
+        let connect = |team: &str| {
+            let content = if team == "team_c" { Value::Null } else { json!(format!("{team}'s rules")) };
+            let conn: TeamConnection = serde_json::from_value(json!({
+                "serverUrl": "https://teams.example.com",
+                "teamId": team,
+                "role": "member",
+                "teamInstructionsContent": content,
+            }))
+            .unwrap();
+            crate::registry::update(|reg| {
+                reg.team = Some(conn);
+                Ok(())
+            })
+            .unwrap();
+        };
+
+        // The loser (team_a) finished writing; by the time it records, team_b has won.
+        assert_eq!(instructions::write_target(&target, "team_a", 3, "a's rules"), ApplyState::Applied);
+        connect("team_b");
+        record_applied_instructions("team_a", Some("a's rules".into()), 3, vec![key.clone()], &[key.clone()]);
+        assert!(
+            instructions::is_present(&path, Scope::Team),
+            "the block is left for the winner to reconcile, not deleted"
+        );
+        let (content, _, recorded) = loaded_instructions();
+        assert_eq!(content.as_deref(), Some("team_b's rules"), "the loser's watermark is not written over the winner's");
+        assert_eq!(recorded, vec![key.clone()], "the winner's record now owns the path");
+        // The winner's next apply sees the path as Stale for its own content and rewrites it.
+        assert_eq!(
+            instructions::current_state(&target, "team_b", 1, "b's rules"),
+            ApplyState::Stale
+        );
+
+        // A winner with NO instruction content (mid-connect, or org instructions off) still
+        // adopts the path - it may be about to fill content in - and its own next apply with
+        // nothing desired cleans every recorded path, so the block does not linger.
+        assert_eq!(instructions::write_target(&target, "team_a", 3, "a's rules"), ApplyState::Applied);
+        connect("team_c");
+        record_applied_instructions("team_a", Some("a's rules".into()), 3, vec![key.clone()], &[key.clone()]);
+        assert!(path.exists(), "adoption never deletes");
+        let (_, _, recorded) = loaded_instructions();
+        assert_eq!(recorded, vec![key.clone()], "the content-less winner now owns the path");
+        apply_instructions_to("team_c", 1, None, &[target.clone()]);
+        assert!(!path.exists(), "the winner's no-content pass cleans the adopted block");
+        let (_, _, recorded) = loaded_instructions();
+        assert!(recorded.is_empty());
+
+        // A disconnect that won leaves no team: nothing could want the block, so it goes.
+        assert_eq!(instructions::write_target(&target, "team_a", 4, "a's rules"), ApplyState::Applied);
+        crate::registry::update(|reg| {
+            reg.team = None;
+            Ok(())
+        })
+        .unwrap();
+        record_applied_instructions("team_a", Some("a's rules".into()), 4, vec![key.clone()], &[key.clone()]);
+        assert!(!path.exists(), "with no team left, our block (and the file we created) is removed");
+
+        // The ordinary case: the set holds and everything is recorded as before.
+        assert_eq!(instructions::write_target(&target, "team_a", 5, "a's rules"), ApplyState::Applied);
+        connect("team_a");
+        record_applied_instructions("team_a", Some("a's rules".into()), 5, vec![key.clone()], &[key.clone()]);
+        let (content, version, recorded) = loaded_instructions();
+        assert_eq!(content.as_deref(), Some("a's rules"));
+        assert_eq!(version, 5);
+        assert_eq!(recorded, vec![key]);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
