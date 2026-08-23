@@ -288,15 +288,18 @@ describe("RulesView", () => {
     );
     api.rulesApplyClient.mockResolvedValue(view());
     render(<RulesView />);
-    await screen.findByLabelText("Rules");
+    const editor = await screen.findByLabelText("Rules");
+    // An unsaved content edit must NOT be saved (and so applied everywhere) by this.
+    await userEvent.type(editor, " Unsaved.");
     await userEvent.click(screen.getByRole("button", { name: "View diff" }));
     await userEvent.click(screen.getByRole("button", { name: "Overwrite this file" }));
     await waitFor(() => expect(api.rulesApplyClient).toHaveBeenCalledWith("codex"));
     expect(api.rulesApply).not.toHaveBeenCalled();
-    // The refreshed view says Applied and the diff card is gone.
+    expect(api.rulesSaveSet).not.toHaveBeenCalled();
+    expect(editor).toHaveValue("Always run tests. Unsaved.");
+    // The refreshed view says Applied and the diff card is gone; the draft survived.
     expect(await screen.findByText("Applied")).toBeInTheDocument();
     expect(screen.queryByText("Edited on disk: Codex")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Rules")).toHaveValue("Always run tests.");
   });
 
   it("creating a set switches to it, so the editor is not still on the old one", async () => {

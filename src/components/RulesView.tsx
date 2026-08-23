@@ -605,10 +605,14 @@ export function RulesView() {
               variant="outline"
               size="sm"
               disabled={busy}
-              title="Rewrite only this client's file from the set; other clients are left as they are"
+              title="Rewrite only this client's file from the set as saved; other clients and your unsaved edits are left as they are"
               onClick={() => {
+                // Not through `act`: that would save the draft first, and a saved content
+                // change reconcile-writes a new revision to EVERY client, which is the
+                // opposite of what "this file" promises. The overwrite uses the set as saved;
+                // the draft stays in the editor.
                 const id = drift.clientId;
-                void act(() => rulesApplyClient(id));
+                void run(() => rulesApplyClient(id), true);
               }}
             >
               <RefreshCw className="size-3.5" />
