@@ -3193,6 +3193,63 @@ async fn rules_apply_client(client_id: String) -> Result<rules::RulesView, Strin
         .map_err(|e| e.to_string())?
 }
 
+// ---- Project-level rules (SBS-1037). Registered folders only; written only by the explicit
+// Apply below, never at startup. ----
+
+#[tauri::command]
+async fn rules_project_add(path: String) -> Result<rules::RulesView, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::project_add(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn rules_project_remove(id: String) -> Result<rules::RulesView, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::project_remove(&id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn rules_project_set_set(
+    id: String,
+    set_id: Option<String>,
+) -> Result<rules::RulesView, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::project_set_set(&id, set_id.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn rules_project_set_file_enabled(
+    id: String,
+    key: String,
+    enabled: bool,
+) -> Result<rules::RulesView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        rules::project_set_file_enabled(&id, &key, enabled)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn rules_project_apply(id: String) -> Result<rules::RulesView, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::project_apply(&id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn rules_project_preview(
+    id: String,
+    key: String,
+) -> Result<Option<rules::RulesPreview>, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::project_preview(&id, &key))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Rules files the detected clients already have, for "Start from a file" (SBS-1035). Read-only.
 #[tauri::command]
 async fn rules_import_candidates() -> Result<Vec<rules::ImportCandidate>, String> {
@@ -5461,6 +5518,12 @@ pub fn run() {
             rules_preview,
             rules_apply,
             rules_apply_client,
+            rules_project_add,
+            rules_project_remove,
+            rules_project_set_set,
+            rules_project_set_file_enabled,
+            rules_project_apply,
+            rules_project_preview,
             rules_import_candidates,
             rules_import_file,
             hooks_view,

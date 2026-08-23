@@ -21,7 +21,7 @@
 //!     file. Same contract as `teams::apply_instructions_to`.
 
 use crate::instructions::{self, ApplyState, Scope, Strategy, Target};
-use crate::registry::RuleSet;
+use crate::registry::{RuleSet, RulesProject};
 use serde::{Deserialize, Serialize};
 
 /// One client's row in the Rules view: whether it is opted in, where its rules file is, and what
@@ -52,6 +52,9 @@ pub struct RulesView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_set_id: Option<String>,
     pub clients: Vec<ClientStatus>,
+    /// Registered project folders and their per-file state (SBS-1037).
+    #[serde(default)]
+    pub projects: Vec<ProjectStatus>,
 }
 
 /// A dry run of one client's write, so the user sees the exact bytes before the first apply
@@ -167,13 +170,17 @@ fn status_from(
 /// The whole Rules view. Read-only; scans every installed client's rules file, so callers run it
 /// off the UI thread.
 pub fn view() -> Result<RulesView, String> {
+    view_with(&installed_targets())
+}
+
+fn view_with(installed: &[ClientTarget]) -> Result<RulesView, String> {
     let reg = crate::registry::load()?;
-    let installed = installed_targets();
     let set = reg.active_rule_set().cloned();
     Ok(RulesView {
-        clients: status_from(&reg, &installed, set.as_ref()),
+        clients: status_from(&reg, installed, set.as_ref()),
         sets: reg.rule_sets.clone(),
         active_set_id: reg.active_rule_set_id.clone(),
+        projects: project_statuses(&reg, installed),
     })
 }
 
@@ -319,6 +326,7 @@ fn apply_to(installed: &[ClientTarget], mode: ApplyMode) -> Result<RulesView, St
         clients: status_from(&reg, installed, set.as_ref()),
         sets: reg.rule_sets.clone(),
         active_set_id: reg.active_rule_set_id.clone(),
+        projects: project_statuses(&reg, installed),
     })
 }
 
@@ -413,8 +421,32 @@ pub fn save_set(id: Option<&str>, name: &str, content: &str) -> Result<RulesView
 /// Delete a set, then apply. Deleting the active set clears the selection, so the apply that
 /// follows removes every file we wrote.
 pub fn delete_set(id: &str) -> Result<RulesView, String> {
+    // A project that applied this set loses it: its files are cleaned up like a remove, and the
+    // project stays registered with no set, so the user sees what happened rather than a
+    // dangling pointer to a set that no longer exists.
+    let orphaned: Vec<RulesProject> = crate::registry::load()?
+        .rules_projects
+        .into_iter()
+        .filter(|p| p.set_id.as_deref() == Some(id))
+        .collect();
+    // A path that could not be cleaned stays on the project's record, exactly as in
+    // project_remove: cleanup is driven by that record, so dropping it would strand the block.
+    let leftovers: Vec<(String, Vec<String>)> = orphaned
+        .iter()
+        .map(|p| (p.id.clone(), clean_project_targets(&p.targets, &[])))
+        .collect();
     crate::registry::update(|reg| {
         reg.remove_rule_set(id);
+        for p in reg.rules_projects.iter_mut() {
+            if p.set_id.as_deref() == Some(id) {
+                p.set_id = None;
+                p.targets = leftovers
+                    .iter()
+                    .find(|(pid, _)| pid == &p.id)
+                    .map(|(_, t)| t.clone())
+                    .unwrap_or_default();
+            }
+        }
         Ok(())
     })?;
     apply()
@@ -436,6 +468,427 @@ pub fn set_client_enabled(client_id: &str, enabled: bool) -> Result<RulesView, S
         Ok(())
     })?;
     apply()
+}
+
+
+// ---------------------------------------------------------------------------------------
+// Project-level rules (SBS-1037)
+// ---------------------------------------------------------------------------------------
+//
+// Global rules go into each client's home-directory file. Project rules go into the user's
+// REPOSITORIES, which is a different consent question, so the model is deliberately narrower:
+// a folder is only ever one the user registered (nothing is scanned for); inside it the unit
+// of consent is a file, switched on per project; a file is written only by an explicit Apply
+// for that project, never at startup; and Toolport writes only its own marked block or its
+// own owned file, with the same writer and markers as everywhere else.
+//
+// Why files and not clients: at project level nearly every client reads the root `AGENTS.md`
+// (Codex, Cursor, Copilot, Roo, Cline, Kiro, Goose, Devin, Pi, Oh My Pi), Gemini CLI and
+// Antigravity read `GEMINI.md`, and Claude Code and VS Code read `.claude/rules/`. Offering a
+// dozen client checkboxes that collapse onto one file would be theatre; the file IS the
+// decision, and each one names the clients it reaches. Each mapping is cited in
+// docs/agent-rules.md. Zed is left out on purpose: it reads only the FIRST of `.rules`,
+// `.cursorrules`, `.windsurfrules`, `.clinerules`, `.github/copilot-instructions.md`,
+// `AGENT.md`, `AGENTS.md`, ..., so whether it would read our block depends on files Toolport
+// cannot see into, and Applied could be false.
+
+/// One file Toolport can write inside a registered project folder, and the clients that read
+/// it there (by client id, as `crate::clients::detect_clients` names them).
+pub struct ProjectFile {
+    pub key: &'static str,
+    /// Path relative to the project root, forward slashes.
+    pub rel: &'static str,
+    pub strategy: Strategy,
+    pub clients: &'static [&'static str],
+}
+
+pub const PROJECT_FILES: &[ProjectFile] = &[
+    ProjectFile {
+        key: "agents-md",
+        rel: "AGENTS.md",
+        strategy: Strategy::SentinelBlock,
+        clients: &[
+            "codex",
+            "cursor",
+            "github-copilot-cli",
+            "kiro",
+            "roo-code",
+            "cline",
+            "windsurf",
+            "devin-cli",
+            "goose",
+            "pi",
+            "omp",
+        ],
+    },
+    ProjectFile {
+        key: "gemini-md",
+        rel: "GEMINI.md",
+        strategy: Strategy::SentinelBlock,
+        clients: &["gemini-cli", "antigravity"],
+    },
+    ProjectFile {
+        key: "claude-rules",
+        rel: ".claude/rules/toolport-rules.md",
+        strategy: Strategy::OwnedFile,
+        clients: &["claude-code", "vscode"],
+    },
+];
+
+fn project_file(key: &str) -> Option<&'static ProjectFile> {
+    PROJECT_FILES.iter().find(|f| f.key == key)
+}
+
+fn project_target(root: &std::path::Path, file: &ProjectFile) -> Target {
+    let mut path = root.to_path_buf();
+    for seg in file.rel.split('/') {
+        path.push(seg);
+    }
+    Target {
+        path,
+        strategy: file.strategy,
+        scope: Scope::Personal,
+        char_cap: None,
+        blocked_if_present: None,
+    }
+}
+
+/// One project file's row in the UI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFileStatus {
+    pub key: String,
+    pub rel_path: String,
+    pub path: String,
+    /// Display names of the DETECTED clients that read this file in a project.
+    pub clients: Vec<String>,
+    pub enabled: bool,
+    pub state: ApplyState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_disk: Option<String>,
+}
+
+/// One registered project in the UI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectStatus {
+    pub id: String,
+    pub path: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_id: Option<String>,
+    /// Only the files at least one detected client reads; nothing is offered for a client that
+    /// is not on the machine.
+    pub files: Vec<ProjectFileStatus>,
+}
+
+/// The files offered for any project on this machine: those read by at least one installed
+/// client, with the installed clients' display names.
+fn offered_project_files(
+    installed: &[ClientTarget],
+) -> Vec<(&'static ProjectFile, Vec<String>)> {
+    PROJECT_FILES
+        .iter()
+        .filter_map(|f| {
+            let names: Vec<String> = installed
+                .iter()
+                .filter(|c| f.clients.contains(&c.id.as_str()))
+                .map(|c| c.name.clone())
+                .collect();
+            (!names.is_empty()).then_some((f, names))
+        })
+        .collect()
+}
+
+fn project_statuses(
+    reg: &crate::registry::Registry,
+    installed: &[ClientTarget],
+) -> Vec<ProjectStatus> {
+    let offered = offered_project_files(installed);
+    reg.rules_projects
+        .iter()
+        .map(|p| {
+            let set = p
+                .set_id
+                .as_deref()
+                .and_then(|id| reg.rule_sets.iter().find(|s| s.id == id));
+            let root = std::path::Path::new(&p.path);
+            let files = offered
+                .iter()
+                .map(|(f, names)| {
+                    let target = project_target(root, f);
+                    let (state, on_disk) = match set {
+                        None => {
+                            if instructions::is_present(&target.path, Scope::Personal) {
+                                (ApplyState::Stale, None)
+                            } else {
+                                (ApplyState::Applied, None)
+                            }
+                        }
+                        Some(s) => {
+                            match instructions::current_state(&target, &s.id, s.revision, &s.content)
+                            {
+                                ApplyState::Stale => match instructions::drifted_body(
+                                    &target, &s.id, s.revision, &s.content,
+                                ) {
+                                    Some(body) => (ApplyState::Drifted, Some(body)),
+                                    None => (ApplyState::Stale, None),
+                                },
+                                other => (other, None),
+                            }
+                        }
+                    };
+                    ProjectFileStatus {
+                        key: f.key.to_string(),
+                        rel_path: f.rel.to_string(),
+                        path: target.path.to_string_lossy().to_string(),
+                        clients: names.clone(),
+                        enabled: p.files.get(f.key).copied().unwrap_or(false),
+                        state,
+                        on_disk,
+                    }
+                })
+                .collect();
+            ProjectStatus {
+                id: p.id.clone(),
+                path: p.path.clone(),
+                name: p.name.clone(),
+                set_id: p.set_id.clone(),
+                files,
+            }
+        })
+        .collect()
+}
+
+/// Register a folder. Writes nothing: the project appears with every file off and no set.
+pub fn project_add(path: &str) -> Result<RulesView, String> {
+    let root = std::path::Path::new(path);
+    if !root.is_absolute() {
+        return Err("Choose a folder by its full path.".to_string());
+    }
+    if !root.is_dir() {
+        return Err(format!("{path} is not a folder."));
+    }
+    let name = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("project")
+        .to_string();
+    crate::registry::update(|reg| {
+        if reg.rules_projects.iter().any(|p| p.path == path) {
+            return Err("That folder is already registered.".to_string());
+        }
+        let ids: Vec<String> = reg.rules_projects.iter().map(|p| p.id.clone()).collect();
+        let id = crate::registry::unique_id(&crate::registry::slugify(&name), &ids);
+        reg.rules_projects.push(RulesProject {
+            id,
+            path: path.to_string(),
+            name,
+            set_id: None,
+            files: std::collections::HashMap::new(),
+            targets: Vec::new(),
+        });
+        Ok(())
+    })?;
+    view()
+}
+
+/// Remove what `targets` holds of ours except the paths in `keep`. Returns the paths that could
+/// NOT be cleaned (and so must stay on record).
+fn clean_project_targets(targets: &[String], keep: &[String]) -> Vec<String> {
+    let mut uncleaned = Vec::new();
+    for t in targets {
+        if keep.contains(t) {
+            continue;
+        }
+        if !instructions::remove_recorded(std::path::Path::new(t), Scope::Personal) {
+            uncleaned.push(t.clone());
+        }
+    }
+    uncleaned
+}
+
+/// Unregister a folder, removing what Toolport wrote in it. A path that cannot be cleaned keeps
+/// the project registered with that path on record, and says so, so a retry can finish the job
+/// rather than stranding a block nothing will ever look for again.
+pub fn project_remove(id: &str) -> Result<RulesView, String> {
+    let Some(project) = crate::registry::load()?
+        .rules_projects
+        .into_iter()
+        .find(|p| p.id == id)
+    else {
+        return Err("That project is no longer registered.".to_string());
+    };
+    let uncleaned = clean_project_targets(&project.targets, &[]);
+    crate::registry::update(|reg| {
+        if uncleaned.is_empty() {
+            reg.rules_projects.retain(|p| p.id != id);
+        } else if let Some(p) = reg.rules_projects.iter_mut().find(|p| p.id == id) {
+            p.targets = uncleaned.clone();
+        }
+        Ok(())
+    })?;
+    if !uncleaned.is_empty() {
+        return Err(format!(
+            "Could not remove Toolport's block from {}. The project stays registered so you can try again.",
+            uncleaned.join(", ")
+        ));
+    }
+    view()
+}
+
+/// Pick (or clear) the set a project applies. Writes nothing; the files read Stale until Apply.
+pub fn project_set_set(id: &str, set_id: Option<&str>) -> Result<RulesView, String> {
+    crate::registry::update(|reg| {
+        if let Some(sid) = set_id {
+            if !reg.rule_sets.iter().any(|s| s.id == sid) {
+                return Err("That rule set no longer exists.".to_string());
+            }
+        }
+        let Some(p) = reg.rules_projects.iter_mut().find(|p| p.id == id) else {
+            return Err("That project is no longer registered.".to_string());
+        };
+        p.set_id = set_id.map(str::to_string);
+        Ok(())
+    })?;
+    view()
+}
+
+/// Switch one project file on (writes nothing until Apply) or off (removes that file's block or
+/// owned file now, since leaving Toolport's text in a repo the user just said no to would be the
+/// wrong default).
+pub fn project_set_file_enabled(id: &str, key: &str, enabled: bool) -> Result<RulesView, String> {
+    let Some(file) = project_file(key) else {
+        return Err(format!("Unknown project file {key}."));
+    };
+    let project = crate::registry::load()?
+        .rules_projects
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| "That project is no longer registered.".to_string())?;
+    let path = project_target(std::path::Path::new(&project.path), file)
+        .path
+        .to_string_lossy()
+        .to_string();
+    let mut still_recorded = project.targets.clone();
+    if !enabled && project.targets.contains(&path) {
+        if instructions::remove_recorded(std::path::Path::new(&path), Scope::Personal) {
+            still_recorded.retain(|t| t != &path);
+        } else {
+            // Switching off means "Toolport's block is gone from this file". If it is not,
+            // say so and leave the file switched ON, so the row keeps showing the real state
+            // and the user can retry; an unchecked box over a block still in the repo would
+            // be the lie project_remove and delete_set already refuse to tell.
+            return Err(format!(
+                "Could not remove Toolport's block from {path}. The file stays switched on so you can try again."
+            ));
+        }
+    }
+    crate::registry::update(|reg| {
+        let Some(p) = reg.rules_projects.iter_mut().find(|p| p.id == id) else {
+            return Err("That project is no longer registered.".to_string());
+        };
+        p.files.insert(key.to_string(), enabled);
+        p.targets = still_recorded.clone();
+        Ok(())
+    })?;
+    view()
+}
+
+/// The explicit Apply for one project. This is the ONLY path that writes a project file;
+/// startup never does.
+pub fn project_apply(id: &str) -> Result<RulesView, String> {
+    apply_project_with(id, &installed_targets())
+}
+
+/// Write every switched-on file from the project's set, clean up anything recorded that is no
+/// longer wanted, and record what is now ours. A file the user edited on disk since the last
+/// apply is rewritten here: Apply is the user asking for exactly that, and the row showed
+/// "Edited on disk" first.
+fn apply_project_with(id: &str, installed: &[ClientTarget]) -> Result<RulesView, String> {
+    let reg = crate::registry::load()?;
+    let Some(project) = reg.rules_projects.iter().find(|p| p.id == id) else {
+        return Err("That project is no longer registered.".to_string());
+    };
+    let Some(set) = project
+        .set_id
+        .as_deref()
+        .and_then(|sid| reg.rule_sets.iter().find(|s| s.id == sid))
+    else {
+        return Err("Pick a rule set for this project first.".to_string());
+    };
+    let root = std::path::Path::new(&project.path);
+    if !root.is_dir() {
+        return Err(format!("{} is not a folder any more.", project.path));
+    }
+    let desired: Vec<(String, Target)> = offered_project_files(installed)
+        .into_iter()
+        .filter(|(f, _)| project.files.get(f.key).copied().unwrap_or(false))
+        .map(|(f, _)| {
+            let t = project_target(root, f);
+            (t.path.to_string_lossy().to_string(), t)
+        })
+        .collect();
+    let mut written = Vec::new();
+    let mut refused = Vec::new();
+    for (key, target) in &desired {
+        match instructions::write_target(target, &set.id, set.revision, &set.content) {
+            ApplyState::Applied => written.push(key.clone()),
+            state => refused.push((key.clone(), state)),
+        }
+    }
+    let desired_paths: Vec<String> = desired.iter().map(|(k, _)| k.clone()).collect();
+    let uncleaned = clean_project_targets(&project.targets, &desired_paths);
+    // What is ours on disk now: written, still-desired previous paths (a refused rewrite keeps
+    // last-good, exactly as the global apply does), and failed cleanups.
+    let mut owned = written;
+    for old in project.targets.iter().chain(uncleaned.iter()) {
+        let still_wanted = desired_paths.contains(old) || uncleaned.contains(old);
+        if still_wanted && !owned.contains(old) {
+            owned.push(old.clone());
+        }
+    }
+    crate::registry::update(|reg| {
+        if let Some(p) = reg.rules_projects.iter_mut().find(|p| p.id == id) {
+            p.targets = owned.clone();
+        }
+        Ok(())
+    })?;
+    if let Some((path, state)) = refused.first() {
+        // Report, do not hide: the view shows the state, but the button was pressed and it
+        // did not do what it said.
+        let why = match state {
+            ApplyState::Error => "it could not be read or written",
+            ApplyState::TooLong => "it would exceed the client's limit",
+            ApplyState::BlockedOverride => "a local override file shadows it",
+            _ => "it was refused",
+        };
+        return Err(format!(
+            "{path} was not written: {why}. Everything else was applied."
+        ));
+    }
+    view_with(installed)
+}
+
+/// Dry run of one project file, from the project's set. `None` when the project has no set.
+pub fn project_preview(id: &str, key: &str) -> Result<Option<RulesPreview>, String> {
+    let Some(file) = project_file(key) else {
+        return Err(format!("Unknown project file {key}."));
+    };
+    let reg = crate::registry::load()?;
+    let Some(project) = reg.rules_projects.iter().find(|p| p.id == id) else {
+        return Err("That project is no longer registered.".to_string());
+    };
+    let Some(set) = project
+        .set_id
+        .as_deref()
+        .and_then(|sid| reg.rule_sets.iter().find(|s| s.id == sid))
+    else {
+        return Ok(None);
+    };
+    let target = project_target(std::path::Path::new(&project.path), file);
+    preview_target(key, &target, set, &set.content).map(Some)
 }
 
 /// Re-assert the active set at startup. Cheap in the common case: [`instructions::write_target`]
@@ -713,6 +1166,211 @@ mod tests {
             content: content.to_string(),
             revision,
         }
+    }
+
+    // ---- project-level rules (SBS-1037) ----
+
+    fn registered(s: &Scratch, name: &str) -> String {
+        let root = s.path(name);
+        std::fs::create_dir_all(&root).unwrap();
+        root.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn project_files_are_offered_only_for_detected_clients_and_register_writes_nothing() {
+        let _dirs = crate::registry::data_dir_test_lock();
+        let s = Scratch::new();
+        let _data_dir = crate::registry::DataDirOverride::set(s.path("data"));
+        let root = registered(&s, "repo");
+        // Codex and Claude Code are installed; no Gemini. Cursor has no GLOBAL target but still
+        // reads the project AGENTS.md, so it must appear under that file.
+        let installed = vec![
+            client("codex", Some(sentinel(s.path("AGENTS.md")))),
+            client("claude-code", Some(owned(s.path("rules").join("toolport-rules.md")))),
+            client("cursor", None),
+        ];
+        crate::registry::update(|reg| reg.upsert_rule_set(None, "Work", "Be brief.").map(|_| ()))
+            .unwrap();
+        project_add(&root).unwrap();
+        let reg = crate::registry::load().unwrap();
+        assert_eq!(reg.rules_projects.len(), 1);
+        assert_eq!(reg.rules_projects[0].name, "repo");
+        assert!(reg.rules_projects[0].set_id.is_none());
+        assert!(
+            std::fs::read_dir(&root).unwrap().next().is_none(),
+            "registering writes nothing"
+        );
+
+        let statuses = project_statuses(&reg, &installed);
+        let keys: Vec<(&str, Vec<String>)> = statuses[0]
+            .files
+            .iter()
+            .map(|f| (f.key.as_str(), f.clients.clone()))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("agents-md", vec!["codex".to_string(), "cursor".to_string()]),
+                ("claude-rules", vec!["claude-code".to_string()]),
+            ],
+            "GEMINI.md is not offered with no Gemini client; Cursor rides on AGENTS.md"
+        );
+        assert!(statuses[0].files.iter().all(|f| !f.enabled));
+        // Duplicate and non-folder registrations are refused.
+        assert!(project_add(&root).is_err());
+        assert!(project_add(&s.path("nope").to_string_lossy()).is_err());
+        assert!(project_add("relative/path").is_err());
+    }
+
+    #[test]
+    fn project_apply_writes_only_switched_on_files_and_remove_cleans_them() {
+        let _dirs = crate::registry::data_dir_test_lock();
+        let s = Scratch::new();
+        let _data_dir = crate::registry::DataDirOverride::set(s.path("data"));
+        let root = registered(&s, "repo");
+        let root_path = std::path::PathBuf::from(&root);
+        const THEIRS: &str = "# Our conventions\n\nUse pnpm.\n";
+        // The user already has an AGENTS.md in the repo; it must survive byte-for-byte.
+        std::fs::write(root_path.join("AGENTS.md"), THEIRS).unwrap();
+        let installed = vec![
+            client("codex", Some(sentinel(s.path("AGENTS.md")))),
+            client("claude-code", Some(owned(s.path("rules").join("toolport-rules.md")))),
+            client("gemini-cli", Some(sentinel(s.path("GEMINI.md")))),
+        ];
+        let set_id = crate::registry::update(|reg| reg.upsert_rule_set(None, "Work", "Be brief."))
+            .unwrap()
+            .1;
+        project_add(&root).unwrap();
+        let pid = crate::registry::load().unwrap().rules_projects[0].id.clone();
+
+        // No set yet: Apply refuses rather than writing nothing silently.
+        assert!(apply_project_with(&pid, &installed)
+            .unwrap_err()
+            .contains("Pick a rule set"));
+        project_set_set(&pid, Some(&set_id)).unwrap();
+        assert!(project_set_set(&pid, Some("ghost")).is_err());
+        // Picking a set writes nothing either.
+        assert_eq!(std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(), THEIRS);
+
+        // Switch AGENTS.md on (still nothing written) and apply: the block is appended, the
+        // user's text is untouched, the other files are not created.
+        project_set_file_enabled(&pid, "agents-md", true).unwrap();
+        assert_eq!(std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(), THEIRS);
+        let view = apply_project_with(&pid, &installed).unwrap();
+        let agents = std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap();
+        assert!(agents.starts_with(THEIRS), "{agents}");
+        assert!(agents.contains("Be brief."));
+        assert!(!root_path.join("GEMINI.md").exists());
+        assert!(!root_path.join(".claude").exists());
+        let proj = view.projects.iter().find(|p| p.id == pid).unwrap();
+        let file = |k: &str| proj.files.iter().find(|f| f.key == k).unwrap().clone();
+        assert_eq!(file("agents-md").state, ApplyState::Applied);
+        assert!(file("agents-md").enabled);
+        assert_eq!(file("claude-rules").state, ApplyState::Stale, "off: not written");
+        assert_eq!(file("gemini-md").state, ApplyState::Stale);
+        let reg = crate::registry::load().unwrap();
+        assert_eq!(
+            reg.rules_projects[0].targets,
+            vec![root_path.join("AGENTS.md").to_string_lossy().to_string()]
+        );
+
+        // Switching a file OFF removes the block now; the user's text is exactly as before.
+        project_set_file_enabled(&pid, "agents-md", false).unwrap();
+        assert_eq!(std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(), THEIRS);
+        assert!(crate::registry::load().unwrap().rules_projects[0].targets.is_empty());
+
+        // A toggle-off whose cleanup fails says so and leaves the file switched on and on
+        // record, rather than showing an unchecked box over a block still in the repo.
+        project_set_file_enabled(&pid, "agents-md", true).unwrap();
+        apply_project_with(&pid, &installed).unwrap();
+        std::fs::write(
+            root_path.join("AGENTS.md"),
+            format!("{}\nunterminated", crate::instructions::PERSONAL_SENTINEL_START_PREFIX),
+        )
+        .unwrap();
+        let err = project_set_file_enabled(&pid, "agents-md", false).unwrap_err();
+        assert!(err.contains("stays switched on"), "{err}");
+        let reg = crate::registry::load().unwrap();
+        assert_eq!(reg.rules_projects[0].files.get("agents-md"), Some(&true));
+        assert_eq!(reg.rules_projects[0].targets.len(), 1);
+        // Repair the file; the retry succeeds.
+        std::fs::write(root_path.join("AGENTS.md"), THEIRS).unwrap();
+        apply_project_with(&pid, &installed).unwrap();
+        project_set_file_enabled(&pid, "agents-md", false).unwrap();
+        assert_eq!(std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(), THEIRS);
+
+        // An owned file in a nested dir is created on apply and deleted whole on remove.
+        project_set_file_enabled(&pid, "claude-rules", true).unwrap();
+        apply_project_with(&pid, &installed).unwrap();
+        let owned_path = root_path.join(".claude").join("rules").join("toolport-rules.md");
+        assert!(owned_path.exists());
+        project_remove(&pid).unwrap();
+        assert!(!owned_path.exists(), "remove cleans what was written");
+        assert_eq!(std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(), THEIRS);
+        assert!(crate::registry::load().unwrap().rules_projects.is_empty());
+    }
+
+    #[test]
+    fn deleting_a_set_a_project_used_cleans_that_project_and_startup_never_writes_projects() {
+        let _dirs = crate::registry::data_dir_test_lock();
+        let s = Scratch::new();
+        let _data_dir = crate::registry::DataDirOverride::set(s.path("data"));
+        let root = registered(&s, "repo");
+        let root_path = std::path::PathBuf::from(&root);
+        let installed = vec![client("codex", Some(sentinel(s.path("AGENTS.md"))))];
+        let set_id = crate::registry::update(|reg| reg.upsert_rule_set(None, "Work", "Be brief."))
+            .unwrap()
+            .1;
+        project_add(&root).unwrap();
+        let pid = crate::registry::load().unwrap().rules_projects[0].id.clone();
+        project_set_set(&pid, Some(&set_id)).unwrap();
+        project_set_file_enabled(&pid, "agents-md", true).unwrap();
+
+        // Startup reconciles GLOBAL rules only. A project with a set and a file switched on is
+        // left exactly as it is until its own Apply.
+        apply_on_startup();
+        assert!(
+            !root_path.join("AGENTS.md").exists(),
+            "startup must never write a project file"
+        );
+
+        apply_project_with(&pid, &installed).unwrap();
+        assert!(root_path.join("AGENTS.md").exists());
+
+        // Deleting the set the project applied removes its files and clears the pointer; the
+        // project itself stays so the user sees why it is empty.
+        delete_set(&set_id).unwrap();
+        assert!(
+            !root_path.join("AGENTS.md").exists(),
+            "a file Toolport created alone is gone"
+        );
+        let reg = crate::registry::load().unwrap();
+        assert_eq!(reg.rules_projects.len(), 1);
+        assert!(reg.rules_projects[0].set_id.is_none());
+        assert!(reg.rules_projects[0].targets.is_empty());
+
+        // A file whose block cannot be cleaned (an unterminated marker) stays on the project's
+        // record when its set is deleted, so a later remove can still try.
+        let set2 = crate::registry::update(|reg| reg.upsert_rule_set(None, "Two", "Two."))
+            .unwrap()
+            .1;
+        project_set_set(&pid, Some(&set2)).unwrap();
+        apply_project_with(&pid, &installed).unwrap();
+        let agents = root_path.join("AGENTS.md");
+        std::fs::write(
+            &agents,
+            format!("{}\nunterminated", crate::instructions::PERSONAL_SENTINEL_START_PREFIX),
+        )
+        .unwrap();
+        delete_set(&set2).unwrap();
+        let reg = crate::registry::load().unwrap();
+        assert!(reg.rules_projects[0].set_id.is_none());
+        assert_eq!(
+            reg.rules_projects[0].targets,
+            vec![agents.to_string_lossy().to_string()],
+            "the uncleanable path stays on record"
+        );
+        assert!(agents.exists());
     }
 
     // ---- import an existing file as a seed (SBS-1035) ----

@@ -601,11 +601,33 @@ export interface RulesClientStatus {
   onDisk?: string;
 }
 
+/** One file Toolport can write in a registered project folder, and its state there (SBS-1037). */
+export interface RulesProjectFileStatus {
+  key: string;
+  relPath: string;
+  path: string;
+  /** Display names of the detected clients that read this file in a project. */
+  clients: string[];
+  enabled: boolean;
+  state: InstructionsApplyState;
+  onDisk?: string;
+}
+
+/** One registered project folder for project-level rules (SBS-1037). */
+export interface RulesProjectStatus {
+  id: string;
+  path: string;
+  name: string;
+  setId?: string;
+  files: RulesProjectFileStatus[];
+}
+
 /** Everything the Rules tab renders, from one `rules_view` call. */
 export interface RulesView {
   sets: RuleSet[];
   activeSetId?: string;
   clients: RulesClientStatus[];
+  projects: RulesProjectStatus[];
 }
 
 /** A dry run of one client's write, shown before the first apply. Nothing is written to get it. */

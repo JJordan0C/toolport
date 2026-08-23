@@ -12,6 +12,12 @@ const api = vi.hoisted(() => ({
   rulesPreview: vi.fn(),
   rulesApply: vi.fn(),
   rulesApplyClient: vi.fn(),
+  rulesProjectAdd: vi.fn(),
+  rulesProjectRemove: vi.fn(),
+  rulesProjectSetSet: vi.fn(),
+  rulesProjectSetFileEnabled: vi.fn(),
+  rulesProjectApply: vi.fn(),
+  rulesProjectPreview: vi.fn(),
   rulesImportCandidates: vi.fn(),
   rulesImportFile: vi.fn(),
 }));
@@ -44,6 +50,7 @@ function view(over: Partial<RulesViewData> = {}): RulesViewData {
       },
       { id: "cursor", name: "Cursor", enabled: false, state: "unsupported" },
     ],
+    projects: [],
     ...over,
   };
 }
@@ -304,6 +311,157 @@ describe("RulesView", () => {
     // The refreshed view says Applied and the diff card is gone; the draft survived.
     expect(await screen.findByText("Applied")).toBeInTheDocument();
     expect(screen.queryByText("Edited on disk: Codex")).not.toBeInTheDocument();
+  });
+
+  it("a registered project lists its files with the clients that read them, and nothing writes until Apply", async () => {
+    const project = {
+      id: "repo",
+      path: "/home/a/code/repo",
+      name: "repo",
+      setId: "work",
+      files: [
+        {
+          key: "agents-md",
+          relPath: "AGENTS.md",
+          path: "/home/a/code/repo/AGENTS.md",
+          clients: ["Codex", "Cursor"],
+          enabled: false,
+          state: "stale" as const,
+        },
+        {
+          key: "claude-rules",
+          relPath: ".claude/rules/toolport-rules.md",
+          path: "/home/a/code/repo/.claude/rules/toolport-rules.md",
+          clients: ["Claude Code"],
+          enabled: true,
+          state: "applied" as const,
+        },
+      ],
+    };
+    api.rulesView.mockResolvedValue(view({ projects: [project] }));
+    api.rulesProjectSetFileEnabled.mockResolvedValue(view({ projects: [project] }));
+    api.rulesProjectApply.mockResolvedValue(view({ projects: [project] }));
+    api.rulesProjectSetSet.mockResolvedValue(view({ projects: [project] }));
+
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+    expect(screen.getByText("/home/a/code/repo")).toBeInTheDocument();
+    expect(screen.getByText("for Codex, Cursor")).toBeInTheDocument();
+    expect(screen.getByLabelText("Rule set for repo")).toHaveValue("work");
+    // Switching a file on is a registry change only; the call says so and nothing applies.
+    await userEvent.click(screen.getByLabelText("AGENTS.md in repo"));
+    await waitFor(() =>
+      expect(api.rulesProjectSetFileEnabled).toHaveBeenCalledWith(
+        "repo",
+        "agents-md",
+        true,
+      ),
+    );
+    expect(api.rulesProjectApply).not.toHaveBeenCalled();
+    // Apply is the explicit write, per project.
+    await userEvent.click(screen.getByRole("button", { name: "Apply to repo" }));
+    await waitFor(() => expect(api.rulesProjectApply).toHaveBeenCalledWith("repo"));
+    // Changing the set is also just a registry change.
+    await userEvent.selectOptions(screen.getByLabelText("Rule set for repo"), "");
+    await waitFor(() =>
+      expect(api.rulesProjectSetSet).toHaveBeenCalledWith("repo", undefined),
+    );
+    // The global editor was not disturbed by any of this.
+    expect(screen.getByLabelText("Rules")).toHaveValue("Always run tests.");
+  });
+
+  it("a failed action still refreshes the view, so a partial apply shows its true state", async () => {
+    const before = view({
+      projects: [
+        {
+          id: "repo",
+          path: "/home/a/code/repo",
+          name: "repo",
+          setId: "work",
+          files: [
+            {
+              key: "agents-md",
+              relPath: "AGENTS.md",
+              path: "/home/a/code/repo/AGENTS.md",
+              clients: ["Codex"],
+              enabled: true,
+              state: "stale" as const,
+            },
+          ],
+        },
+      ],
+    });
+    const after = view({
+      projects: [
+        {
+          ...before.projects[0],
+          files: [{ ...before.projects[0].files[0], state: "applied" as const }],
+        },
+      ],
+    });
+    api.rulesView.mockResolvedValueOnce(before).mockResolvedValueOnce(after);
+    api.rulesProjectApply.mockRejectedValue(
+      new Error(
+        "/home/a/code/repo/GEMINI.md was not written: it could not be read or written.",
+      ),
+    );
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+    expect(screen.getByText("Not applied yet")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Apply to repo" }));
+    // The error is shown AND the row reflects what actually happened on disk.
+    expect(await screen.findByRole("alert")).toHaveTextContent("was not written");
+    // Codex's global row was already Applied; the project row joins it after the refresh.
+    await waitFor(() => expect(screen.getAllByText("Applied")).toHaveLength(2));
+    expect(screen.queryByText("Not applied yet")).not.toBeInTheDocument();
+    expect(api.rulesView).toHaveBeenCalledTimes(2);
+  });
+
+  it("deleting a set a project uses says the project's folder is cleaned too", async () => {
+    api.rulesView.mockResolvedValue(
+      view({
+        sets: [
+          { id: "work", name: "Work", content: "Always run tests.", revision: 2 },
+          { id: "side", name: "Side", content: "Side rules.", revision: 1 },
+        ],
+        projects: [
+          {
+            id: "repo",
+            path: "/home/a/code/repo",
+            name: "repo",
+            setId: "side",
+            files: [],
+          },
+        ],
+      }),
+    );
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+    await userEvent.click(screen.getByRole("button", { name: "Delete Side" }));
+    expect(
+      screen.getByText(/also applied to the project \u201Crepo\u201D/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/This unused rule set is deleted/)).not.toBeInTheDocument();
+  });
+
+  it("adding a project goes through the folder picker and registers the picked path", async () => {
+    dialog.open.mockResolvedValue("/home/a/code/other");
+    api.rulesProjectAdd.mockResolvedValue(
+      view({
+        projects: [{ id: "other", path: "/home/a/code/other", name: "other", files: [] }],
+      }),
+    );
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+    expect(screen.getByText(/No project folders registered/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Add a project folder" }));
+    await waitFor(() =>
+      expect(api.rulesProjectAdd).toHaveBeenCalledWith("/home/a/code/other"),
+    );
+    expect(dialog.open).toHaveBeenCalledWith(
+      expect.objectContaining({ directory: true }),
+    );
+    expect(await screen.findByText("/home/a/code/other")).toBeInTheDocument();
   });
 
   it("starts a new set from an existing rules file without selecting (and so applying) it", async () => {
