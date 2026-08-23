@@ -4,6 +4,22 @@ All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 Entries before the rename below shipped under the project's former name, Conduit.
 
+## [Unreleased]
+
+### Added
+
+- **Agent rules: a block you edited by hand in a client's file is no longer silently put
+  back.** Toolport wrote its block into `AGENTS.md` (or its own file in a rules directory),
+  you tuned it there, and the next startup or the next time you toggled a client Toolport
+  rewrote it from the set with no warning. Now a block written for the current set revision
+  whose body differs on disk reads **Edited on disk** instead of "Not applied yet"; every
+  automatic apply (startup, saving, switching sets, toggling clients) leaves it alone; and the
+  row offers **View diff**, with **Pull into set** (the file's version becomes your unsaved
+  draft) and **Overwrite the file** (the set goes back over it; what **Re-apply** does too).
+  A change to the set itself is a newer revision and is written as before. Team
+  instructions are unchanged: org rules stay authoritative over a member's edit.
+  (SBS-1036)
+
 ## [1.16.0] - 2026-08-22
 
 ### Fixed

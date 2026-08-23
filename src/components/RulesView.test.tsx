@@ -210,6 +210,65 @@ describe("RulesView", () => {
     expect(api.rulesSetActive).toHaveBeenCalledWith("personal");
   });
 
+  it("a block edited on disk is reported with a diff, and Pull into set makes it the draft", async () => {
+    api.rulesView.mockResolvedValue(
+      view({
+        clients: [
+          {
+            id: "codex",
+            name: "Codex",
+            enabled: true,
+            path: "/home/a/.codex/AGENTS.md",
+            state: "drifted",
+            onDisk: "Always run tests.\nAnd lint.",
+          },
+        ],
+      }),
+    );
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+    expect(screen.getByText("Edited on disk")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "View diff" }));
+    // The card shows the set as saved against the file, line by line.
+    expect(screen.getByText("Edited on disk: Codex")).toBeInTheDocument();
+    expect(screen.getByText(/^\+ And lint\.$/)).toBeInTheDocument();
+
+    // Pull into set: the file's text becomes the unsaved draft. Nothing is written.
+    await userEvent.click(screen.getByRole("button", { name: "Pull into set" }));
+    expect(screen.getByLabelText("Rules")).toHaveValue("Always run tests.\nAnd lint.");
+    expect(screen.getByRole("button", { name: "Save and apply" })).toBeEnabled();
+    expect(api.rulesApply).not.toHaveBeenCalled();
+    expect(api.rulesSaveSet).not.toHaveBeenCalled();
+    expect(screen.queryByText("Edited on disk: Codex")).not.toBeInTheDocument();
+  });
+
+  it("Overwrite the file re-applies the set over the edited block", async () => {
+    api.rulesView.mockResolvedValue(
+      view({
+        clients: [
+          {
+            id: "codex",
+            name: "Codex",
+            enabled: true,
+            path: "/home/a/.codex/AGENTS.md",
+            state: "drifted",
+            onDisk: "Something else.",
+          },
+        ],
+      }),
+    );
+    api.rulesApply.mockResolvedValue(view());
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+    await userEvent.click(screen.getByRole("button", { name: "View diff" }));
+    await userEvent.click(screen.getByRole("button", { name: "Overwrite the file" }));
+    await waitFor(() => expect(api.rulesApply).toHaveBeenCalledTimes(1));
+    // The refreshed view says Applied and the diff card is gone.
+    expect(await screen.findByText("Applied")).toBeInTheDocument();
+    expect(screen.queryByText("Edited on disk: Codex")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Rules")).toHaveValue("Always run tests.");
+  });
+
   it("creating a set switches to it, so the editor is not still on the old one", async () => {
     // The backend only auto-activates a new set when nothing else is active, so without an
     // explicit select this button would look like it did nothing.

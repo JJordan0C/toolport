@@ -38,6 +38,10 @@ pub struct ClientStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub state: ApplyState,
+    /// When `state` is [`ApplyState::Drifted`]: the body as it is on disk right now, so the UI
+    /// can show the difference and offer to pull it into the set. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_disk: Option<String>,
 }
 
 /// Everything the Rules view needs, in one round trip.
@@ -117,20 +121,33 @@ fn status_from(
     installed
         .iter()
         .map(|c| {
-            let state = match (&c.target, set) {
-                (None, _) => ApplyState::Unsupported,
+            let (state, on_disk) = match (&c.target, set) {
+                (None, _) => (ApplyState::Unsupported, None),
                 // No active set: the desired end state is "nothing of ours on disk", so the
                 // question is presence, not content. Reporting Applied unconditionally here hid a
                 // cleanup that failed — the block was still sitting in the file while the row
                 // said "up to date".
                 (Some(t), None) => {
                     if instructions::is_present(&t.path, Scope::Personal) {
-                        ApplyState::Stale
+                        (ApplyState::Stale, None)
                     } else {
-                        ApplyState::Applied
+                        (ApplyState::Applied, None)
                     }
                 }
-                (Some(t), Some(s)) => instructions::current_state(t, &s.id, s.revision, &s.content),
+                (Some(t), Some(s)) => {
+                    match instructions::current_state(t, &s.id, s.revision, &s.content) {
+                        // Stale covers both "not written yet" and "written, then changed by
+                        // hand". Only the second is drift, and only drift carries a body worth
+                        // showing (SBS-1036).
+                        ApplyState::Stale => {
+                            match instructions::drifted_body(t, &s.id, s.revision, &s.content) {
+                                Some(body) => (ApplyState::Drifted, Some(body)),
+                                None => (ApplyState::Stale, None),
+                            }
+                        }
+                        other => (other, None),
+                    }
+                }
             };
             ClientStatus {
                 id: c.id.clone(),
@@ -141,6 +158,7 @@ fn status_from(
                     .as_ref()
                     .map(|t| t.path.to_string_lossy().to_string()),
                 state,
+                on_disk,
             }
         })
         .collect()
@@ -166,13 +184,36 @@ pub fn view() -> Result<RulesView, String> {
 /// client that reports anything other than [`ApplyState::Applied`] is simply not recorded, so the
 /// next pass tries it again.
 pub fn apply() -> Result<RulesView, String> {
+    apply_with(ApplyMode::Reconcile)
+}
+
+/// The explicit "Re-apply" / "Overwrite": make every opted-in client's file match the active set,
+/// including a block the user edited by hand on disk. The one apply that is allowed to put
+/// Toolport's text back over a [`ApplyState::Drifted`] block, because the user asked for exactly
+/// that with the diff in front of them.
+pub fn apply_overwriting_drift() -> Result<RulesView, String> {
+    apply_with(ApplyMode::Overwrite)
+}
+
+/// Whether an apply may rewrite a block the user has edited on disk since Toolport wrote it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyMode {
+    /// Write what is missing or behind the set; leave a hand-edited current-revision block as
+    /// it is and report it [`ApplyState::Drifted`]. What every automatic path uses: startup,
+    /// saving the set, switching sets, toggling a client.
+    Reconcile,
+    /// Write everything that differs from the set, drift included.
+    Overwrite,
+}
+
+fn apply_with(mode: ApplyMode) -> Result<RulesView, String> {
     let installed = installed_targets();
-    apply_to(&installed)
+    apply_to(&installed, mode)
 }
 
 /// [`apply`] over an explicit client/target set, so tests drive a known set of files instead of
 /// the developer's real machine.
-fn apply_to(installed: &[ClientTarget]) -> Result<RulesView, String> {
+fn apply_to(installed: &[ClientTarget], mode: ApplyMode) -> Result<RulesView, String> {
     // Hold the registry's cross-process lock from the ONE authoritative load through every file
     // write/cleanup and the rules_targets save. Rule mutations also use this lock, so an older
     // apply cannot write stale bytes after a newer set wins, and a placeholder/default snapshot
@@ -196,8 +237,17 @@ fn apply_to(installed: &[ClientTarget]) -> Result<RulesView, String> {
         };
 
         let mut written: Vec<String> = Vec::new();
+        // Hand-edited current-revision blocks a reconcile left alone. They are still ours on
+        // disk, so they stay on record like a successful write would.
+        let mut left_drifted: Vec<String> = Vec::new();
         if let Some(s) = set.as_ref() {
             for target in &targets {
+                if mode == ApplyMode::Reconcile
+                    && instructions::drifted_body(target, &s.id, s.revision, &s.content).is_some()
+                {
+                    left_drifted.push(target.path.to_string_lossy().to_string());
+                    continue;
+                }
                 if instructions::write_target(target, &s.id, s.revision, &s.content)
                     == ApplyState::Applied
                 {
@@ -222,7 +272,11 @@ fn apply_to(installed: &[ClientTarget]) -> Result<RulesView, String> {
         // What we now own on disk: successful writes, still-desired previous good files, and
         // failed cleanups. Every path remains discoverable for a later reconciliation.
         let mut owned = written;
-        for old in prev_targets.iter().chain(uncleaned.iter()) {
+        for old in prev_targets
+            .iter()
+            .chain(uncleaned.iter())
+            .chain(left_drifted.iter())
+        {
             let still_wanted = desired.iter().any(|d| d == old) || uncleaned.contains(old);
             if still_wanted && !owned.contains(old) {
                 owned.push(old.clone());
@@ -695,7 +749,7 @@ mod tests {
             Ok(())
         })
         .expect("seed the registry");
-        apply_to(installed).expect("apply")
+        apply_to(installed, ApplyMode::Reconcile).expect("apply")
     }
 
     #[test]
@@ -736,6 +790,70 @@ mod tests {
         assert_eq!(by_id("cursor").state, ApplyState::Unsupported);
     }
 
+    /// SBS-1036: a block the user edited on disk after Toolport wrote it is reported, not
+    /// silently reverted. Only the explicit Overwrite puts the set's text back.
+    #[test]
+    fn a_hand_edited_block_is_reported_as_drift_and_only_overwrite_reverts_it() {
+        let _dirs = crate::registry::data_dir_test_lock();
+        let s = Scratch::new();
+        let _data_dir = crate::registry::DataDirOverride::set(s.path("data"));
+        let codex = client("codex", Some(sentinel(s.path("AGENTS.md"))));
+        let claude = client(
+            "claude-code",
+            Some(owned(s.path("rules").join(Scope::Personal.owned_file_name()))),
+        );
+        let installed = vec![codex.clone(), claude.clone()];
+        seed_and_apply("Be brief.", &["codex", "claude-code"], &installed);
+        let codex_path = codex.target.clone().unwrap().path;
+        let claude_path = claude.target.clone().unwrap().path;
+
+        // The user tunes both files by hand, inside what Toolport wrote.
+        for path in [&codex_path, &claude_path] {
+            let text = std::fs::read_to_string(path).unwrap();
+            std::fs::write(path, text.replace("Be brief.", "Be brief. And kind.")).unwrap();
+        }
+        let edited_codex = std::fs::read_to_string(&codex_path).unwrap();
+        let edited_claude = std::fs::read_to_string(&claude_path).unwrap();
+
+        // A reconcile (startup, a toggle, a save that did not change content) leaves both alone
+        // and reports them, body included, so the UI can show the difference.
+        let view = apply_to(&installed, ApplyMode::Reconcile).unwrap();
+        assert_eq!(std::fs::read_to_string(&codex_path).unwrap(), edited_codex);
+        assert_eq!(std::fs::read_to_string(&claude_path).unwrap(), edited_claude);
+        let by_id = |v: &RulesView, id: &str| v.clients.iter().find(|c| c.id == id).unwrap().clone();
+        for id in ["codex", "claude-code"] {
+            let row = by_id(&view, id);
+            assert_eq!(row.state, ApplyState::Drifted, "{id}");
+            assert_eq!(row.on_disk.as_deref(), Some("Be brief. And kind."), "{id}");
+        }
+        let reg = crate::registry::load().unwrap();
+        assert_eq!(reg.rules_targets.len(), 2, "drifted files stay on record");
+
+        // A change to the SET is a newer revision: the user moved the source of truth, and the
+        // reconcile writes it (the hand edit goes; the UI offered Pull first).
+        let view = seed_and_apply("Be brief. Always.", &[], &installed);
+        assert!(std::fs::read_to_string(&codex_path).unwrap().contains("Be brief. Always."));
+        assert_eq!(by_id(&view, "codex").state, ApplyState::Applied);
+
+        // Drift again, then the explicit Overwrite reverts it.
+        let text = std::fs::read_to_string(&codex_path).unwrap();
+        std::fs::write(&codex_path, text.replace("Always.", "Never.")).unwrap();
+        assert_eq!(
+            by_id(&apply_to(&installed, ApplyMode::Reconcile).unwrap(), "codex").state,
+            ApplyState::Drifted
+        );
+        let view = apply_to(&installed, ApplyMode::Overwrite).unwrap();
+        assert!(std::fs::read_to_string(&codex_path).unwrap().contains("Be brief. Always."));
+        assert_eq!(by_id(&view, "codex").state, ApplyState::Applied);
+        assert_eq!(by_id(&view, "codex").on_disk, None);
+
+        // An absent block is plain Stale and a reconcile writes it.
+        std::fs::remove_file(&codex_path).unwrap();
+        let view = apply_to(&installed, ApplyMode::Reconcile).unwrap();
+        assert!(codex_path.exists());
+        assert_eq!(by_id(&view, "codex").state, ApplyState::Applied);
+    }
+
     #[test]
     fn opting_a_client_out_removes_only_that_clients_file() {
         let _dirs = crate::registry::data_dir_test_lock();
@@ -761,7 +879,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        apply_to(&installed).unwrap();
+        apply_to(&installed, ApplyMode::Reconcile).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&codex_path).unwrap(),
@@ -803,7 +921,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let view = apply_to(&installed).unwrap();
+        let view = apply_to(&installed, ApplyMode::Reconcile).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -981,7 +1099,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        apply_to(&installed).unwrap();
+        apply_to(&installed, ApplyMode::Reconcile).unwrap();
 
         assert_eq!(
             crate::registry::load().unwrap().rules_targets,
@@ -1020,7 +1138,7 @@ mod tests {
         .unwrap();
         std::fs::write(data.join("registry.json"), "{ not json").unwrap();
 
-        let error = apply_to(&[]).expect_err("backup recovery must refuse filesystem changes");
+        let error = apply_to(&[], ApplyMode::Reconcile).expect_err("backup recovery must refuse filesystem changes");
 
         assert!(error.contains("not authoritative"), "unexpected error: {error}");
         assert_eq!(
@@ -1059,7 +1177,7 @@ mod tests {
                         Ok(())
                     })
                     .unwrap();
-                    apply_to(&installed).unwrap();
+                    apply_to(&installed, ApplyMode::Reconcile).unwrap();
                 });
                 scope.spawn(|| {
                     crate::registry::update(|reg| {
@@ -1067,7 +1185,7 @@ mod tests {
                         Ok(())
                     })
                     .unwrap();
-                    apply_to(&installed).unwrap();
+                    apply_to(&installed, ApplyMode::Reconcile).unwrap();
                 });
             });
 
@@ -1108,7 +1226,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        apply_to(&installed).unwrap();
+        apply_to(&installed, ApplyMode::Reconcile).unwrap();
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains("Rules B."));
         assert!(!after.contains("Rules A."), "the old set's span is replaced, not appended to");
@@ -1124,7 +1242,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let view = apply_to(&installed).unwrap();
+        let view = apply_to(&installed, ApplyMode::Reconcile).unwrap();
         assert!(!path.exists(), "a file that held only our block is removed");
         let reg = crate::registry::load().unwrap();
         assert!(reg.rules_targets.is_empty(), "nothing left to clean up");

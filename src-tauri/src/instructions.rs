@@ -92,6 +92,14 @@ pub enum ApplyState {
     /// written, drifted, or hand-edited. Distinct from `Applied` so the coverage panel shows a
     /// truthful "not covered" for a client added after the last write (see [`current_state`]).
     Stale,
+    /// Toolport wrote this block for exactly the current set revision, and the body has since
+    /// been changed on disk by someone else. Personal rules only ([`current_state`] never
+    /// returns it; `rules::status_from` refines `Stale` into it via [`drifted_body`]): a
+    /// reconcile leaves such a block alone rather than silently putting Toolport's text back
+    /// over an edit the user made in the client's file, until they pull the edit into the set
+    /// or explicitly overwrite it (SBS-1036). Team instructions keep treating the same
+    /// situation as `Stale`, because org rules are authoritative over a member's edit.
+    Drifted,
 }
 
 /// One client's reported state, for the apply-status receipt (spec W5).
@@ -450,6 +458,35 @@ pub fn write_target(t: &Target, id: &str, version: i64, content: &str) -> ApplyS
         Ok(()) => ApplyState::Applied,
         Err(_) => ApplyState::Error,
     }
+}
+
+/// The hand-edited body, when `t.path` carries this scope's artifact for exactly `id` at
+/// exactly `version` but with a body that is not `content`. That combination means Toolport
+/// wrote this block for the current revision and something else changed it since: drift, as
+/// opposed to a block for an older revision (an unapplied set change, which apply should
+/// write) or no block at all. `None` for absent, another id/version, identical, or unreadable.
+pub fn drifted_body(t: &Target, id: &str, version: i64, content: &str) -> Option<String> {
+    let existing = read_existing(&t.path).ok()?;
+    let want = content.trim_end_matches('\n');
+    let body = match t.strategy {
+        Strategy::OwnedFile => {
+            let rest = existing.strip_prefix(&t.scope.owned_header(id, version))?;
+            rest.strip_prefix("\n\n")
+                .or_else(|| rest.strip_prefix('\n'))
+                .unwrap_or(rest)
+                .trim_end_matches('\n')
+                .to_string()
+        }
+        Strategy::SentinelBlock => {
+            let (start, end) = find_block(&existing, t.scope)?;
+            let rest = existing[start..end].strip_prefix(&t.scope.start_marker(id, version))?;
+            let rest = rest.strip_prefix('\n').unwrap_or(rest);
+            rest.strip_suffix(t.scope.sentinel_end())?
+                .trim_end_matches('\n')
+                .to_string()
+        }
+    };
+    (body != want).then_some(body)
 }
 
 /// Read-only: what state IS this client's rules file in right now, relative to the current
@@ -1188,6 +1225,45 @@ mod tests {
             blocked_if_present: Some(shadow),
         };
         assert_eq!(current_state(&shadowed, TEAM, 1, "c"), ApplyState::BlockedOverride);
+    }
+
+    /// SBS-1036: drift is "our block, our id, our version, not our body". Everything else is
+    /// somebody else's business or an ordinary stale write.
+    #[test]
+    fn drifted_body_is_only_a_hand_edit_of_the_current_revision() {
+        let s = Scratch::new();
+        let personal = Scope::Personal;
+        // Sentinel: write v2, then edit the body by hand inside the markers.
+        let block = block_target(s.path("AGENTS.md"), personal);
+        std::fs::write(&block.path, "# mine\n").unwrap();
+        assert_eq!(write_target(&block, "set", 2, "Be brief."), ApplyState::Applied);
+        assert_eq!(drifted_body(&block, "set", 2, "Be brief."), None, "identical is not drift");
+        let on_disk = std::fs::read_to_string(&block.path).unwrap();
+        std::fs::write(&block.path, on_disk.replace("Be brief.", "Be brief.\nAnd kind.")).unwrap();
+        assert_eq!(
+            drifted_body(&block, "set", 2, "Be brief.").as_deref(),
+            Some("Be brief.\nAnd kind.")
+        );
+        assert_eq!(current_state(&block, "set", 2, "Be brief."), ApplyState::Stale);
+        // The same file seen from a newer revision of the set is an unapplied change, not drift.
+        assert_eq!(drifted_body(&block, "set", 3, "Be brief."), None);
+        // And from another set it is that set's stale write.
+        assert_eq!(drifted_body(&block, "other", 2, "Be brief."), None);
+        // No block at all is not drift.
+        std::fs::write(&block.path, "# mine\n").unwrap();
+        assert_eq!(drifted_body(&block, "set", 2, "Be brief."), None);
+
+        // Owned file: same rules, body is everything under the header.
+        let owned = owned_target(s.path("toolport-rules.md"), personal);
+        assert_eq!(write_target(&owned, "set", 1, "Run tests.\n"), ApplyState::Applied);
+        assert_eq!(drifted_body(&owned, "set", 1, "Run tests."), None);
+        let on_disk = std::fs::read_to_string(&owned.path).unwrap();
+        std::fs::write(&owned.path, on_disk.replace("Run tests.", "Run tests twice.")).unwrap();
+        assert_eq!(drifted_body(&owned, "set", 1, "Run tests.").as_deref(), Some("Run tests twice."));
+        assert_eq!(drifted_body(&owned, "set", 2, "Run tests."), None, "newer revision: stale, not drift");
+        // A file that is not ours at all (no header) is not drift either.
+        std::fs::write(&owned.path, "somebody else's file\n").unwrap();
+        assert_eq!(drifted_body(&owned, "set", 1, "Run tests."), None);
     }
 
     #[test]

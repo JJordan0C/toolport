@@ -3184,10 +3184,12 @@ async fn rules_preview(
         .map_err(|e| e.to_string())?
 }
 
-/// Re-apply the active set. Used by the "Apply" button and after a client is connected.
+/// The explicit Re-apply / Overwrite button: make every opted-in client's file match the active
+/// set, including a block the user edited on disk (SBS-1036). Every automatic path reconciles
+/// instead and leaves such a block alone.
 #[tauri::command]
 async fn rules_apply() -> Result<rules::RulesView, String> {
-    tauri::async_runtime::spawn_blocking(rules::apply)
+    tauri::async_runtime::spawn_blocking(rules::apply_overwriting_drift)
         .await
         .map_err(|e| e.to_string())?
 }
