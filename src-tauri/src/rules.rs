@@ -473,19 +473,27 @@ fn import_candidates_for(
 /// one whose remainder still carries a marker lookalike (which `save_set` would refuse anyway;
 /// better to say so before the editor fills with it).
 pub fn import_file(path: &str, client_name: Option<&str>) -> Result<ImportedRules, String> {
+    use std::io::Read;
     let p = std::path::Path::new(path);
-    let meta = std::fs::metadata(p).map_err(|e| format!("Could not read {path}: {e}"))?;
+    // One handle for the check and the read, so a file swapped between the two cannot get a
+    // larger body past the size limit; and the read itself is bounded regardless.
+    let mut file = std::fs::File::open(p).map_err(|e| format!("Could not read {path}: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("Could not read {path}: {e}"))?;
     if !meta.is_file() {
         return Err(format!("{path} is not a file."));
     }
-    if meta.len() > MAX_IMPORT_BYTES {
+    let mut raw = Vec::new();
+    file.by_ref()
+        .take(MAX_IMPORT_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("Could not read {path}: {e}"))?;
+    if raw.len() as u64 > MAX_IMPORT_BYTES {
         return Err(format!(
-            "{path} is {} bytes, which is too large to be a rules file (limit {} bytes).",
-            meta.len(),
-            MAX_IMPORT_BYTES
+            "{path} is larger than {MAX_IMPORT_BYTES} bytes, which is too large to be a rules file."
         ));
     }
-    let raw = std::fs::read(p).map_err(|e| format!("Could not read {path}: {e}"))?;
     let text = String::from_utf8(raw)
         .map_err(|_| format!("{path} is not UTF-8 text, so it cannot be imported as rules."))?;
     let (content, stripped_ours) = strip_toolport_artifacts(&text);
@@ -515,10 +523,13 @@ pub fn import_file(path: &str, client_name: Option<&str>) -> Result<ImportedRule
 /// remainder); otherwise every block of either scope is cut out in place. Surrounding blank
 /// lines are trimmed because this seeds an editor, not a file.
 fn strip_toolport_artifacts(text: &str) -> (String, bool) {
-    if instructions::ALL_SCOPES
-        .iter()
-        .any(|s| text.trim_start().starts_with(s.owned_header_prefix()))
-    {
+    // An owned file of ours opens with a complete one-line header comment. Only that exact
+    // shape counts; a line that merely starts like the header (a lookalike, or a truncated
+    // copy) is the user's text and is kept rather than silently dropped as "ours".
+    let first_line = text.trim_start().lines().next().unwrap_or("");
+    if instructions::ALL_SCOPES.iter().any(|s| {
+        first_line.starts_with(s.owned_header_prefix()) && first_line.trim_end().ends_with("-->")
+    }) {
         return (String::new(), true);
     }
     let mut out = text.to_string();
@@ -667,6 +678,13 @@ mod tests {
         let imported = import_file(path.to_str().unwrap(), Some("Claude Code")).unwrap();
         assert_eq!(imported.content, "");
         assert!(imported.stripped_ours, "an owned file is entirely Toolport's");
+
+        // A line that only LOOKS like the header is the user's text, not ours.
+        let lookalike = s.path("lookalike.md");
+        std::fs::write(&lookalike, format!("{} but not really\nrules\n", Scope::Team.owned_header_prefix())).unwrap();
+        let imported = import_file(lookalike.to_str().unwrap(), None).unwrap();
+        assert!(imported.content.contains("but not really"), "{}", imported.content);
+        assert!(!imported.stripped_ours);
 
         // A file with nothing of ours in it imports verbatim (trimmed) and says so.
         let theirs = s.path("CLAUDE.md");
