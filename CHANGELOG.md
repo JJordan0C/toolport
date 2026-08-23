@@ -6,6 +6,53 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Security
+
+- **A process that bound the approval broker's endpoint after the app had gone could
+  approve gated calls in its place, and be handed the arguments first.** The gateway
+  dialed whatever `approval-endpoint.json` named and believed whatever came back. The
+  descriptor survives a crash or a force-kill, and nothing authenticated the peer that
+  answered: the literal bytes `"approved"` were a complete decision. Because the
+  request is written before the reply is read, such a peer also received the call's
+  real arguments, including the rehydrated values behind a PII release. The gateway now
+  opens every dial with a random challenge that the broker must answer with an
+  HMAC-SHA256 proof of the shared token, and sends nothing until the proof checks out;
+  a peer that cannot read the owner-only descriptor cannot produce it, so it sees no
+  request and its answer is never read. The failure is reported as `unreachable`, so a
+  restarted app is still found on the re-read, and it is still fail-closed. On Unix the
+  broker also listens on a socket file in a `0700` directory under the data dir, which
+  a current gateway prefers, so such a peer cannot even connect on that path; the
+  loopback listener stays (and is all there is on Windows), and the challenge protects
+  both the same way. A gateway from before this change still reads only the loopback
+  address, still reaches the broker, and is still answered. (SBS-867)
+
+  What this does not claim: a process running as the same user as Toolport can read
+  the descriptor and `registry.json` alike, and can switch human approval off directly;
+  that is a sandboxing question (SBS-185), not an authentication one.
+
+- **Teams: a member's consent to a review server no longer follows the server's id
+  when its command changes.** Team servers that run a local command or point at a LAN
+  address arrive off and stay off until the member reviews and enables them; that
+  enablement was carried across syncs by id alone, so an org config that kept the id
+  and swapped the command re-enabled the new command with no re-consent, and a public
+  remote server that had been auto-enabled (no member action at all) became a local
+  command that ran on the next gateway start. Consent is now bound to what the member
+  enabled - transport, command, args, env keys, cwd, url - and is carried over only
+  when the new entry matches; a changed definition arrives off and is counted in the
+  "needs review" notice, which now counts only the servers that are actually off rather
+  than every review server including the ones already consented to. A rename or a tool
+  allow-list change does not re-prompt. (SBS-1017)
+
+- **A form elicitation relayed from an MCP server now says which server is asking.**
+  When a server asks the user for input (MCP elicitation in form mode, whether as a
+  modern `input_required` result or a legacy server-initiated request), the client
+  renders it in the same chrome as Toolport's own approval prompts, so a server-authored
+  "your session expired, re-enter your token" was indistinguishable from a genuine one.
+  Toolport now appends `Toolport source: the "<server>" MCP server (not Toolport)` to the
+  message, the form-mode counterpart of the verified `Toolport destination:` line URL
+  mode already carried; a server that pre-writes that line to name itself as something
+  else has it replaced. (SBS-891)
+
 ### Added
 
 - **Agent rules: start a new set from a rules file you already have.** The tab opened on an
@@ -19,6 +66,20 @@ Entries before the rename below shipped under the project's former name, Conduit
   written into it is left out and the import says so, and a remainder that still looks like
   Toolport's markers is refused up front. See
   [docs/agent-rules.md](docs/agent-rules.md#starting-from-an-existing-file). (SBS-1035)
+
+### Fixed
+
+- **Team Instructions: losing a write race no longer deletes the winner's block.** When
+  the team changed or was cleared while an apply was writing its files, the apply that
+  lost the compare-and-set removed every file it had just written. If the apply that won
+  had written its own block to those same paths (same markers), the loser stripped it;
+  if the winner's write had failed, the loser stripped the only good block while the UI
+  reported the new config. The lost apply now hands its written paths to whichever team
+  is connected, whose next reconcile sees them as stale and rewrites them; only when no
+  team remains at all (a disconnect won) is the block removed, which is what disconnect
+  does to everything it has on record anyway. The other half of this ticket - a path
+  whose cleanup failed being dropped from the record and stranded - was already fixed
+  alongside SBS-917. (SBS-914)
 
 ## [1.16.0] - 2026-08-22
 
