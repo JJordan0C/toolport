@@ -599,6 +599,30 @@ pub struct RuleSet {
     pub revision: i64,
 }
 
+/// One registered project folder for project-level agent rules (SBS-1037). The consent unit
+/// inside it is a FILE, not a client: at project level nearly every client reads the root
+/// `AGENTS.md`, Gemini reads `GEMINI.md`, Claude Code and VS Code read `.claude/rules/`, so
+/// `files` maps each of those (by `rules::PROJECT_FILES` key) to whether the user switched it
+/// on. Off means never written.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RulesProject {
+    pub id: String,
+    /// Absolute path of the folder, as the user picked it.
+    pub path: String,
+    /// Display name; defaults to the folder name.
+    pub name: String,
+    /// The rule set applied to this project, if any. Independent of the global active set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_id: Option<String>,
+    /// Per-file opt-in, keyed by `rules::PROJECT_FILES` key. Absent means off.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub files: HashMap<String, bool>,
+    /// Absolute paths this project's applies have written, so removal touches exactly those.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
+}
+
 /// Maps a project folder to a profile, so the gateway can auto-scope a client to the right
 /// server set based on the working directory (MCP `root`) it reports, instead of a manual
 /// profile switch. A client whose reported root is `path` or a descendant of it resolves to
@@ -928,6 +952,11 @@ pub struct Registry {
     /// Same role as `TeamConnection::team_instructions_targets`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules_targets: Vec<String>,
+    /// Project folders the user registered for project-level agent rules (SBS-1037). Nothing
+    /// is ever discovered: a folder is here because the user added it, and its files are
+    /// written only by an explicit Apply for that project, never at startup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules_projects: Vec<RulesProject>,
     /// Whether the native-agent hook sensor is installed. OFF until the user opts in:
     /// it writes into a settings file they own and it observes every native tool call
     /// their agent makes. See [`crate::hooks`].
@@ -1198,6 +1227,7 @@ impl Default for Registry {
             active_rule_set_id: None,
             rules_clients: HashMap::new(),
             rules_targets: Vec::new(),
+            rules_projects: Vec::new(),
             hooks_enabled: false,
             hook_targets: Vec::new(),
             unknown_fields: serde_json::Map::new(),
@@ -1205,7 +1235,7 @@ impl Default for Registry {
     }
 }
 
-fn slugify(s: &str) -> String {
+pub(crate) fn slugify(s: &str) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
     for c in s.chars() {

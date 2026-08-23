@@ -8,6 +8,21 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Added
 
+- **Agent rules: apply a rule set inside a project folder.** A new Projects section
+  registers a folder you choose (Toolport never scans for repositories) and applies a set to
+  the files the repo's clients read there: the root `AGENTS.md` (Codex, Cursor, Copilot CLI,
+  Kiro, Roo Code, Cline, Devin, Goose, Pi, Oh My Pi), `GEMINI.md` (Gemini CLI, Antigravity)
+  and `.claude/rules/toolport-rules.md` (Claude Code, VS Code), each offered only when a
+  detected client reads it and each naming the clients it reaches. Files are switched on per
+  project and written only by that project's own **Apply**, never at startup; switching a
+  file off or removing the project removes what Toolport wrote; your repo's own text is left
+  byte-for-byte; a per-file Preview shows the exact bytes first. This is what brings Cursor
+  and GitHub Copilot into agent rules, which have no user-level file Toolport could write.
+  Zed is left out on purpose (it reads only the first of nine candidate files, so Toolport
+  could not honestly report Applied). See
+  [docs/agent-rules.md](docs/agent-rules.md#project-level-rules) for the per-client
+  citations. (SBS-1037)
+
 - **Agent rules: a block you edited by hand in a client's file is no longer silently put
   back.** Toolport wrote its block into `AGENTS.md` (or its own file in a rules directory),
   you tuned it there, and the next startup or the next time you toggled a client Toolport

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { Eye, FileText, Plus, RefreshCw, X } from "lucide-react";
+import { Eye, FileText, FolderPlus, Plus, RefreshCw, X } from "lucide-react";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Callout } from "@/components/Callout";
@@ -10,6 +11,12 @@ import {
   rulesApplyClient,
   rulesDeleteSet,
   rulesPreview,
+  rulesProjectAdd,
+  rulesProjectApply,
+  rulesProjectPreview,
+  rulesProjectRemove,
+  rulesProjectSetFileEnabled,
+  rulesProjectSetSet,
   rulesSaveSet,
   rulesSetActive,
   rulesSetClientEnabled,
@@ -20,6 +27,8 @@ import { lineDiff } from "@/lib/lineDiff";
 import type {
   InstructionsApplyState,
   RulesPreview,
+  RulesProjectFileStatus,
+  RulesProjectStatus,
   RulesView as RulesViewData,
 } from "@/lib/types";
 
@@ -69,9 +78,12 @@ export function RulesView() {
   const [draftName, setDraftName] = useState("");
 
   const [preview, setPreview] = useState<RulesPreview | null>(null);
+  // Set alongside `preview` when it is a PROJECT file's dry run, which has no client to name.
+  const [previewTitle, setPreviewTitle] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   // Pull into set would replace whatever is typed in the editor; with unsaved edits, ask first.
   const [confirmPull, setConfirmPull] = useState<string | null>(null);
+  const [confirmRemoveProject, setConfirmRemoveProject] = useState<string | null>(null);
   // The diff card for a client whose block was edited on disk (SBS-1036).
   const [drift, setDrift] = useState<{
     clientId: string;
@@ -270,6 +282,38 @@ export function RulesView() {
     setDrift({ clientId, clientName, onDisk });
   }
 
+  // ---- Project-level rules (SBS-1037) ----
+  //
+  // Every project action goes through `run(..., true)`: it refreshes the view but must not touch
+  // the GLOBAL editor's unsaved draft, which is about a different set entirely.
+
+  async function addProject() {
+    try {
+      const picked = await openDialog({
+        directory: true,
+        multiple: false,
+        title: "Choose a project folder",
+      });
+      if (typeof picked === "string") await run(() => rulesProjectAdd(picked), true);
+    } catch (e) {
+      setError(`Couldn't open the folder picker: ${e}`);
+    }
+  }
+
+  async function openProjectPreview(p: RulesProjectStatus, f: RulesProjectFileStatus) {
+    setBusy(true);
+    setError(null);
+    setPreview(null);
+    try {
+      setPreview(await rulesProjectPreview(p.id, f.key));
+      setPreviewTitle(`${p.name} - ${f.relPath}`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   /**
    * Open the dry run for one client.
    *
@@ -283,6 +327,7 @@ export function RulesView() {
     // Drop any previous preview up front. If this one fails, a card left over from ANOTHER client
     // would sit there under the error looking like it belongs to the client just clicked.
     setPreview(null);
+    setPreviewTitle(null);
     try {
       setPreview(await rulesPreview(clientId, dirty ? draft : undefined));
     } catch (e) {
@@ -512,11 +557,152 @@ export function RulesView() {
         )}
       </div>
 
+      <div className="rounded-xl border bg-card p-5">
+        <div className="mb-1 flex items-center justify-between gap-3">
+          <h2 className="text-sm font-medium">Projects</h2>
+          <Button variant="outline" size="sm" disabled={busy} onClick={addProject}>
+            <FolderPlus className="size-3.5" />
+            Add a project folder
+          </Button>
+        </div>
+        <p className="mb-3 text-xs text-muted-foreground">
+          Project rules go into the folder itself, beside your repo&rsquo;s own files, and
+          will show up in <span className="font-mono">git status</span>. Toolport writes
+          only its own marked block (or its own file) and only when you press Apply for
+          that project, never at startup. Each file names the clients that read it there.
+        </p>
+        {data.projects.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No project folders registered. Add one to apply a rule set inside it.
+          </p>
+        ) : (
+          <ul className="grid gap-3">
+            {data.projects.map((p) => {
+              const set = data.sets.find((s) => s.id === p.setId) ?? null;
+              const anyOn = p.files.some((f) => f.enabled);
+              return (
+                <li key={p.id} className="rounded-lg border p-3">
+                  <div className="mb-2 flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-sm font-medium">{p.name}</div>
+                      <div
+                        className="truncate font-mono text-xs text-muted-foreground"
+                        title={p.path}
+                      >
+                        {p.path}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      aria-label={`Remove project ${p.name}`}
+                      title="Remove this project and what Toolport wrote in it"
+                      onClick={() => setConfirmRemoveProject(p.id)}
+                      className="rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-destructive"
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  </div>
+                  <label className="mb-2 flex items-center gap-2 text-xs">
+                    <span className="text-muted-foreground">Rule set</span>
+                    <select
+                      aria-label={`Rule set for ${p.name}`}
+                      value={p.setId ?? ""}
+                      disabled={busy}
+                      onChange={(e) => {
+                        const next = e.target.value || undefined;
+                        void run(() => rulesProjectSetSet(p.id, next), true);
+                      }}
+                      className="rounded-md border bg-background px-2 py-1 text-xs"
+                    >
+                      <option value="">None</option>
+                      {data.sets.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <ul className="mb-2 grid gap-1.5">
+                    {p.files.map((f) => (
+                      <li
+                        key={f.key}
+                        className="flex items-center justify-between gap-3 text-sm"
+                      >
+                        <label className="flex min-w-0 items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={f.enabled}
+                            disabled={busy}
+                            aria-label={`${f.relPath} in ${p.name}`}
+                            onChange={(e) => {
+                              const next = e.target.checked;
+                              void run(
+                                () => rulesProjectSetFileEnabled(p.id, f.key, next),
+                                true,
+                              );
+                            }}
+                          />
+                          <span className="min-w-0">
+                            <span className="font-mono text-xs">{f.relPath}</span>{" "}
+                            <span className="text-xs text-muted-foreground">
+                              for {f.clients.join(", ")}
+                            </span>
+                          </span>
+                        </label>
+                        <span className="flex shrink-0 items-center gap-2">
+                          {f.enabled && (set || f.state !== "applied") && (
+                            <RuleStateBadge state={f.state} />
+                          )}
+                          <button
+                            type="button"
+                            disabled={busy || !set}
+                            title={
+                              set
+                                ? "See exactly what would be written"
+                                : "Pick a rule set first"
+                            }
+                            onClick={() => openProjectPreview(p, f)}
+                            className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+                          >
+                            <Eye className="size-3" />
+                            Preview
+                          </button>
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                  <Button
+                    size="sm"
+                    disabled={busy || !set || !anyOn}
+                    title={
+                      !set
+                        ? "Pick a rule set first"
+                        : !anyOn
+                          ? "Switch on a file first"
+                          : "Write the switched-on files from this set"
+                    }
+                    onClick={() => run(() => rulesProjectApply(p.id), true)}
+                  >
+                    Apply to {p.name}
+                  </Button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+
       {preview && (
         <div ref={previewRef} className="scroll-mt-4 rounded-xl border bg-card p-5">
           <div className="mb-1 flex items-center justify-between gap-3">
             <h2 className="text-sm font-medium">
-              Preview{previewClientName ? `: ${previewClientName}` : ""}
+              Preview
+              {previewTitle
+                ? `: ${previewTitle}`
+                : previewClientName
+                  ? `: ${previewClientName}`
+                  : ""}
             </h2>
             <button
               type="button"
@@ -634,6 +820,20 @@ export function RulesView() {
           setConfirmPull(null);
           setDrift(null);
           if (onDisk !== null) editDraft({ content: onDisk });
+        }}
+      />
+
+      <ConfirmDialog
+        open={confirmRemoveProject !== null}
+        onOpenChange={(o) => !o && setConfirmRemoveProject(null)}
+        title="Remove this project?"
+        description="Toolport removes what it wrote in the folder. Your repo's own files are left alone."
+        confirmLabel="Remove"
+        destructive
+        onConfirm={() => {
+          const id = confirmRemoveProject;
+          setConfirmRemoveProject(null);
+          if (id) void run(() => rulesProjectRemove(id), true);
         }}
       />
 

@@ -615,6 +615,33 @@ export function rulesApplyClient(clientId: string): Promise<RulesView> {
   return invoke<RulesView>("rules_apply_client", { clientId });
 }
 
+// Project-level rules (SBS-1037). Registered folders only; written only by `rulesProjectApply`.
+export function rulesProjectAdd(path: string): Promise<RulesView> {
+  return invoke<RulesView>("rules_project_add", { path });
+}
+export function rulesProjectRemove(id: string): Promise<RulesView> {
+  return invoke<RulesView>("rules_project_remove", { id });
+}
+export function rulesProjectSetSet(id: string, setId?: string): Promise<RulesView> {
+  return invoke<RulesView>("rules_project_set_set", { id, setId: setId ?? null });
+}
+export function rulesProjectSetFileEnabled(
+  id: string,
+  key: string,
+  enabled: boolean,
+): Promise<RulesView> {
+  return invoke<RulesView>("rules_project_set_file_enabled", { id, key, enabled });
+}
+export function rulesProjectApply(id: string): Promise<RulesView> {
+  return invoke<RulesView>("rules_project_apply", { id });
+}
+export function rulesProjectPreview(
+  id: string,
+  key: string,
+): Promise<RulesPreview | null> {
+  return invoke<RulesPreview | null>("rules_project_preview", { id, key });
+}
+
 export interface TeamPushPreview {
   baseVersion: number;
   localFingerprint: string;
