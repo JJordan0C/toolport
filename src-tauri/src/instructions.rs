@@ -52,7 +52,7 @@ pub enum Scope {
 }
 
 /// Every scope, for the checks that must consider all of them (see [`content_carries_a_marker`]).
-const ALL_SCOPES: [Scope; 2] = [Scope::Team, Scope::Personal];
+pub const ALL_SCOPES: [Scope; 2] = [Scope::Team, Scope::Personal];
 
 /// A resolved place to write one client's copy of the rules for one [`Scope`].
 #[derive(Debug, Clone, PartialEq, Eq)]

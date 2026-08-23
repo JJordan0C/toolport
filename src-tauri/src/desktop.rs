@@ -3193,6 +3193,26 @@ async fn rules_apply_client(client_id: String) -> Result<rules::RulesView, Strin
         .map_err(|e| e.to_string())?
 }
 
+/// Rules files the detected clients already have, for "Start from a file" (SBS-1035). Read-only.
+#[tauri::command]
+async fn rules_import_candidates() -> Result<Vec<rules::ImportCandidate>, String> {
+    tauri::async_runtime::spawn_blocking(rules::import_candidates)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Read one file as the seed for a new rule set (SBS-1035). Read-only: nothing is saved and
+/// the file is left as it was; the UI puts the text in the editor for the user to review.
+#[tauri::command]
+async fn rules_import_file(
+    path: String,
+    client_name: Option<String>,
+) -> Result<rules::ImportedRules, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::import_file(&path, client_name.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// The explicit Re-apply / Overwrite button: make every opted-in client's file match the active
 /// set, including a block the user edited on disk (SBS-1036). Every automatic path reconciles
 /// instead and leaves such a block alone.
@@ -5441,6 +5461,8 @@ pub fn run() {
             rules_preview,
             rules_apply,
             rules_apply_client,
+            rules_import_candidates,
+            rules_import_file,
             hooks_view,
             hooks_set_enabled,
             hooks_preview,

