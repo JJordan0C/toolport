@@ -43,6 +43,16 @@ Entries before the rename below shipped under the project's former name, Conduit
   than every review server including the ones already consented to. A rename or a tool
   allow-list change does not re-prompt. (SBS-1017)
 
+- **A form elicitation relayed from an MCP server now says which server is asking.**
+  When a server asks the user for input (MCP elicitation in form mode, whether as a
+  modern `input_required` result or a legacy server-initiated request), the client
+  renders it in the same chrome as Toolport's own approval prompts, so a server-authored
+  "your session expired, re-enter your token" was indistinguishable from a genuine one.
+  Toolport now appends `Toolport source: the "<server>" MCP server (not Toolport)` to the
+  message, the form-mode counterpart of the verified `Toolport destination:` line URL
+  mode already carried; a server that pre-writes that line to name itself as something
+  else has it replaced. (SBS-891)
+
 ## [1.16.0] - 2026-08-22
 
 ### Fixed
