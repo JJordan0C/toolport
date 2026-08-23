@@ -289,10 +289,15 @@ export function RulesView() {
   async function importFrom(path: string, clientName?: string) {
     setImporting(null);
     let note: string | null = null;
+    const known = new Set((data?.sets ?? []).map((s) => s.id));
     await run(async () => {
       await flushDraft();
       const imported = await rulesImportFile(path, clientName);
       const created = await rulesSaveSet(imported.name, imported.content);
+      // A set id can be reused after a delete ("Imported from Codex" again), and a draft held
+      // for the deleted one would otherwise be restored over the imported text.
+      const fresh = created.sets.find((s) => !known.has(s.id));
+      if (fresh) forgetRulesDraft(fresh.id);
       const nowActive = created.activeSetId !== data?.activeSetId;
       note =
         (imported.strippedOurs

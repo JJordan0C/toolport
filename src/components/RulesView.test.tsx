@@ -266,6 +266,45 @@ describe("RulesView", () => {
     expect(dialog.open).not.toHaveBeenCalled();
   });
 
+  it("an import that becomes the first applied set is not overwritten by a stale held draft", async () => {
+    // Nothing selected: the backend selects the new set. A draft left behind by an earlier,
+    // deleted set that had the same id must not be restored over the imported text.
+    api.rulesView.mockResolvedValue(view({ sets: [], activeSetId: undefined }));
+    api.rulesImportCandidates.mockResolvedValue([]);
+    dialog.open.mockResolvedValue("/home/a/.codex/AGENTS.md");
+    api.rulesImportFile.mockResolvedValue({
+      path: "/home/a/.codex/AGENTS.md",
+      name: "Imported from Codex",
+      content: "Be terse.",
+      strippedOurs: false,
+    });
+    api.rulesSaveSet.mockResolvedValue(
+      view({
+        sets: [
+          {
+            id: "imported-from-codex",
+            name: "Imported from Codex",
+            content: "Be terse.",
+            revision: 1,
+          },
+        ],
+        activeSetId: "imported-from-codex",
+      }),
+    );
+    setRulesDraft("imported-from-codex", {
+      name: "Imported from Codex",
+      content: "OLD STALE TEXT",
+    });
+
+    render(<RulesView />);
+    await screen.findByText(/No rule set yet/);
+    await userEvent.click(screen.getByRole("button", { name: "Start from a file" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Choose a file…" }));
+    await waitFor(() => expect(screen.getByLabelText("Rules")).toHaveValue("Be terse."));
+    expect(screen.getByRole("button", { name: "Saved" })).toBeDisabled();
+    expect(screen.getByText(/It is now your applied set/)).toBeInTheDocument();
+  });
+
   it("the file picker feeds the same import, and a failed import is surfaced", async () => {
     api.rulesImportCandidates.mockResolvedValue([]);
     dialog.open.mockResolvedValue("/tmp/mine.md");
