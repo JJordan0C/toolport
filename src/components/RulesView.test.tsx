@@ -11,9 +11,13 @@ const api = vi.hoisted(() => ({
   rulesSetClientEnabled: vi.fn(),
   rulesPreview: vi.fn(),
   rulesApply: vi.fn(),
+  rulesImportCandidates: vi.fn(),
+  rulesImportFile: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => api);
+const dialog = vi.hoisted(() => ({ open: vi.fn() }));
+vi.mock("@tauri-apps/plugin-dialog", () => dialog);
 
 import { clearRulesDraftCache, setRulesDraft } from "@/lib/rulesDraftCache";
 import { RulesView } from "./RulesView";
@@ -208,6 +212,73 @@ describe("RulesView", () => {
       ),
     );
     expect(api.rulesSetActive).toHaveBeenCalledWith("personal");
+  });
+
+  it("starts a new set from an existing rules file as an unsaved draft", async () => {
+    api.rulesImportCandidates.mockResolvedValue([
+      {
+        clientId: "codex",
+        clientName: "Codex",
+        path: "/home/a/.codex/AGENTS.md",
+        bytes: 2048,
+      },
+    ]);
+    api.rulesImportFile.mockResolvedValue({
+      path: "/home/a/.codex/AGENTS.md",
+      name: "Imported from Codex",
+      content: "Be terse.",
+      strippedOurs: true,
+    });
+    const withNew = view({
+      sets: [
+        { id: "work", name: "Work", content: "Always run tests.", revision: 2 },
+        { id: "imp", name: "Imported from Codex", content: "", revision: 1 },
+      ],
+    });
+    api.rulesSaveSet.mockResolvedValue(withNew);
+    api.rulesSetActive.mockResolvedValue({ ...withNew, activeSetId: "imp" });
+
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+    await userEvent.click(screen.getByRole("button", { name: "Start from a file" }));
+    // The panel lists the client's own file with its size, and says the file is not changed.
+    const candidate = await screen.findByRole("button", {
+      name: /Codex .*AGENTS\.md.*2\.0 KB/,
+    });
+    expect(screen.getByText(/the file is not\s+changed/)).toBeInTheDocument();
+    await userEvent.click(candidate);
+
+    // The text is in the editor, on the new set, UNSAVED: the set was created empty and the
+    // imported text is the draft, so nothing reached a client yet.
+    await waitFor(() => expect(screen.getByLabelText("Rules")).toHaveValue("Be terse."));
+    expect(screen.getByLabelText("Rule set name")).toHaveValue("Imported from Codex");
+    expect(api.rulesImportFile).toHaveBeenCalledWith("/home/a/.codex/AGENTS.md", "Codex");
+    expect(api.rulesSaveSet).toHaveBeenCalledWith("Imported from Codex", "");
+    expect(api.rulesSetActive).toHaveBeenCalledWith("imp");
+    expect(screen.getByRole("button", { name: "Save and apply" })).toBeEnabled();
+    // It says what happened, including that Toolport's own block was left out.
+    expect(
+      screen.getByText(/block Toolport had written there was left out/),
+    ).toBeInTheDocument();
+    expect(dialog.open).not.toHaveBeenCalled();
+  });
+
+  it("the file picker feeds the same import, and a failed import is surfaced", async () => {
+    api.rulesImportCandidates.mockResolvedValue([]);
+    dialog.open.mockResolvedValue("/tmp/mine.md");
+    api.rulesImportFile.mockRejectedValue(new Error("/tmp/mine.md is not UTF-8 text"));
+
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+    await userEvent.click(screen.getByRole("button", { name: "Start from a file" }));
+    expect(await screen.findByText(/No rules files found/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Choose a file…" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("not UTF-8");
+    expect(api.rulesImportFile).toHaveBeenCalledWith("/tmp/mine.md", undefined);
+    // Nothing was created for a file that could not be read.
+    expect(api.rulesSaveSet).not.toHaveBeenCalled();
+    // The editor still shows the set that was there before.
+    expect(screen.getByLabelText("Rules")).toHaveValue("Always run tests.");
   });
 
   it("creating a set switches to it, so the editor is not still on the old one", async () => {

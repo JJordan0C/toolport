@@ -4,6 +4,21 @@ All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 Entries before the rename below shipped under the project's former name, Conduit.
 
+## [Unreleased]
+
+### Added
+
+- **Agent rules: start a new set from a rules file you already have.** The tab opened on an
+  empty editor, and the first thing it asked of someone with a `~/.claude/CLAUDE.md` or a
+  `~/.codex/AGENTS.md` was to retype it. **Start from a file** lists the rules files the
+  detected clients already read (the user's own text: sentinel-block targets such as
+  `AGENTS.md` and `GEMINI.md`, the other `.md` files in a rules directory, and Claude Code's
+  `~/.claude/CLAUDE.md`), with a file picker for anything else, and seeds a new set with the
+  file's text as an unsaved draft. The file is read and never written, anything Toolport had
+  written into it is left out and the import says so, and a remainder that still looks like
+  Toolport's markers is refused up front. See
+  [docs/agent-rules.md](docs/agent-rules.md#starting-from-an-existing-file). (SBS-1035)
+
 ## [1.16.0] - 2026-08-22
 
 ### Fixed
