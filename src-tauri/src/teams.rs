@@ -1086,12 +1086,12 @@ fn apply_instructions_to(
 /// winner's own write had failed, it strips the only good block while the UI reports the
 /// new config. So instead:
 ///
-/// * a team is still connected -> hand the paths to ITS record. Its next reconcile sees a
-///   path whose content is not its own as Stale and rewrites it, which is exactly the
-///   reconciliation the record exists to drive. Nothing is deleted.
-/// * no team remains (a disconnect won) -> an empty file is the correct end state, and
-///   removing our block is what disconnect does to everything it had on record. Only here
-///   is removal right, because only here is nothing left that could want the block.
+/// * a team with instruction content is connected -> hand the paths to ITS record. Its next
+///   reconcile sees a path whose content is not its own as Stale and rewrites it, which is
+///   exactly the reconciliation the record exists to drive. Nothing is deleted.
+/// * no team remains (a disconnect won), or the connected team has no instruction content
+///   (whose apply would never look at the paths again) -> an empty file is the correct end
+///   state, and removing our block is what disconnect does to everything it had on record.
 fn record_applied_instructions(
     team_id: &str,
     new_content: Option<String>,
@@ -1114,14 +1114,21 @@ fn record_applied_instructions(
     if matches!(recorded, Ok((_, true))) {
         return;
     }
+    // Adopt only into a winner that HAS instruction content: its next reconcile then finds
+    // our paths Stale for its content and rewrites them. A connected team with no content
+    // (fresh connect, org instructions off) would carry the paths forever - its unchanged-
+    // content early return never looks at them - so for it, as for no team at all, an empty
+    // file is the right end state and our block is removed.
     let adopted = crate::registry::update(|reg| {
         if let Some(t) = reg.team.as_mut() {
-            for path in written {
-                if !t.team_instructions_targets.contains(path) {
-                    t.team_instructions_targets.push(path.clone());
+            if t.team_instructions_content.is_some() {
+                for path in written {
+                    if !t.team_instructions_targets.contains(path) {
+                        t.team_instructions_targets.push(path.clone());
+                    }
                 }
+                return Ok(true);
             }
-            return Ok(true);
         }
         Ok(false)
     });
@@ -2467,11 +2474,15 @@ mod tests {
             char_cap: None,
             blocked_if_present: None,
         };
+        // `connect` gives the team instruction content (the realistic winner of a switch);
+        // `team_c` below is the content-less case.
         let connect = |team: &str| {
+            let content = if team == "team_c" { Value::Null } else { json!(format!("{team}'s rules")) };
             let conn: TeamConnection = serde_json::from_value(json!({
                 "serverUrl": "https://teams.example.com",
                 "teamId": team,
                 "role": "member",
+                "teamInstructionsContent": content,
             }))
             .unwrap();
             crate::registry::update(|reg| {
@@ -2490,7 +2501,7 @@ mod tests {
             "the block is left for the winner to reconcile, not deleted"
         );
         let (content, _, recorded) = loaded_instructions();
-        assert_eq!(content, None, "the loser's watermark is not written over the winner's");
+        assert_eq!(content.as_deref(), Some("team_b's rules"), "the loser's watermark is not written over the winner's");
         assert_eq!(recorded, vec![key.clone()], "the winner's record now owns the path");
         // The winner's next apply sees the path as Stale for its own content and rewrites it.
         assert_eq!(
@@ -2498,7 +2509,17 @@ mod tests {
             ApplyState::Stale
         );
 
+        // A winner with NO instruction content would never reconcile the adopted paths (its
+        // unchanged-content path returns early), so the block goes rather than lingering.
+        assert_eq!(instructions::write_target(&target, "team_a", 3, "a's rules"), ApplyState::Applied);
+        connect("team_c");
+        record_applied_instructions("team_a", Some("a's rules".into()), 3, vec![key.clone()], &[key.clone()]);
+        assert!(!path.exists(), "a winner without content cannot reconcile it: removed");
+        let (_, _, recorded) = loaded_instructions();
+        assert!(recorded.is_empty(), "and nothing is handed to a record that would ignore it");
+
         // A disconnect that won leaves no team: nothing could want the block, so it goes.
+        assert_eq!(instructions::write_target(&target, "team_a", 4, "a's rules"), ApplyState::Applied);
         crate::registry::update(|reg| {
             reg.team = None;
             Ok(())
