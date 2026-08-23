@@ -772,11 +772,18 @@ pub fn project_set_file_enabled(id: &str, key: &str, enabled: bool) -> Result<Ru
         .to_string_lossy()
         .to_string();
     let mut still_recorded = project.targets.clone();
-    if !enabled
-        && project.targets.contains(&path)
-        && instructions::remove_recorded(std::path::Path::new(&path), Scope::Personal)
-    {
-        still_recorded.retain(|t| t != &path);
+    if !enabled && project.targets.contains(&path) {
+        if instructions::remove_recorded(std::path::Path::new(&path), Scope::Personal) {
+            still_recorded.retain(|t| t != &path);
+        } else {
+            // Switching off means "Toolport's block is gone from this file". If it is not,
+            // say so and leave the file switched ON, so the row keeps showing the real state
+            // and the user can retry; an unchecked box over a block still in the repo would
+            // be the lie project_remove and delete_set already refuse to tell.
+            return Err(format!(
+                "Could not remove Toolport's block from {path}. The file stays switched on so you can try again."
+            ));
+        }
     }
     crate::registry::update(|reg| {
         let Some(p) = reg.rules_projects.iter_mut().find(|p| p.id == id) else {
@@ -1086,6 +1093,26 @@ mod tests {
         project_set_file_enabled(&pid, "agents-md", false).unwrap();
         assert_eq!(std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(), THEIRS);
         assert!(crate::registry::load().unwrap().rules_projects[0].targets.is_empty());
+
+        // A toggle-off whose cleanup fails says so and leaves the file switched on and on
+        // record, rather than showing an unchecked box over a block still in the repo.
+        project_set_file_enabled(&pid, "agents-md", true).unwrap();
+        apply_project_with(&pid, &installed).unwrap();
+        std::fs::write(
+            root_path.join("AGENTS.md"),
+            format!("{}\nunterminated", crate::instructions::PERSONAL_SENTINEL_START_PREFIX),
+        )
+        .unwrap();
+        let err = project_set_file_enabled(&pid, "agents-md", false).unwrap_err();
+        assert!(err.contains("stays switched on"), "{err}");
+        let reg = crate::registry::load().unwrap();
+        assert_eq!(reg.rules_projects[0].files.get("agents-md"), Some(&true));
+        assert_eq!(reg.rules_projects[0].targets.len(), 1);
+        // Repair the file; the retry succeeds.
+        std::fs::write(root_path.join("AGENTS.md"), THEIRS).unwrap();
+        apply_project_with(&pid, &installed).unwrap();
+        project_set_file_enabled(&pid, "agents-md", false).unwrap();
+        assert_eq!(std::fs::read_to_string(root_path.join("AGENTS.md")).unwrap(), THEIRS);
 
         // An owned file in a nested dir is created on apply and deleted whole on remove.
         project_set_file_enabled(&pid, "claude-rules", true).unwrap();
