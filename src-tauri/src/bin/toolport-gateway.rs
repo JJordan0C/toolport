@@ -9036,6 +9036,11 @@ fn connect_one(
     let progress = PROGRESS_DISPATCH
         .get()
         .map(|d| bind_progress_sink(d, &server.id));
+    // Name the server on every form elicitation from here on, INCLUDING ones raised while
+    // the handshake is still in flight: the transport below gets this handler before
+    // connect, and `DownstreamServer::set_server_request_handler` wraps again afterwards
+    // (idempotent) (SBS-891).
+    let server_handler = downstream::stamping_server_request_handler(&server.id, server_handler);
     let result = if let Some(command) = &server.command {
         let mut env: Vec<(String, String)> = Vec::new();
         // A failed vault read is NOT "no secret stored" (SBS-789): a locked
