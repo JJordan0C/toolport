@@ -8,6 +8,41 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Security
 
+- **A process that bound the approval broker's endpoint after the app had gone could
+  approve gated calls in its place, and be handed the arguments first.** The gateway
+  dialed whatever `approval-endpoint.json` named and believed whatever came back. The
+  descriptor survives a crash or a force-kill, and nothing authenticated the peer that
+  answered: the literal bytes `"approved"` were a complete decision. Because the
+  request is written before the reply is read, such a peer also received the call's
+  real arguments, including the rehydrated values behind a PII release. The gateway now
+  opens every dial with a random challenge that the broker must answer with an
+  HMAC-SHA256 proof of the shared token, and sends nothing until the proof checks out;
+  a peer that cannot read the owner-only descriptor cannot produce it, so it sees no
+  request and its answer is never read. The failure is reported as `unreachable`, so a
+  restarted app is still found on the re-read, and it is still fail-closed. On Unix the
+  broker also listens on a socket file in a `0700` directory under the data dir, which
+  a current gateway prefers, so such a peer cannot even connect on that path; the
+  loopback listener stays (and is all there is on Windows), and the challenge protects
+  both the same way. A gateway from before this change still reads only the loopback
+  address, still reaches the broker, and is still answered. (SBS-867)
+
+  What this does not claim: a process running as the same user as Toolport can read
+  the descriptor and `registry.json` alike, and can switch human approval off directly;
+  that is a sandboxing question (SBS-185), not an authentication one.
+
+- **Teams: a member's consent to a review server no longer follows the server's id
+  when its command changes.** Team servers that run a local command or point at a LAN
+  address arrive off and stay off until the member reviews and enables them; that
+  enablement was carried across syncs by id alone, so an org config that kept the id
+  and swapped the command re-enabled the new command with no re-consent, and a public
+  remote server that had been auto-enabled (no member action at all) became a local
+  command that ran on the next gateway start. Consent is now bound to what the member
+  enabled - transport, command, args, env keys, cwd, url - and is carried over only
+  when the new entry matches; a changed definition arrives off and is counted in the
+  "needs review" notice, which now counts only the servers that are actually off rather
+  than every review server including the ones already consented to. A rename or a tool
+  allow-list change does not re-prompt. (SBS-1017)
+
 - **A form elicitation relayed from an MCP server now says which server is asking.**
   When a server asks the user for input (MCP elicitation in form mode, whether as a
   modern `input_required` result or a legacy server-initiated request), the client
