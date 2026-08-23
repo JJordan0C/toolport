@@ -67,6 +67,18 @@ Entries before the rename below shipped under the project's former name, Conduit
   Toolport's markers is refused up front. See
   [docs/agent-rules.md](docs/agent-rules.md#starting-from-an-existing-file). (SBS-1035)
 
+- **Agent rules: a block you edited by hand in a client's file is no longer silently put
+  back.** Toolport wrote its block into `AGENTS.md` (or its own file in a rules directory),
+  you tuned it there, and the next startup or the next time you toggled a client Toolport
+  rewrote it from the set with no warning. Now a block written for the current set revision
+  whose body differs on disk reads **Edited on disk** instead of "Not applied yet"; every
+  automatic apply (startup, saving, switching sets, toggling clients) leaves it alone; and the
+  row offers **View diff**, with **Pull into set** (the file's version becomes your unsaved
+  draft) and **Overwrite this file** (the set goes back over that one file; **Re-apply** does it for every switched-on client).
+  A change to the set itself is a newer revision and is written as before. Team
+  instructions are unchanged: org rules stay authoritative over a member's edit.
+  (SBS-1036)
+
 ### Fixed
 
 - **Team Instructions: losing a write race no longer deletes the winner's block.** When

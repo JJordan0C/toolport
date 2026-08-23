@@ -8,6 +8,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { RuleStateBadge } from "@/components/RuleStateBadge";
 import {
   rulesApply,
+  rulesApplyClient,
   rulesDeleteSet,
   rulesImportCandidates,
   rulesImportFile,
@@ -18,6 +19,7 @@ import {
   rulesView,
 } from "@/lib/api";
 import { forgetRulesDraft, getRulesDraft, setRulesDraft } from "@/lib/rulesDraftCache";
+import { lineDiff } from "@/lib/lineDiff";
 import type {
   InstructionsApplyState,
   RulesImportCandidate,
@@ -76,6 +78,14 @@ export function RulesView() {
 
   const [preview, setPreview] = useState<RulesPreview | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  // Pull into set would replace whatever is typed in the editor; with unsaved edits, ask first.
+  const [confirmPull, setConfirmPull] = useState<string | null>(null);
+  // The diff card for a client whose block was edited on disk (SBS-1036).
+  const [drift, setDrift] = useState<{
+    clientId: string;
+    clientName: string;
+    onDisk: string;
+  } | null>(null);
 
   // "Start from a file" (SBS-1035). `null` = panel closed; `candidates: null` = still looking.
   const [importing, setImporting] = useState<{
@@ -129,6 +139,8 @@ export function RulesView() {
     // opened. Anything that reseats the editor can invalidate it, and a preview showing a path
     // and bytes that no longer match what is on screen is worse than showing no preview at all.
     setPreview(null);
+    // Same for a drift card: the refreshed view carries the current on-disk body.
+    setDrift(null);
   }
 
   /** Reseat a reloaded view without discarding an unsaved draft held across an unmount. */
@@ -259,6 +271,17 @@ export function RulesView() {
       const fresh = created.sets.find((s) => !known.has(s.id));
       return fresh ? rulesSetActive(fresh.id) : created;
     });
+  }
+
+  /**
+   * Show how a client's on-disk block differs from the saved set, with the two ways out: take the
+   * edit into the set (a draft, nothing written) or put the set back over it (the explicit
+   * overwrite, which is what Re-apply does). Until one of those happens every automatic apply
+   * leaves the edited block alone.
+   */
+  function openDrift(clientId: string, clientName: string, onDisk: string) {
+    setPreview(null);
+    setDrift({ clientId, clientName, onDisk });
   }
 
   /**
@@ -536,6 +559,7 @@ export function RulesView() {
                 variant="outline"
                 size="sm"
                 disabled={busy}
+                title="Rewrite every switched-on client's file from this set, including a block you edited on disk"
                 onClick={() => act(rulesApply)}
               >
                 <RefreshCw className="size-3.5" />
@@ -593,6 +617,17 @@ export function RulesView() {
                     states still matter because they mean cleanup left rules on disk. */}
                 {c.enabled && (active || c.state !== "applied") && (
                   <RuleStateBadge state={c.state} />
+                )}
+                {c.state === "drifted" && c.onDisk !== undefined && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    title="See how the file differs from this set"
+                    onClick={() => openDrift(c.id, c.name, c.onDisk ?? "")}
+                    className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+                  >
+                    View diff
+                  </button>
                 )}
                 <button
                   type="button"
@@ -659,6 +694,94 @@ export function RulesView() {
           </pre>
         </div>
       )}
+
+      {drift && active && (
+        <div className="rounded-xl border bg-card p-5">
+          <div className="mb-1 flex items-center justify-between gap-3">
+            <h2 className="text-sm font-medium">Edited on disk: {drift.clientName}</h2>
+            <button
+              type="button"
+              onClick={() => setDrift(null)}
+              className="text-xs text-muted-foreground hover:text-foreground"
+            >
+              Close
+            </button>
+          </div>
+          <p className="mb-3 text-xs text-muted-foreground">
+            Toolport wrote this block from the set &ldquo;{active.name}&rdquo; and it has
+            been changed in the file since. Nothing is written here until you choose: pull
+            the file&rsquo;s version into the set (it becomes an unsaved draft you can
+            still edit), or overwrite the file with the set. Lines starting with &minus;
+            are the set as saved; lines starting with + are what the file has now.
+          </p>
+          <pre className="mb-3 max-h-64 overflow-auto rounded-lg border bg-muted/20 p-3 font-mono text-xs whitespace-pre-wrap">
+            {lineDiff(active.content, drift.onDisk).map((line, i) => (
+              <div
+                key={i}
+                className={
+                  line.kind === "add"
+                    ? "bg-success/10 text-foreground"
+                    : line.kind === "del"
+                      ? "bg-destructive/10 text-muted-foreground line-through"
+                      : "text-muted-foreground"
+                }
+              >
+                {line.kind === "add" ? "+ " : line.kind === "del" ? "\u2212 " : "  "}
+                {line.text}
+              </div>
+            ))}
+          </pre>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              disabled={busy}
+              onClick={() => {
+                const onDisk = drift.onDisk;
+                if (dirty) {
+                  setConfirmPull(onDisk);
+                  return;
+                }
+                setDrift(null);
+                editDraft({ content: onDisk });
+              }}
+            >
+              Pull into set
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={busy}
+              title="Rewrite only this client's file from the set as saved; other clients and your unsaved edits are left as they are"
+              onClick={() => {
+                // Not through `act`: that would save the draft first, and a saved content
+                // change reconcile-writes a new revision to EVERY client, which is the
+                // opposite of what "this file" promises. The overwrite uses the set as saved;
+                // the draft stays in the editor.
+                const id = drift.clientId;
+                void run(() => rulesApplyClient(id), true);
+              }}
+            >
+              <RefreshCw className="size-3.5" />
+              Overwrite this file
+            </Button>
+          </div>
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={confirmPull !== null}
+        onOpenChange={(o) => !o && setConfirmPull(null)}
+        title="Replace your unsaved edits?"
+        description="The editor has changes you have not saved. Pulling the file's version in replaces them. Nothing is written to disk either way."
+        confirmLabel="Replace"
+        destructive
+        onConfirm={() => {
+          const onDisk = confirmPull;
+          setConfirmPull(null);
+          setDrift(null);
+          if (onDisk !== null) editDraft({ content: onDisk });
+        }}
+      />
 
       <ConfirmDialog
         open={confirmDelete !== null}

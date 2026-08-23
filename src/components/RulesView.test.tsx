@@ -11,6 +11,7 @@ const api = vi.hoisted(() => ({
   rulesSetClientEnabled: vi.fn(),
   rulesPreview: vi.fn(),
   rulesApply: vi.fn(),
+  rulesApplyClient: vi.fn(),
   rulesImportCandidates: vi.fn(),
   rulesImportFile: vi.fn(),
 }));
@@ -212,6 +213,97 @@ describe("RulesView", () => {
       ),
     );
     expect(api.rulesSetActive).toHaveBeenCalledWith("personal");
+  });
+
+  it("a block edited on disk is reported with a diff, and Pull into set makes it the draft", async () => {
+    api.rulesView.mockResolvedValue(
+      view({
+        clients: [
+          {
+            id: "codex",
+            name: "Codex",
+            enabled: true,
+            path: "/home/a/.codex/AGENTS.md",
+            state: "drifted",
+            onDisk: "Always run tests.\nAnd lint.",
+          },
+        ],
+      }),
+    );
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+    expect(screen.getByText("Edited on disk")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "View diff" }));
+    // The card shows the set as saved against the file, line by line.
+    expect(screen.getByText("Edited on disk: Codex")).toBeInTheDocument();
+    expect(screen.getByText(/^\+ And lint\.$/)).toBeInTheDocument();
+
+    // Pull into set: the file's text becomes the unsaved draft. Nothing is written.
+    await userEvent.click(screen.getByRole("button", { name: "Pull into set" }));
+    expect(screen.getByLabelText("Rules")).toHaveValue("Always run tests.\nAnd lint.");
+    expect(screen.getByRole("button", { name: "Save and apply" })).toBeEnabled();
+    expect(api.rulesApply).not.toHaveBeenCalled();
+    expect(api.rulesSaveSet).not.toHaveBeenCalled();
+    expect(screen.queryByText("Edited on disk: Codex")).not.toBeInTheDocument();
+  });
+
+  it("Pull into set asks before replacing unsaved edits", async () => {
+    api.rulesView.mockResolvedValue(
+      view({
+        clients: [
+          {
+            id: "codex",
+            name: "Codex",
+            enabled: true,
+            path: "/home/a/.codex/AGENTS.md",
+            state: "drifted",
+            onDisk: "From the file.",
+          },
+        ],
+      }),
+    );
+    render(<RulesView />);
+    const editor = await screen.findByLabelText("Rules");
+    await userEvent.type(editor, " Typed but unsaved.");
+    await userEvent.click(screen.getByRole("button", { name: "View diff" }));
+    await userEvent.click(screen.getByRole("button", { name: "Pull into set" }));
+    // Nothing replaced yet: the confirm is up and the typed text is intact.
+    expect(screen.getByText("Replace your unsaved edits?")).toBeInTheDocument();
+    expect(editor).toHaveValue("Always run tests. Typed but unsaved.");
+    await userEvent.click(screen.getByRole("button", { name: "Replace" }));
+    expect(editor).toHaveValue("From the file.");
+    expect(api.rulesApply).not.toHaveBeenCalled();
+  });
+
+  it("Overwrite this file re-applies the set over the edited block of that client only", async () => {
+    api.rulesView.mockResolvedValue(
+      view({
+        clients: [
+          {
+            id: "codex",
+            name: "Codex",
+            enabled: true,
+            path: "/home/a/.codex/AGENTS.md",
+            state: "drifted",
+            onDisk: "Something else.",
+          },
+        ],
+      }),
+    );
+    api.rulesApplyClient.mockResolvedValue(view());
+    render(<RulesView />);
+    const editor = await screen.findByLabelText("Rules");
+    // An unsaved content edit must NOT be saved (and so applied everywhere) by this.
+    await userEvent.type(editor, " Unsaved.");
+    await userEvent.click(screen.getByRole("button", { name: "View diff" }));
+    await userEvent.click(screen.getByRole("button", { name: "Overwrite this file" }));
+    await waitFor(() => expect(api.rulesApplyClient).toHaveBeenCalledWith("codex"));
+    expect(api.rulesApply).not.toHaveBeenCalled();
+    expect(api.rulesSaveSet).not.toHaveBeenCalled();
+    expect(editor).toHaveValue("Always run tests. Unsaved.");
+    // The refreshed view says Applied and the diff card is gone; the draft survived.
+    expect(await screen.findByText("Applied")).toBeInTheDocument();
+    expect(screen.queryByText("Edited on disk: Codex")).not.toBeInTheDocument();
   });
 
   it("starts a new set from an existing rules file without selecting (and so applying) it", async () => {

@@ -3184,6 +3184,15 @@ async fn rules_preview(
         .map_err(|e| e.to_string())?
 }
 
+/// "Overwrite the file" on one client's drift card: that client's file is rewritten from the
+/// set; every other client is reconciled, so a drifted block elsewhere is left alone (SBS-1036).
+#[tauri::command]
+async fn rules_apply_client(client_id: String) -> Result<rules::RulesView, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::apply_overwriting_client(&client_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Rules files the detected clients already have, for "Start from a file" (SBS-1035). Read-only.
 #[tauri::command]
 async fn rules_import_candidates() -> Result<Vec<rules::ImportCandidate>, String> {
@@ -3204,10 +3213,12 @@ async fn rules_import_file(
         .map_err(|e| e.to_string())?
 }
 
-/// Re-apply the active set. Used by the "Apply" button and after a client is connected.
+/// The explicit Re-apply / Overwrite button: make every opted-in client's file match the active
+/// set, including a block the user edited on disk (SBS-1036). Every automatic path reconciles
+/// instead and leaves such a block alone.
 #[tauri::command]
 async fn rules_apply() -> Result<rules::RulesView, String> {
-    tauri::async_runtime::spawn_blocking(rules::apply)
+    tauri::async_runtime::spawn_blocking(rules::apply_overwriting_drift)
         .await
         .map_err(|e| e.to_string())?
 }
@@ -5449,6 +5460,7 @@ pub fn run() {
             rules_set_client_enabled,
             rules_preview,
             rules_apply,
+            rules_apply_client,
             rules_import_candidates,
             rules_import_file,
             hooks_view,

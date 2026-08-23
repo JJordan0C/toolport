@@ -552,7 +552,14 @@ export interface TeamConnection {
 
 /** Per-client on-disk state of the org Team Instructions (spec W4/W5). */
 export type InstructionsApplyState =
-  "applied" | "stale" | "blocked_override" | "too_long" | "unsupported" | "error";
+  | "applied"
+  | "stale"
+  | "blocked_override"
+  | "too_long"
+  | "unsupported"
+  | "error"
+  /** Toolport wrote this block for the current set revision and it was edited on disk since (personal rules only). */
+  | "drifted";
 
 export interface InstructionsClientStatus {
   id: string;
@@ -590,6 +597,8 @@ export interface RulesClientStatus {
   /** Absent when this client has no global-rules file Toolport can manage (Cursor, Warp). */
   path?: string;
   state: InstructionsApplyState;
+  /** When `state` is `drifted`: the block's body as it is on disk, for the diff and Pull into set. */
+  onDisk?: string;
 }
 
 /** Everything the Rules tab renders, from one `rules_view` call. */
