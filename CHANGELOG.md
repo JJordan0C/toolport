@@ -43,6 +43,7 @@ Entries before the rename below shipped under the project's former name, Conduit
   than every review server including the ones already consented to. A rename or a tool
   allow-list change does not re-prompt. (SBS-1017)
 
+
 - **A form elicitation relayed from an MCP server now says which server is asking.**
   When a server asks the user for input (MCP elicitation in form mode, whether as a
   modern `input_required` result or a legacy server-initiated request), the client
