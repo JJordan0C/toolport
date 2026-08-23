@@ -7,6 +7,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { RuleStateBadge } from "@/components/RuleStateBadge";
 import {
   rulesApply,
+  rulesApplyClient,
   rulesDeleteSet,
   rulesPreview,
   rulesSaveSet,
@@ -69,6 +70,8 @@ export function RulesView() {
 
   const [preview, setPreview] = useState<RulesPreview | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  // Pull into set would replace whatever is typed in the editor; with unsaved edits, ask first.
+  const [confirmPull, setConfirmPull] = useState<string | null>(null);
   // The diff card for a client whose block was edited on disk (SBS-1036).
   const [drift, setDrift] = useState<{
     clientId: string;
@@ -588,6 +591,10 @@ export function RulesView() {
               disabled={busy}
               onClick={() => {
                 const onDisk = drift.onDisk;
+                if (dirty) {
+                  setConfirmPull(onDisk);
+                  return;
+                }
                 setDrift(null);
                 editDraft({ content: onDisk });
               }}
@@ -598,14 +605,33 @@ export function RulesView() {
               variant="outline"
               size="sm"
               disabled={busy}
-              onClick={() => act(rulesApply)}
+              title="Rewrite only this client's file from the set; other clients are left as they are"
+              onClick={() => {
+                const id = drift.clientId;
+                void act(() => rulesApplyClient(id));
+              }}
             >
               <RefreshCw className="size-3.5" />
-              Overwrite the file
+              Overwrite this file
             </Button>
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmPull !== null}
+        onOpenChange={(o) => !o && setConfirmPull(null)}
+        title="Replace your unsaved edits?"
+        description="The editor has changes you have not saved. Pulling the file's version in replaces them. Nothing is written to disk either way."
+        confirmLabel="Replace"
+        destructive
+        onConfirm={() => {
+          const onDisk = confirmPull;
+          setConfirmPull(null);
+          setDrift(null);
+          if (onDisk !== null) editDraft({ content: onDisk });
+        }}
+      />
 
       <ConfirmDialog
         open={confirmDelete !== null}

@@ -15,7 +15,7 @@ Entries before the rename below shipped under the project's former name, Conduit
   whose body differs on disk reads **Edited on disk** instead of "Not applied yet"; every
   automatic apply (startup, saving, switching sets, toggling clients) leaves it alone; and the
   row offers **View diff**, with **Pull into set** (the file's version becomes your unsaved
-  draft) and **Overwrite the file** (the set goes back over it; what **Re-apply** does too).
+  draft) and **Overwrite this file** (the set goes back over that one file; **Re-apply** does it for every switched-on client).
   A change to the set itself is a newer revision and is written as before. Team
   instructions are unchanged: org rules stay authoritative over a member's edit.
   (SBS-1036)

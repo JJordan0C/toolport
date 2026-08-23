@@ -10,6 +10,8 @@ export interface DiffLine {
 }
 
 const MAX_CELLS = 4_000_000;
+/** Past this many output lines the caller renders one DOM node per line; say so instead. */
+const MAX_LINES = 4_000;
 
 function splitLines(text: string): string[] {
   return text === "" ? [] : text.replace(/\n$/, "").split("\n");
@@ -18,7 +20,18 @@ function splitLines(text: string): string[] {
 export function lineDiff(before: string, after: string): DiffLine[] {
   const a = splitLines(before);
   const b = splitLines(after);
-  if (a.length * b.length > MAX_CELLS) {
+  // The table below is (a+1) x (b+1); a one-sided input must not slip past the guard because
+  // the other side is empty, and the fallback must not hand back more lines than anyone could
+  // render or read.
+  if (a.length + b.length > MAX_LINES) {
+    return [
+      {
+        kind: "same",
+        text: `(too large to show line by line: ${a.length} lines in the set, ${b.length} in the file)`,
+      },
+    ];
+  }
+  if ((a.length + 1) * (b.length + 1) > MAX_CELLS) {
     return [
       ...a.map((text) => ({ kind: "del" as const, text })),
       ...b.map((text) => ({ kind: "add" as const, text })),

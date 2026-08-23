@@ -3184,6 +3184,15 @@ async fn rules_preview(
         .map_err(|e| e.to_string())?
 }
 
+/// "Overwrite the file" on one client's drift card: that client's file is rewritten from the
+/// set; every other client is reconciled, so a drifted block elsewhere is left alone (SBS-1036).
+#[tauri::command]
+async fn rules_apply_client(client_id: String) -> Result<rules::RulesView, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::apply_overwriting_client(&client_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// The explicit Re-apply / Overwrite button: make every opted-in client's file match the active
 /// set, including a block the user edited on disk (SBS-1036). Every automatic path reconciles
 /// instead and leaves such a block alone.
@@ -5431,6 +5440,7 @@ pub fn run() {
             rules_set_client_enabled,
             rules_preview,
             rules_apply,
+            rules_apply_client,
             hooks_view,
             hooks_set_enabled,
             hooks_preview,

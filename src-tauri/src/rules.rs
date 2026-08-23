@@ -195,8 +195,24 @@ pub fn apply_overwriting_drift() -> Result<RulesView, String> {
     apply_with(ApplyMode::Overwrite)
 }
 
+/// Overwrite exactly ONE client's file from the set (the "Overwrite the file" action on that
+/// client's drift card) and reconcile everything else. A drifted block in some other client's
+/// file is left alone: the user resolved the one they were looking at, not all of them.
+pub fn apply_overwriting_client(client_id: &str) -> Result<RulesView, String> {
+    let installed = installed_targets();
+    let Some(path) = installed
+        .iter()
+        .find(|c| c.id == client_id)
+        .and_then(|c| c.target.as_ref())
+        .map(|t| t.path.clone())
+    else {
+        return Err("That client has no rules file Toolport manages.".to_string());
+    };
+    apply_to(&installed, ApplyMode::OverwriteOnly(path))
+}
+
 /// Whether an apply may rewrite a block the user has edited on disk since Toolport wrote it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ApplyMode {
     /// Write what is missing or behind the set; leave a hand-edited current-revision block as
     /// it is and report it [`ApplyState::Drifted`]. What every automatic path uses: startup,
@@ -204,6 +220,18 @@ enum ApplyMode {
     Reconcile,
     /// Write everything that differs from the set, drift included.
     Overwrite,
+    /// Reconcile, except that the one file at this path is written even if drifted.
+    OverwriteOnly(std::path::PathBuf),
+}
+
+impl ApplyMode {
+    fn overwrites(&self, path: &std::path::Path) -> bool {
+        match self {
+            ApplyMode::Reconcile => false,
+            ApplyMode::Overwrite => true,
+            ApplyMode::OverwriteOnly(only) => only == path,
+        }
+    }
 }
 
 fn apply_with(mode: ApplyMode) -> Result<RulesView, String> {
@@ -242,7 +270,7 @@ fn apply_to(installed: &[ClientTarget], mode: ApplyMode) -> Result<RulesView, St
         let mut left_drifted: Vec<String> = Vec::new();
         if let Some(s) = set.as_ref() {
             for target in &targets {
-                if mode == ApplyMode::Reconcile
+                if !mode.overwrites(&target.path)
                     && instructions::drifted_body(target, &s.id, s.revision, &s.content).is_some()
                 {
                     left_drifted.push(target.path.to_string_lossy().to_string());
@@ -835,13 +863,19 @@ mod tests {
         assert!(std::fs::read_to_string(&codex_path).unwrap().contains("Be brief. Always."));
         assert_eq!(by_id(&view, "codex").state, ApplyState::Applied);
 
-        // Drift again, then the explicit Overwrite reverts it.
-        let text = std::fs::read_to_string(&codex_path).unwrap();
-        std::fs::write(&codex_path, text.replace("Always.", "Never.")).unwrap();
-        assert_eq!(
-            by_id(&apply_to(&installed, ApplyMode::Reconcile).unwrap(), "codex").state,
-            ApplyState::Drifted
-        );
+        // Drift BOTH again. Overwriting one client's file leaves the other's edit alone.
+        for path in [&codex_path, &claude_path] {
+            let text = std::fs::read_to_string(path).unwrap();
+            std::fs::write(path, text.replace("Always.", "Never.")).unwrap();
+        }
+        let view = apply_to(&installed, ApplyMode::Reconcile).unwrap();
+        assert_eq!(by_id(&view, "codex").state, ApplyState::Drifted);
+        assert_eq!(by_id(&view, "claude-code").state, ApplyState::Drifted);
+        let view = apply_to(&installed, ApplyMode::OverwriteOnly(claude_path.clone())).unwrap();
+        assert_eq!(by_id(&view, "claude-code").state, ApplyState::Applied, "the one asked for");
+        assert_eq!(by_id(&view, "codex").state, ApplyState::Drifted, "the other is untouched");
+        assert!(std::fs::read_to_string(&codex_path).unwrap().contains("Never."));
+        // And the explicit overwrite-everything reverts the rest.
         let view = apply_to(&installed, ApplyMode::Overwrite).unwrap();
         assert!(std::fs::read_to_string(&codex_path).unwrap().contains("Be brief. Always."));
         assert_eq!(by_id(&view, "codex").state, ApplyState::Applied);

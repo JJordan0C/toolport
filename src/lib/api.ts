@@ -610,6 +610,11 @@ export function rulesApply(): Promise<RulesView> {
   return invoke<RulesView>("rules_apply");
 }
 
+/** Overwrite ONE client's file from the set (its drift card's action); everything else reconciles. */
+export function rulesApplyClient(clientId: string): Promise<RulesView> {
+  return invoke<RulesView>("rules_apply_client", { clientId });
+}
+
 export interface TeamPushPreview {
   baseVersion: number;
   localFingerprint: string;

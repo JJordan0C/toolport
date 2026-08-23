@@ -11,6 +11,7 @@ const api = vi.hoisted(() => ({
   rulesSetClientEnabled: vi.fn(),
   rulesPreview: vi.fn(),
   rulesApply: vi.fn(),
+  rulesApplyClient: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => api);
@@ -242,7 +243,35 @@ describe("RulesView", () => {
     expect(screen.queryByText("Edited on disk: Codex")).not.toBeInTheDocument();
   });
 
-  it("Overwrite the file re-applies the set over the edited block", async () => {
+  it("Pull into set asks before replacing unsaved edits", async () => {
+    api.rulesView.mockResolvedValue(
+      view({
+        clients: [
+          {
+            id: "codex",
+            name: "Codex",
+            enabled: true,
+            path: "/home/a/.codex/AGENTS.md",
+            state: "drifted",
+            onDisk: "From the file.",
+          },
+        ],
+      }),
+    );
+    render(<RulesView />);
+    const editor = await screen.findByLabelText("Rules");
+    await userEvent.type(editor, " Typed but unsaved.");
+    await userEvent.click(screen.getByRole("button", { name: "View diff" }));
+    await userEvent.click(screen.getByRole("button", { name: "Pull into set" }));
+    // Nothing replaced yet: the confirm is up and the typed text is intact.
+    expect(screen.getByText("Replace your unsaved edits?")).toBeInTheDocument();
+    expect(editor).toHaveValue("Always run tests. Typed but unsaved.");
+    await userEvent.click(screen.getByRole("button", { name: "Replace" }));
+    expect(editor).toHaveValue("From the file.");
+    expect(api.rulesApply).not.toHaveBeenCalled();
+  });
+
+  it("Overwrite this file re-applies the set over the edited block of that client only", async () => {
     api.rulesView.mockResolvedValue(
       view({
         clients: [
@@ -257,12 +286,13 @@ describe("RulesView", () => {
         ],
       }),
     );
-    api.rulesApply.mockResolvedValue(view());
+    api.rulesApplyClient.mockResolvedValue(view());
     render(<RulesView />);
     await screen.findByLabelText("Rules");
     await userEvent.click(screen.getByRole("button", { name: "View diff" }));
-    await userEvent.click(screen.getByRole("button", { name: "Overwrite the file" }));
-    await waitFor(() => expect(api.rulesApply).toHaveBeenCalledTimes(1));
+    await userEvent.click(screen.getByRole("button", { name: "Overwrite this file" }));
+    await waitFor(() => expect(api.rulesApplyClient).toHaveBeenCalledWith("codex"));
+    expect(api.rulesApply).not.toHaveBeenCalled();
     // The refreshed view says Applied and the diff card is gone.
     expect(await screen.findByText("Applied")).toBeInTheDocument();
     expect(screen.queryByText("Edited on disk: Codex")).not.toBeInTheDocument();
