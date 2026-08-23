@@ -429,15 +429,22 @@ pub fn delete_set(id: &str) -> Result<RulesView, String> {
         .into_iter()
         .filter(|p| p.set_id.as_deref() == Some(id))
         .collect();
-    for project in &orphaned {
-        let _ = clean_project_targets(&project.targets, &[]);
-    }
+    // A path that could not be cleaned stays on the project's record, exactly as in
+    // project_remove: cleanup is driven by that record, so dropping it would strand the block.
+    let leftovers: Vec<(String, Vec<String>)> = orphaned
+        .iter()
+        .map(|p| (p.id.clone(), clean_project_targets(&p.targets, &[])))
+        .collect();
     crate::registry::update(|reg| {
         reg.remove_rule_set(id);
         for p in reg.rules_projects.iter_mut() {
             if p.set_id.as_deref() == Some(id) {
                 p.set_id = None;
-                p.targets.clear();
+                p.targets = leftovers
+                    .iter()
+                    .find(|(pid, _)| pid == &p.id)
+                    .map(|(_, t)| t.clone())
+                    .unwrap_or_default();
             }
         }
         Ok(())
@@ -1129,6 +1136,29 @@ mod tests {
         assert_eq!(reg.rules_projects.len(), 1);
         assert!(reg.rules_projects[0].set_id.is_none());
         assert!(reg.rules_projects[0].targets.is_empty());
+
+        // A file whose block cannot be cleaned (an unterminated marker) stays on the project's
+        // record when its set is deleted, so a later remove can still try.
+        let set2 = crate::registry::update(|reg| reg.upsert_rule_set(None, "Two", "Two."))
+            .unwrap()
+            .1;
+        project_set_set(&pid, Some(&set2)).unwrap();
+        apply_project_with(&pid, &installed).unwrap();
+        let agents = root_path.join("AGENTS.md");
+        std::fs::write(
+            &agents,
+            format!("{}\nunterminated", crate::instructions::PERSONAL_SENTINEL_START_PREFIX),
+        )
+        .unwrap();
+        delete_set(&set2).unwrap();
+        let reg = crate::registry::load().unwrap();
+        assert!(reg.rules_projects[0].set_id.is_none());
+        assert_eq!(
+            reg.rules_projects[0].targets,
+            vec![agents.to_string_lossy().to_string()],
+            "the uncleanable path stays on record"
+        );
+        assert!(agents.exists());
     }
 
     // ---- registry-level set management (no filesystem) ----

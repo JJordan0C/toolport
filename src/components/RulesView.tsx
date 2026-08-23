@@ -180,7 +180,14 @@ export function RulesView() {
     };
   }, []);
 
-  /** Run a mutating call, adopt the refreshed view, and surface any failure in place. */
+  /**
+   * Run a mutating call, adopt the refreshed view, and surface any failure in place.
+   *
+   * On failure the view is refreshed anyway, best-effort and draft-preserving: an action can do
+   * part of its work and then report a problem (a project Apply that wrote two files and was
+   * refused on the third, a remove that could not clean one path), and leaving the rows as they
+   * were would show a state the disk and the registry no longer have.
+   */
   async function run(fn: () => Promise<RulesViewData>, preserveDraft = false) {
     setBusy(true);
     setError(null);
@@ -190,6 +197,11 @@ export function RulesView() {
       else adopt(next);
     } catch (e) {
       setError(String(e));
+      try {
+        adoptPreservingDraft(await rulesView());
+      } catch {
+        // The error above is the one worth showing; a failed refresh adds nothing.
+      }
     } finally {
       setBusy(false);
     }

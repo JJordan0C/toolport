@@ -368,6 +368,53 @@ describe("RulesView", () => {
     expect(screen.getByLabelText("Rules")).toHaveValue("Always run tests.");
   });
 
+  it("a failed action still refreshes the view, so a partial apply shows its true state", async () => {
+    const before = view({
+      projects: [
+        {
+          id: "repo",
+          path: "/home/a/code/repo",
+          name: "repo",
+          setId: "work",
+          files: [
+            {
+              key: "agents-md",
+              relPath: "AGENTS.md",
+              path: "/home/a/code/repo/AGENTS.md",
+              clients: ["Codex"],
+              enabled: true,
+              state: "stale" as const,
+            },
+          ],
+        },
+      ],
+    });
+    const after = view({
+      projects: [
+        {
+          ...before.projects[0],
+          files: [{ ...before.projects[0].files[0], state: "applied" as const }],
+        },
+      ],
+    });
+    api.rulesView.mockResolvedValueOnce(before).mockResolvedValueOnce(after);
+    api.rulesProjectApply.mockRejectedValue(
+      new Error(
+        "/home/a/code/repo/GEMINI.md was not written: it could not be read or written.",
+      ),
+    );
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+    expect(screen.getByText("Not applied yet")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Apply to repo" }));
+    // The error is shown AND the row reflects what actually happened on disk.
+    expect(await screen.findByRole("alert")).toHaveTextContent("was not written");
+    // Codex's global row was already Applied; the project row joins it after the refresh.
+    await waitFor(() => expect(screen.getAllByText("Applied")).toHaveLength(2));
+    expect(screen.queryByText("Not applied yet")).not.toBeInTheDocument();
+    expect(api.rulesView).toHaveBeenCalledTimes(2);
+  });
+
   it("adding a project goes through the folder picker and registers the picked path", async () => {
     dialog.open.mockResolvedValue("/home/a/code/other");
     api.rulesProjectAdd.mockResolvedValue(
