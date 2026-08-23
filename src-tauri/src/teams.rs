@@ -1074,6 +1074,32 @@ fn apply_instructions_to(
     let new_content = desired.map(str::to_string);
     let mut recorded_targets = written.clone();
     recorded_targets.extend(keep);
+    record_applied_instructions(team_id, new_content, version, recorded_targets, &written);
+}
+
+/// Persist the outcome of one apply: the content+version watermark and the recorded set, by
+/// compare-and-set on `team_id`. When the set loses - the team changed or was cleared while
+/// the files were being written - the files just written have no record that would ever
+/// clean them, and the answer used to be to delete them on the spot. That was the wrong
+/// repair (SBS-914): a winner that switched teams wrote ITS block to those same paths, under
+/// the same markers, so `remove_recorded` there strips the winner's block; and if the
+/// winner's own write had failed, it strips the only good block while the UI reports the
+/// new config. So instead:
+///
+/// * a team is still connected -> hand the paths to ITS record. Its next reconcile sees a
+///   path whose content is not its own as Stale and rewrites it, which is exactly the
+///   reconciliation the record exists to drive. Nothing is deleted.
+/// * no team remains (a disconnect won) -> an empty file is the correct end state, and
+///   removing our block is what disconnect does to everything it had on record. Only here
+///   is removal right, because only here is nothing left that could want the block.
+fn record_applied_instructions(
+    team_id: &str,
+    new_content: Option<String>,
+    version: i64,
+    recorded_targets: Vec<String>,
+    written: &[String],
+) {
+    use crate::instructions;
     let recorded = crate::registry::update(|reg| {
         if let Some(t) = reg.team.as_mut() {
             if t.team_id == team_id {
@@ -1085,8 +1111,22 @@ fn apply_instructions_to(
         }
         Ok(false)
     });
-    if !matches!(recorded, Ok((_, true))) {
-        for path in &written {
+    if matches!(recorded, Ok((_, true))) {
+        return;
+    }
+    let adopted = crate::registry::update(|reg| {
+        if let Some(t) = reg.team.as_mut() {
+            for path in written {
+                if !t.team_instructions_targets.contains(path) {
+                    t.team_instructions_targets.push(path.clone());
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    });
+    if !matches!(adopted, Ok((_, true))) {
+        for path in written {
             let _ = instructions::remove_recorded(
                 std::path::Path::new(path),
                 instructions::Scope::Team,
@@ -2401,6 +2441,80 @@ mod tests {
         let (_, _, recorded) = loaded_instructions();
         assert!(!path.exists(), "the repaired recorded path should be cleaned");
         assert!(recorded.is_empty(), "a successful retry may forget the path");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// SBS-914: losing the compare-and-set must not delete what we wrote. A team switch that
+    /// won the race gets the paths on its own record and reconciles them; only a disconnect
+    /// (no team left) makes an empty file the right end state.
+    #[test]
+    fn a_lost_record_race_hands_written_paths_to_the_winner_instead_of_deleting_them() {
+        use crate::instructions::{self, ApplyState, Scope, Strategy, Target};
+
+        let _env = crate::clients::env_test_lock();
+        let _dirs = crate::registry::data_dir_test_lock();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-sbs914-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data = crate::registry::DataDirOverride::set(scratch.join("data"));
+        let path = scratch.join("AGENTS.md");
+        let key = path.to_string_lossy().to_string();
+        let target = Target {
+            path: path.clone(),
+            strategy: Strategy::SentinelBlock,
+            scope: Scope::Team,
+            char_cap: None,
+            blocked_if_present: None,
+        };
+        let connect = |team: &str| {
+            let conn: TeamConnection = serde_json::from_value(json!({
+                "serverUrl": "https://teams.example.com",
+                "teamId": team,
+                "role": "member",
+            }))
+            .unwrap();
+            crate::registry::update(|reg| {
+                reg.team = Some(conn);
+                Ok(())
+            })
+            .unwrap();
+        };
+
+        // The loser (team_a) finished writing; by the time it records, team_b has won.
+        assert_eq!(instructions::write_target(&target, "team_a", 3, "a's rules"), ApplyState::Applied);
+        connect("team_b");
+        record_applied_instructions("team_a", Some("a's rules".into()), 3, vec![key.clone()], &[key.clone()]);
+        assert!(
+            instructions::is_present(&path, Scope::Team),
+            "the block is left for the winner to reconcile, not deleted"
+        );
+        let (content, _, recorded) = loaded_instructions();
+        assert_eq!(content, None, "the loser's watermark is not written over the winner's");
+        assert_eq!(recorded, vec![key.clone()], "the winner's record now owns the path");
+        // The winner's next apply sees the path as Stale for its own content and rewrites it.
+        assert_eq!(
+            instructions::current_state(&target, "team_b", 1, "b's rules"),
+            ApplyState::Stale
+        );
+
+        // A disconnect that won leaves no team: nothing could want the block, so it goes.
+        crate::registry::update(|reg| {
+            reg.team = None;
+            Ok(())
+        })
+        .unwrap();
+        record_applied_instructions("team_a", Some("a's rules".into()), 4, vec![key.clone()], &[key.clone()]);
+        assert!(!path.exists(), "with no team left, our block (and the file we created) is removed");
+
+        // The ordinary case: the set holds and everything is recorded as before.
+        assert_eq!(instructions::write_target(&target, "team_a", 5, "a's rules"), ApplyState::Applied);
+        connect("team_a");
+        record_applied_instructions("team_a", Some("a's rules".into()), 5, vec![key.clone()], &[key.clone()]);
+        let (content, version, recorded) = loaded_instructions();
+        assert_eq!(content.as_deref(), Some("a's rules"));
+        assert_eq!(version, 5);
+        assert_eq!(recorded, vec![key]);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 

@@ -4,6 +4,22 @@ All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 Entries before the rename below shipped under the project's former name, Conduit.
 
+## [Unreleased]
+
+### Fixed
+
+- **Team Instructions: losing a write race no longer deletes the winner's block.** When
+  the team changed or was cleared while an apply was writing its files, the apply that
+  lost the compare-and-set removed every file it had just written. If the apply that won
+  had written its own block to those same paths (same markers), the loser stripped it;
+  if the winner's write had failed, the loser stripped the only good block while the UI
+  reported the new config. The lost apply now hands its written paths to whichever team
+  is connected, whose next reconcile sees them as stale and rewrites them; only when no
+  team remains at all (a disconnect won) is the block removed, which is what disconnect
+  does to everything it has on record anyway. The other half of this ticket - a path
+  whose cleanup failed being dropped from the record and stranded - was already fixed
+  alongside SBS-917. (SBS-914)
+
 ## [1.16.0] - 2026-08-22
 
 ### Fixed
