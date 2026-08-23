@@ -853,11 +853,24 @@ export function RulesView() {
         open={confirmDelete !== null}
         onOpenChange={(o) => !o && setConfirmDelete(null)}
         title="Delete this rule set?"
-        description={
-          confirmDelete === data.activeSetId
-            ? "Toolport removes what it wrote from every client. Your own content in those files is left alone."
-            : "This unused rule set is deleted. The active set and client files stay unchanged."
-        }
+        description={(() => {
+          // A set can be in use by projects even when it is not the global active set;
+          // deleting it cleans Toolport's files out of those folders too, so say so.
+          const projects = data.projects.filter((p) => p.setId === confirmDelete);
+          const projectNote =
+            projects.length > 0
+              ? ` It is also applied to ${projects.length === 1 ? "the project" : "projects"} ${projects
+                  .map((p) => `\u201C${p.name}\u201D`)
+                  .join(
+                    ", ",
+                  )}: Toolport removes what it wrote in ${projects.length === 1 ? "that folder" : "those folders"}. Your repo's own files are left alone.`
+              : "";
+          return confirmDelete === data.activeSetId
+            ? `Toolport removes what it wrote from every client. Your own content in those files is left alone.${projectNote}`
+            : projects.length > 0
+              ? `This rule set is deleted. The active set and client files stay unchanged.${projectNote}`
+              : "This unused rule set is deleted. The active set and client files stay unchanged.";
+        })()}
         confirmLabel="Delete"
         destructive
         onConfirm={() => {

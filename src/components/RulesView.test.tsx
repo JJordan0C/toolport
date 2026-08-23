@@ -415,6 +415,33 @@ describe("RulesView", () => {
     expect(api.rulesView).toHaveBeenCalledTimes(2);
   });
 
+  it("deleting a set a project uses says the project's folder is cleaned too", async () => {
+    api.rulesView.mockResolvedValue(
+      view({
+        sets: [
+          { id: "work", name: "Work", content: "Always run tests.", revision: 2 },
+          { id: "side", name: "Side", content: "Side rules.", revision: 1 },
+        ],
+        projects: [
+          {
+            id: "repo",
+            path: "/home/a/code/repo",
+            name: "repo",
+            setId: "side",
+            files: [],
+          },
+        ],
+      }),
+    );
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+    await userEvent.click(screen.getByRole("button", { name: "Delete Side" }));
+    expect(
+      screen.getByText(/also applied to the project \u201Crepo\u201D/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/This unused rule set is deleted/)).not.toBeInTheDocument();
+  });
+
   it("adding a project goes through the folder picker and registers the picked path", async () => {
     dialog.open.mockResolvedValue("/home/a/code/other");
     api.rulesProjectAdd.mockResolvedValue(
