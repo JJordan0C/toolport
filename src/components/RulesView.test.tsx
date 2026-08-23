@@ -11,9 +11,13 @@ const api = vi.hoisted(() => ({
   rulesSetClientEnabled: vi.fn(),
   rulesPreview: vi.fn(),
   rulesApply: vi.fn(),
+  rulesImportCandidates: vi.fn(),
+  rulesImportFile: vi.fn(),
 }));
 
 vi.mock("@/lib/api", () => api);
+const dialog = vi.hoisted(() => ({ open: vi.fn() }));
+vi.mock("@tauri-apps/plugin-dialog", () => dialog);
 
 import { clearRulesDraftCache, setRulesDraft } from "@/lib/rulesDraftCache";
 import { RulesView } from "./RulesView";
@@ -208,6 +212,115 @@ describe("RulesView", () => {
       ),
     );
     expect(api.rulesSetActive).toHaveBeenCalledWith("personal");
+  });
+
+  it("starts a new set from an existing rules file without selecting (and so applying) it", async () => {
+    api.rulesImportCandidates.mockResolvedValue([
+      {
+        clientId: "codex",
+        clientName: "Codex",
+        path: "/home/a/.codex/AGENTS.md",
+        bytes: 2048,
+      },
+    ]);
+    api.rulesImportFile.mockResolvedValue({
+      path: "/home/a/.codex/AGENTS.md",
+      name: "Imported from Codex",
+      content: "Be terse.",
+      strippedOurs: true,
+    });
+    const withNew = view({
+      sets: [
+        { id: "work", name: "Work", content: "Always run tests.", revision: 2 },
+        { id: "imp", name: "Imported from Codex", content: "Be terse.", revision: 1 },
+      ],
+    });
+    api.rulesSaveSet.mockResolvedValue(withNew);
+
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+    await userEvent.click(screen.getByRole("button", { name: "Start from a file" }));
+    // The panel lists the client's own file with its size, and says the file is not changed.
+    const candidate = await screen.findByRole("button", {
+      name: /Codex .*AGENTS\.md.*2\.0 KB/,
+    });
+    expect(screen.getByText(/the file is not\s+changed/)).toBeInTheDocument();
+    await userEvent.click(candidate);
+
+    // The set is created WITH the text and not selected: selecting applies, and that is the
+    // user's call. The editor still shows the set that was active; the new chip is there.
+    await waitFor(() =>
+      expect(api.rulesSaveSet).toHaveBeenCalledWith("Imported from Codex", "Be terse."),
+    );
+    expect(api.rulesImportFile).toHaveBeenCalledWith("/home/a/.codex/AGENTS.md", "Codex");
+    expect(api.rulesSetActive).not.toHaveBeenCalled();
+    expect(
+      await screen.findByRole("button", { name: "Imported from Codex" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Rules")).toHaveValue("Always run tests.");
+    // It says what happened: Toolport's own block was left out, and nothing applied yet.
+    expect(
+      screen.getByText(/block Toolport had written there was left out/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Pick it above to edit and apply it/)).toBeInTheDocument();
+    expect(dialog.open).not.toHaveBeenCalled();
+  });
+
+  it("an import that becomes the first applied set is not overwritten by a stale held draft", async () => {
+    // Nothing selected: the backend selects the new set. A draft left behind by an earlier,
+    // deleted set that had the same id must not be restored over the imported text.
+    api.rulesView.mockResolvedValue(view({ sets: [], activeSetId: undefined }));
+    api.rulesImportCandidates.mockResolvedValue([]);
+    dialog.open.mockResolvedValue("/home/a/.codex/AGENTS.md");
+    api.rulesImportFile.mockResolvedValue({
+      path: "/home/a/.codex/AGENTS.md",
+      name: "Imported from Codex",
+      content: "Be terse.",
+      strippedOurs: false,
+    });
+    api.rulesSaveSet.mockResolvedValue(
+      view({
+        sets: [
+          {
+            id: "imported-from-codex",
+            name: "Imported from Codex",
+            content: "Be terse.",
+            revision: 1,
+          },
+        ],
+        activeSetId: "imported-from-codex",
+      }),
+    );
+    setRulesDraft("imported-from-codex", {
+      name: "Imported from Codex",
+      content: "OLD STALE TEXT",
+    });
+
+    render(<RulesView />);
+    await screen.findByText(/No rule set yet/);
+    await userEvent.click(screen.getByRole("button", { name: "Start from a file" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Choose a file…" }));
+    await waitFor(() => expect(screen.getByLabelText("Rules")).toHaveValue("Be terse."));
+    expect(screen.getByRole("button", { name: "Saved" })).toBeDisabled();
+    expect(screen.getByText(/It is now your applied set/)).toBeInTheDocument();
+  });
+
+  it("the file picker feeds the same import, and a failed import is surfaced", async () => {
+    api.rulesImportCandidates.mockResolvedValue([]);
+    dialog.open.mockResolvedValue("/tmp/mine.md");
+    api.rulesImportFile.mockRejectedValue(new Error("/tmp/mine.md is not UTF-8 text"));
+
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+    await userEvent.click(screen.getByRole("button", { name: "Start from a file" }));
+    expect(await screen.findByText(/No rules files found/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Choose a file…" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("not UTF-8");
+    expect(api.rulesImportFile).toHaveBeenCalledWith("/tmp/mine.md", undefined);
+    // Nothing was created for a file that could not be read.
+    expect(api.rulesSaveSet).not.toHaveBeenCalled();
+    // The editor still shows the set that was there before.
+    expect(screen.getByLabelText("Rules")).toHaveValue("Always run tests.");
   });
 
   it("creating a set switches to it, so the editor is not still on the old one", async () => {

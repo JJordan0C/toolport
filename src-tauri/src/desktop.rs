@@ -3184,6 +3184,26 @@ async fn rules_preview(
         .map_err(|e| e.to_string())?
 }
 
+/// Rules files the detected clients already have, for "Start from a file" (SBS-1035). Read-only.
+#[tauri::command]
+async fn rules_import_candidates() -> Result<Vec<rules::ImportCandidate>, String> {
+    tauri::async_runtime::spawn_blocking(rules::import_candidates)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Read one file as the seed for a new rule set (SBS-1035). Read-only: nothing is saved and
+/// the file is left as it was; the UI puts the text in the editor for the user to review.
+#[tauri::command]
+async fn rules_import_file(
+    path: String,
+    client_name: Option<String>,
+) -> Result<rules::ImportedRules, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::import_file(&path, client_name.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Re-apply the active set. Used by the "Apply" button and after a client is connected.
 #[tauri::command]
 async fn rules_apply() -> Result<rules::RulesView, String> {
@@ -5429,6 +5449,8 @@ pub fn run() {
             rules_set_client_enabled,
             rules_preview,
             rules_apply,
+            rules_import_candidates,
+            rules_import_file,
             hooks_view,
             hooks_set_enabled,
             hooks_preview,

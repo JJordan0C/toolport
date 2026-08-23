@@ -36,6 +36,27 @@ it refuses the save and tells you. This only comes up if you copy out of the
 preview pane, which shows the finished file including the markers. Copy just your
 own text.
 
+## Starting from an existing file
+
+Most people already have rules somewhere before they open this tab: a `~/.claude/CLAUDE.md`,
+a `~/.codex/AGENTS.md`, a `GEMINI.md`, a `.goosehints`. **Start from a file** (next to
+**New set**) lists the rules files the detected clients already read, with their sizes, and
+offers a file picker for anything else. Picking one creates a new set named after the client
+("Imported from Codex") from the file's text. The new set is **not** selected for you -
+selecting a set applies it to every client you have switched on, and that is your call to
+make with the new set in front of you - unless no set was selected at all, in which case it
+becomes the applied set, as any first set does.
+
+Two rules, both of them about not surprising you:
+
+- **The file is read, never written.** Importing changes nothing on disk. If you later switch
+  that client on, Toolport appends its block beside your original text as usual; remove the
+  original by hand if you want only one copy.
+- **Only your text comes in.** Anything Toolport itself wrote into that file (its own marked
+  block, or a whole file it owns) is left out, and the import says so. A file whose remaining
+  text still looks like Toolport's marker comments is refused, the same way a save is, so you
+  are told up front rather than at the first write.
+
 ## Before anything is written
 
 - **Every client starts switched off.** Nothing is written until you tick a client

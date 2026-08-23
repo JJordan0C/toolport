@@ -610,6 +610,25 @@ export interface RulesPreview {
   state: InstructionsApplyState;
 }
 
+/** A rules file already on this machine that a new set can start from (SBS-1035). */
+export interface RulesImportCandidate {
+  clientId: string;
+  clientName: string;
+  path: string;
+  bytes: number;
+}
+
+/**
+ * What importing a file yields: the user's own text with anything Toolport wrote removed. Nothing
+ * is saved by the import and the source file is not touched; the UI seeds a draft with it.
+ */
+export interface RulesImportedFile {
+  path: string;
+  name: string;
+  content: string;
+  strippedOurs: boolean;
+}
+
 export function activeProfile(registry: Registry): Profile | undefined {
   return (
     registry.profiles.find((p) => p.id === registry.activeProfileId) ??
