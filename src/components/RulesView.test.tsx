@@ -48,7 +48,13 @@ function view(over: Partial<RulesViewData> = {}): RulesViewData {
         path: "/home/a/.claude/rules/toolport-rules.md",
         state: "stale",
       },
-      { id: "cursor", name: "Cursor", enabled: false, state: "unsupported" },
+      {
+        id: "cursor",
+        name: "Cursor",
+        enabled: false,
+        state: "unsupported",
+        projectCovered: true,
+      },
     ],
     projects: [],
     ...over,
@@ -77,12 +83,37 @@ describe("RulesView", () => {
   });
 
   it("names the clients it cannot write instead of hiding them", async () => {
+    api.rulesView.mockResolvedValue(
+      view({
+        clients: [
+          {
+            id: "cursor",
+            name: "Cursor",
+            enabled: false,
+            state: "unsupported",
+            projectCovered: true,
+          },
+          {
+            id: "claude-desktop",
+            name: "Claude Desktop",
+            enabled: false,
+            state: "unsupported",
+          },
+          { id: "opencode", name: "OpenCode", enabled: false, state: "unsupported" },
+        ],
+      }),
+    );
     render(<RulesView />);
     await screen.findByLabelText("Rules");
-    // Cursor has no rules file we manage: it must be called out, not silently dropped, or the
-    // user thinks their rules reached it.
+    // Cursor reads project AGENTS.md: pointed at Projects, not written off as unsupported.
+    expect(screen.getByText(/No global rules file for/)).toHaveTextContent("Cursor");
+    expect(screen.getByText(/add a folder under Projects below/)).toBeInTheDocument();
+    // Claude Desktop is the chat app; saying "unsupported" reads as Claude Code being missed.
+    expect(screen.getByText(/Claude Desktop is the chat app/)).toBeInTheDocument();
+    // A client with rules nowhere is still called out, not silently dropped, or the user
+    // thinks their rules reached it.
     expect(screen.getByText(/No rules file Toolport can write for/)).toHaveTextContent(
-      "Cursor",
+      "OpenCode",
     );
     expect(screen.queryByLabelText("Cursor")).not.toBeInTheDocument();
   });

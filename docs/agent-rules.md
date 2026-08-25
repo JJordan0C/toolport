@@ -108,10 +108,12 @@ Claude Code extension, and one write covers both when both are installed.
 ### Clients with no rules file Toolport can write
 
 Some clients keep their global rules somewhere Toolport cannot write. They have no
-checkbox; the Clients section lists whichever of them it detects underneath ("No rules
-file Toolport can write for ..."), so you know to paste your rules in yourself. Toolport
-does not silently skip them. Which names appear depends on what is installed, so the list
-below is the full set rather than what you will see.
+checkbox; the Clients section lists whichever of them it detects underneath, so nothing
+is silently skipped, and it says which of three cases each one is: clients that read
+project rules (Cursor, GitHub Copilot CLI) are pointed at the Projects section, Claude
+Desktop is noted as the chat app with Claude Code inside it already covered, and the
+rest say to paste your rules in by hand. Which names appear depends on what is
+installed, so the list below is the full set rather than what you will see.
 
 - **Cursor** and **Warp** keep global rules in their own UI or account: Cursor's User
   rules in _Customize -> Rules_, Warp's in Warp Drive. Both also read per-project files

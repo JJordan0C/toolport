@@ -37,6 +37,11 @@ pub struct ClientStatus {
     /// `None` when this client has no global-rules location we can write (Cursor, Warp).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// `true` when a client with no global rules file still reads one of the files the Projects
+    /// section writes (Cursor, GitHub Copilot CLI), so the UI can point at Projects instead of
+    /// calling the client unsupported. Always `false` when `path` is set.
+    #[serde(default)]
+    pub project_covered: bool,
     pub state: ApplyState,
     /// When `state` is [`ApplyState::Drifted`]: the body as it is on disk right now, so the UI
     /// can show the difference and offer to pull it into the set. Absent otherwise.
@@ -160,6 +165,8 @@ fn status_from(
                     .target
                     .as_ref()
                     .map(|t| t.path.to_string_lossy().to_string()),
+                project_covered: c.target.is_none()
+                    && PROJECT_FILES.iter().any(|f| f.clients.contains(&c.id.as_str())),
                 state,
                 on_disk,
             }
