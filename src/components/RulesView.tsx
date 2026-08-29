@@ -455,6 +455,14 @@ export function RulesView() {
   const clients = data?.clients ?? [];
   const supported = clients.filter((c) => c.path);
   const unsupported = clients.filter((c) => !c.path);
+  // Three different truths hide behind "no global rules file", and lumping them into one
+  // "unsupported" sentence overstates it: Cursor and Copilot CLI are reached per project,
+  // and Claude Desktop is the chat app while Claude Code inside it is already covered.
+  const projectOnly = unsupported.filter((c) => c.projectCovered);
+  const chatDesktop = unsupported.filter((c) => c.id === "claude-desktop");
+  const manualOnly = unsupported.filter(
+    (c) => !c.projectCovered && c.id !== "claude-desktop",
+  );
   const onCount = supported.filter((c) => c.enabled).length;
   // Name the client in the card header. The path alone is ambiguous wherever two clients share a
   // file (Claude Code / VS Code, Gemini CLI / Antigravity).
@@ -707,10 +715,27 @@ export function RulesView() {
         </ul>
 
         {unsupported.length > 0 && (
-          <p className="mt-3 text-xs text-muted-foreground">
-            No rules file Toolport can write for{" "}
-            {unsupported.map((c) => c.name).join(", ")}. Paste your rules in by hand.
-          </p>
+          <div className="mt-3 space-y-1 text-xs text-muted-foreground">
+            {projectOnly.length > 0 && (
+              <p>
+                No global rules file for {projectOnly.map((c) => c.name).join(", ")}, but
+                project rules reach {projectOnly.length === 1 ? "it" : "them"}: add a
+                folder under Projects below.
+              </p>
+            )}
+            {chatDesktop.length > 0 && (
+              <p>
+                Claude Desktop is the chat app and has no rules file; Claude Code inside
+                it is covered by the Claude Code row above.
+              </p>
+            )}
+            {manualOnly.length > 0 && (
+              <p>
+                No rules file Toolport can write for{" "}
+                {manualOnly.map((c) => c.name).join(", ")}. Paste your rules in by hand.
+              </p>
+            )}
+          </div>
         )}
       </div>
 

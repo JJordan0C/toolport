@@ -597,6 +597,11 @@ export interface RulesClientStatus {
   enabled: boolean;
   /** Absent when this client has no global-rules file Toolport can manage (Cursor, Warp). */
   path?: string;
+  /**
+   * No global rules file, but the client reads one of the files the Projects section writes
+   * (Cursor, GitHub Copilot CLI), so the UI points at Projects instead of "unsupported".
+   */
+  projectCovered?: boolean;
   state: InstructionsApplyState;
   /** When `state` is `drifted`: the block's body as it is on disk, for the diff and Pull into set. */
   onDisk?: string;
