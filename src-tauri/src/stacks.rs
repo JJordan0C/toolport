@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::catalog::{self, CatalogEntry};
 
 /// One curated stack: a use-case bundle the user can set up in one flow.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Stack {
     /// Stable id (kebab-case), e.g. "fullstack-web".
@@ -144,7 +144,10 @@ mod tests {
 
     #[test]
     fn stack_servers_carry_credential_hints_where_expected() {
-        let infra = stacks().into_iter().find(|s| s.id == "infra-devops").unwrap();
+        let infra = stacks()
+            .into_iter()
+            .find(|s| s.id == "infra-devops")
+            .unwrap();
         let linode = infra.servers.iter().find(|e| e.name == "Linode").unwrap();
         // Linode is token-based: it should carry a creds URL + a setup hint.
         assert!(linode.credentials_url.is_some());

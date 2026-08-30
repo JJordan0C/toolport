@@ -10,6 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TransportPill } from "@/components/TransportPill";
 import { ServerDialog } from "@/components/ServerDialog";
+import { ServerLogo } from "@/components/ServerLogo";
 
 /** Section order for the browse view; categories not listed fall to the end. */
 const CATEGORY_ORDER = [
@@ -569,6 +570,7 @@ function CatalogCard({
     <div className="flex flex-col gap-2 rounded-lg border p-3 transition-colors hover:border-ring/40">
       <div className="flex items-start justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1.5">
+          <ServerLogo name={entry.name} transport={entry.transport} size={28} />
           <span className="truncate text-sm font-medium">{entry.name}</span>
           {entry.homepage && (
             <button

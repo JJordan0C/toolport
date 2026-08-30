@@ -118,17 +118,8 @@ export function ClientsView({
   const sorted = sortClients(clients);
   const present = sorted.filter((client) => statusOf(client) !== "missing");
   const missing = sorted.filter((client) => statusOf(client) === "missing");
-  const connected = present.filter((client) => statusOf(client) === "connected").length;
-  const ready = present.filter((client) => statusOf(client) === "ready").length;
-  const customized = present.filter((client) => statusOf(client) === "customized").length;
-  const errors = present.filter((client) => statusOf(client) === "error").length;
-  const allConnected = present.length > 0 && connected === present.length;
-  const summaryIssues = [
-    customized > 0 ? `${customized} using custom configuration` : null,
-    errors > 0
-      ? `${errors} config read${errors === 1 ? "" : "s"} need${errors === 1 ? "s" : ""} attention`
-      : null,
-  ].filter((part): part is string => part !== null);
+  const connected = present.filter((client) => statusOf(client) === "connected");
+  const available = present.filter((client) => statusOf(client) !== "connected");
 
   if (loading && clients.length === 0) {
     return (
@@ -161,49 +152,30 @@ export function ClientsView({
         />
       )}
 
-      {present.length > 0 && (
-        <div
-          className={`flex items-center gap-3 rounded-xl border px-4 py-3 ${
-            allConnected
-              ? "border-success/20 bg-success/5"
-              : "border-border/70 bg-card/40"
-          }`}
-        >
-          <div
-            className={`grid size-8 shrink-0 place-items-center rounded-lg ${
-              allConnected
-                ? "bg-success/10 text-success"
-                : "bg-muted text-muted-foreground"
-            }`}
-          >
-            <MonitorCog className="size-4" />
+      {connected.length > 0 && (
+        <section>
+          <SectionHeader count={connected.length}>Connected to Toolport</SectionHeader>
+          <div className="overflow-hidden rounded-xl border border-success/20 bg-success/5">
+            {connected.map((client) => (
+              <ClientRow
+                key={client.id}
+                client={client}
+                importCount={importableServers(client, registry).length}
+                onSelect={() => onSelectClient(client.id)}
+              />
+            ))}
           </div>
-          <div>
-            <p className="text-sm font-semibold">
-              {allConnected || connected > 0
-                ? `${connected} client${connected === 1 ? "" : "s"} connected`
-                : ready > 0
-                  ? `${ready} client${ready === 1 ? "" : "s"} ready to connect`
-                  : `${present.length} installed client${present.length === 1 ? "" : "s"}`}
-            </p>
-            <p className="text-xs text-muted-foreground">
-              {allConnected
-                ? "Your installed clients are connected to Toolport."
-                : summaryIssues.length > 0
-                  ? `${summaryIssues.join(". ")}.`
-                  : connected > 0 && ready > 0
-                    ? `${ready} more installed and ready when you are.`
-                    : "Choose a client below to connect it to Toolport."}
-            </p>
-          </div>
-        </div>
+        </section>
       )}
 
-      {present.length > 0 && (
+      {available.length > 0 && (
         <section>
-          <SectionHeader count={present.length}>On this machine</SectionHeader>
+          <SectionHeader count={available.length}>Available to connect</SectionHeader>
+          <p className="mb-2 text-xs text-muted-foreground">
+            Select an installed client to connect it or review its configuration.
+          </p>
           <div className="overflow-hidden rounded-xl border border-border/60 bg-card/40">
-            {present.map((client) => (
+            {available.map((client) => (
               <ClientRow
                 key={client.id}
                 client={client}
