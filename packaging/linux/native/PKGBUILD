@@ -1,21 +1,20 @@
-# Maintainer preview package. The release archive is expected to unpack to
-# toolport-$pkgver and is replaced with a tagged source URL at release time.
-pkgname=toolport-native-preview
+# Maintainer: Tyler South <tsouth2@gmail.com>
+# The archive is expected to unpack to toolport-$pkgver.
+pkgname=toolport
 pkgver=1.17.0
 pkgrel=1
-pkgdesc='Native GTK Toolport shell and local MCP gateway'
+pkgdesc='One local MCP gateway for every AI client, with a native GTK shell'
 arch=('x86_64')
 url='https://github.com/tsouth89/toolport'
 license=('MIT')
 depends=('gtk4' 'libadwaita' 'libsecret' 'glib2' 'dbus' 'hicolor-icon-theme')
 makedepends=('cargo' 'desktop-file-utils' 'appstream' 'zip')
-provides=('toolport-native-preview')
-# Both shells read the same ~/.config/Toolport and only one can own the approval
-# broker: the second to start gets an inert one, so HIL prompts appear in
-# whichever launched first and the other window shows an empty queue forever.
-# They also share /usr/bin/toolport-gateway. One at a time, by construction.
-# `toolport` covers the deb-derived toolport-bin, which provides it.
-conflicts=('toolport' 'toolport-bin')
+# The GTK shell replaces the Tauri one on Linux rather than sitting beside it:
+# both read the same ~/.config/Toolport, only one can hold the approval broker's
+# owner lock, and both claim /usr/bin/toolport-gateway. `replaces` upgrades an
+# existing preview install in place.
+conflicts=('toolport-bin' 'toolport-native-preview')
+replaces=('toolport-native-preview')
 options=('!lto')
 source=("toolport-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
@@ -38,10 +37,10 @@ package() {
     "$pkgdir/usr/bin/toolport-gtk"
   install -Dm755 src-tauri/target/release/toolport-gateway \
     "$pkgdir/usr/bin/toolport-gateway"
-  install -Dm644 packaging/linux/native/com.tsout.Toolport.NativePreview.desktop \
-    "$pkgdir/usr/share/applications/com.tsout.Toolport.NativePreview.desktop"
-  install -Dm644 packaging/linux/native/com.tsout.Toolport.NativePreview.metainfo.xml \
-    "$pkgdir/usr/share/metainfo/com.tsout.Toolport.NativePreview.metainfo.xml"
+  install -Dm644 packaging/linux/native/com.tsout.Toolport.desktop \
+    "$pkgdir/usr/share/applications/com.tsout.Toolport.desktop"
+  install -Dm644 packaging/linux/native/com.tsout.Toolport.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/com.tsout.Toolport.metainfo.xml"
   install -Dm644 src-tauri/icons/32x32.png \
     "$pkgdir/usr/share/icons/hicolor/32x32/apps/toolport.png"
   install -Dm644 src-tauri/icons/128x128.png \

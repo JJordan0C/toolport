@@ -41,11 +41,11 @@ build_package() {
   local package_path="$work_root/toolport-$version.pkg.tar.zst"
   mkdir -p "$package_root"
   cp -a "$stage_root"/. "$package_root"/
-  printf 'pkgname = toolport-native-preview\npkgbase = toolport-native-preview\npkgver = %s-1\npkgdesc = Native GTK Toolport shell and local MCP gateway\nurl = https://github.com/tsouth89/toolport\nbuilddate = 0\npackager = Toolport lifecycle smoke\nsize = 1\narch = x86_64\nlicense = MIT\n' \
+  printf 'pkgname = toolport\npkgbase = toolport\npkgver = %s-1\npkgdesc = One local MCP gateway for every AI client, with a native GTK shell\nurl = https://github.com/tsouth89/toolport\nbuilddate = 0\npackager = Toolport lifecycle smoke\nsize = 1\narch = x86_64\nlicense = MIT\n' \
     "$version" > "$package_root/.PKGINFO"
   if [[ "$version" == "1.17.1" ]]; then
     printf 'X-Toolport-Lifecycle=upgrade\n' \
-      >> "$package_root/usr/share/applications/com.tsout.Toolport.NativePreview.desktop"
+      >> "$package_root/usr/share/applications/com.tsout.Toolport.desktop"
   fi
   (cd "$package_root" && bsdtar --zstd -cf "$package_path" .PKGINFO usr)
   printf '%s\n' "$package_path"
@@ -85,18 +85,18 @@ assert_user_state_unchanged
 
 pacman_root -U "$package_v2"
 grep -q '^X-Toolport-Lifecycle=upgrade$' \
-  "$root/usr/share/applications/com.tsout.Toolport.NativePreview.desktop"
+  "$root/usr/share/applications/com.tsout.Toolport.desktop"
 assert_user_state_unchanged
 
 pacman_root -U "$package_v1"
 if grep -q '^X-Toolport-Lifecycle=upgrade$' \
-  "$root/usr/share/applications/com.tsout.Toolport.NativePreview.desktop"; then
+  "$root/usr/share/applications/com.tsout.Toolport.desktop"; then
   echo "error: rollback retained the upgraded desktop payload" >&2
   exit 1
 fi
 assert_user_state_unchanged
 
-pacman_root -R toolport-native-preview
+pacman_root -R toolport
 test ! -e "$root/usr/bin/toolport-gtk"
 test ! -e "$root/usr/bin/toolport-gateway"
 test ! -e "$root/usr/share/toolport/agent-plugin/toolport-agent-plugin.zip"

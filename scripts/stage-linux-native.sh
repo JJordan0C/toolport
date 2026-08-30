@@ -26,11 +26,11 @@ install -Dm755 "$repo_root/src-tauri/target/release/toolport-gtk" \
 install -Dm755 "$repo_root/src-tauri/target/release/toolport-gateway" \
   "$stage_root/usr/bin/toolport-gateway"
 install -Dm644 \
-  "$repo_root/packaging/linux/native/com.tsout.Toolport.NativePreview.desktop" \
-  "$stage_root/usr/share/applications/com.tsout.Toolport.NativePreview.desktop"
+  "$repo_root/packaging/linux/native/com.tsout.Toolport.desktop" \
+  "$stage_root/usr/share/applications/com.tsout.Toolport.desktop"
 install -Dm644 \
-  "$repo_root/packaging/linux/native/com.tsout.Toolport.NativePreview.metainfo.xml" \
-  "$stage_root/usr/share/metainfo/com.tsout.Toolport.NativePreview.metainfo.xml"
+  "$repo_root/packaging/linux/native/com.tsout.Toolport.metainfo.xml" \
+  "$stage_root/usr/share/metainfo/com.tsout.Toolport.metainfo.xml"
 install -Dm644 "$repo_root/src-tauri/icons/32x32.png" \
   "$stage_root/usr/share/icons/hicolor/32x32/apps/toolport.png"
 install -Dm644 "$repo_root/src-tauri/icons/128x128.png" \
@@ -43,11 +43,11 @@ install -d "$stage_root/usr/share/toolport/agent-plugin"
   zip -qr "$stage_root/usr/share/toolport/agent-plugin/toolport-agent-plugin.zip" toolport
 )
 install -Dm644 "$repo_root/LICENSE" \
-  "$stage_root/usr/share/licenses/toolport-native-preview/LICENSE"
+  "$stage_root/usr/share/licenses/toolport/LICENSE"
 
 desktop-file-validate \
-  "$stage_root/usr/share/applications/com.tsout.Toolport.NativePreview.desktop"
+  "$stage_root/usr/share/applications/com.tsout.Toolport.desktop"
 appstreamcli validate --no-net \
-  "$stage_root/usr/share/metainfo/com.tsout.Toolport.NativePreview.metainfo.xml"
+  "$stage_root/usr/share/metainfo/com.tsout.Toolport.metainfo.xml"
 
-echo "staged the Linux-native preview at $stage_root"
+echo "staged the Linux native shell at $stage_root"

@@ -91,8 +91,13 @@ entry so it cannot repoint the shipping shell's login launch (identities
 merge at cutover); (26) an unpackaged build registers the `toolport://` and
 `conduit://` handlers at runtime, like the shipping shell does.
 
-Still open, deliberately: the full app-ID unification (item 25's cutover
-half) happens at the replacement release; the approval card for routine
+Item 25's cutover half is now done: the shell ships as `com.tsout.Toolport`
+with the `Toolport` autostart entry, and `migrate_preview_identity` retires the
+preview's autostart file and URL-handler desktop entry on first run so an
+upgraded install does not keep a second handler or a login entry pointing at a
+binary the package no longer installs.
+
+Still open, deliberately: happens at the replacement release; the approval card for routine
 writes still shows pretty-printed JSON rather than the structured
 name/risk/calls/dependencies breakdown (item 22, second half); and the
 per-client "servers it can reach" chips and gateway-flow diagram (item 17,
@@ -105,13 +110,13 @@ scope line and in the tooltips.
   WebKit light, dark, and system selector. This is the native theme contract.
 - Updates are owned by pacman or the Omarchy update flow. The Tauri downloader
   remains available only in the shipping cross-platform shell.
-- The GTK binary and package retain preview identity until the replacement
-  release, so desktop IDs do not collide early. The package conflicts with
-  `toolport` / `toolport-bin` rather than installing beside it: both shells read
-  the same `~/.config/Toolport`, and only one can hold the approval broker's
-  owner lock, so with both running HIL prompts reach whichever started first
-  while the other shows an empty queue. They also both claim
-  `/usr/bin/toolport-gateway`. Rollback is uninstall and reinstall the other.
+- The GTK shell replaces the Tauri one on Linux rather than installing beside
+  it. Both read the same `~/.config/Toolport`, only one can hold the approval
+  broker's owner lock (the second process gets an inert broker, so HIL prompts
+  reach whichever started first while the other shows an empty queue), and both
+  claim `/usr/bin/toolport-gateway`. The package is `toolport`, conflicting with
+  `toolport-bin` and replacing `toolport-native-preview`. Rollback is uninstall
+  and reinstall the other.
 - Updater-only process recovery commands are not exposed as native UI. The
   package lifecycle and stale-gateway action replace that workflow.
 - Clearing retained activity is one explicit action covering the call audit,

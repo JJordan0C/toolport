@@ -3,11 +3,13 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 
-/// Autostart entry name for the native preview. Deliberately NOT "Toolport":
-/// while both Linux shells are installable side by side, sharing the shipping
-/// shell's autostart file would silently repoint the user's login launch at
-/// whichever shell toggled last. The name merges back at the cutover release.
-const NATIVE_AUTOSTART_NAME: &str = "ToolportNativePreview";
+/// Autostart entry name. The preview used its own so it could not repoint the
+/// shipping shell's login launch while both were installable; the GTK shell now
+/// replaces that shell on Linux, so the names have merged as planned.
+/// [`super::migrate_preview_identity`] retires the old file.
+pub(super) const NATIVE_AUTOSTART_NAME: &str = "Toolport";
+/// What the preview wrote. Only referenced by the migration.
+pub(super) const LEGACY_AUTOSTART_NAME: &str = "ToolportNativePreview";
 
 #[derive(Clone)]
 pub(super) struct SettingsPage {

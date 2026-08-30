@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>com.tsout.Toolport.NativePreview</id>
-  <name>Toolport Native Preview</name>
+  <id>com.tsout.Toolport</id>
+  <name>Toolport</name>
   <summary>One local MCP gateway for every AI client</summary>
   <metadata_license>MIT</metadata_license>
   <project_license>MIT</project_license>
@@ -14,11 +14,11 @@
       clients with approvals, audit history, rules, and local credential storage.
     </p>
     <p>
-      This additive Linux-native preview uses GTK4, follows the active Omarchy
-      palette, and behaves as a regular Wayland window under Hyprland.
+      The Linux build is native GTK4. It follows the active Omarchy palette and
+      behaves as a regular Wayland window under Hyprland.
     </p>
   </description>
-  <launchable type="desktop-id">com.tsout.Toolport.NativePreview.desktop</launchable>
+  <launchable type="desktop-id">com.tsout.Toolport.desktop</launchable>
   <provides>
     <binary>toolport-gtk</binary>
     <mediatype>x-scheme-handler/toolport</mediatype>

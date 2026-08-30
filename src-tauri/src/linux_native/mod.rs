@@ -25,7 +25,13 @@ use playground::PlaygroundPage;
 use settings::SettingsPage;
 use teams::TeamsPage;
 
-const PREVIEW_APP_ID: &str = "com.tsout.Toolport.NativePreview";
+/// The desktop identity. The GTK shell replaces the Tauri one on Linux rather
+/// than sitting beside it (they share `~/.config/Toolport` and only one can hold
+/// the approval broker's owner lock), so it carries the plain name.
+const APP_ID: &str = "com.tsout.Toolport";
+/// The identity the preview shipped under. Kept only so [`migrate_preview_identity`]
+/// can clean up what it left in the user's home directory.
+const LEGACY_PREVIEW_APP_ID: &str = "com.tsout.Toolport.NativePreview";
 
 pub fn run() {
     let registry = match crate::registry::load() {
@@ -49,7 +55,7 @@ pub fn run() {
         .filter(|arg| arg != "--hidden")
         .collect::<Vec<_>>();
     let app = adw::Application::builder()
-        .application_id(PREVIEW_APP_ID)
+        .application_id(APP_ID)
         .flags(gtk::gio::ApplicationFlags::HANDLES_OPEN)
         .build();
     let _hold = app.hold();
@@ -66,6 +72,7 @@ pub fn run() {
     quit.connect_activate(move |_, _| app_for_quit.quit());
     app.add_action(&quit);
     app.set_accels_for_action("app.quit", &["<Primary>q"]);
+    migrate_preview_identity();
     ensure_url_scheme_handlers();
 
     let tray = tray::start(&app);
@@ -140,9 +147,9 @@ fn ensure_url_scheme_handlers() {
         if std::fs::create_dir_all(&applications).is_err() {
             return;
         }
-        let desktop_path = applications.join("com.tsout.Toolport.NativePreview.desktop");
+        let desktop_path = applications.join(format!("{APP_ID}.desktop"));
         let contents = format!(
-            "[Desktop Entry]\nType=Application\nName=Toolport (native preview)\nExec={} %u\nIcon=toolport\nNoDisplay=true\nMimeType=x-scheme-handler/toolport;x-scheme-handler/conduit;\n",
+            "[Desktop Entry]\nType=Application\nName=Toolport\nExec={} %u\nIcon=toolport\nNoDisplay=true\nMimeType=x-scheme-handler/toolport;x-scheme-handler/conduit;\n",
             exe.display()
         );
         if std::fs::write(&desktop_path, contents).is_err() {
@@ -154,7 +161,7 @@ fn ensure_url_scheme_handlers() {
         for scheme in unhandled {
             let _ = std::process::Command::new("xdg-mime")
                 .arg("default")
-                .arg("com.tsout.Toolport.NativePreview.desktop")
+                .arg(format!("{APP_ID}.desktop"))
                 .arg(format!("x-scheme-handler/{scheme}"))
                 .status();
         }
@@ -163,6 +170,62 @@ fn ensure_url_scheme_handlers() {
             desktop_path.display()
         );
     });
+}
+
+/// Clean up what the preview identity left behind.
+///
+/// The preview shipped as `com.tsout.Toolport.NativePreview` with its own
+/// autostart entry, deliberately separate so it could not repoint the shipping
+/// shell's login launch. Now that the GTK shell IS the shipping shell on Linux
+/// the two merge, and anything left under the old identity would either launch a
+/// binary the package no longer installs or register a second URL handler for
+/// the same schemes. Runs once per start; every step is best effort, because a
+/// failed cleanup must never stop the app from opening.
+fn migrate_preview_identity() {
+    let old_autostart = crate::autostart::linux_autostart_file(settings::LEGACY_AUTOSTART_NAME);
+    let applications = gtk::glib::user_data_dir().join("applications");
+    let stale_handler = applications.join(format!("{LEGACY_PREVIEW_APP_ID}.desktop"));
+    let retired = retire_preview_files(old_autostart.as_deref(), &stale_handler, || {
+        let _ = crate::autostart::enable_linux(settings::NATIVE_AUTOSTART_NAME);
+    });
+    if retired.handler {
+        let _ = std::process::Command::new("update-desktop-database")
+            .arg(&applications)
+            .status();
+    }
+}
+
+/// What [`retire_preview_files`] actually removed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RetiredPreview {
+    autostart: bool,
+    handler: bool,
+}
+
+/// The file work behind [`migrate_preview_identity`], with its paths injected.
+///
+/// Split out because this deletes files in the user's home directory, and a test
+/// that exercised it through `dirs::home_dir()` would delete the developer's.
+fn retire_preview_files(
+    old_autostart: Option<&std::path::Path>,
+    stale_handler: &std::path::Path,
+    carry_autostart: impl FnOnce(),
+) -> RetiredPreview {
+    let mut retired = RetiredPreview::default();
+    // The file existing IS the "launch at login" setting, so carry it across
+    // before removing rather than silently turning it off.
+    if let Some(old) = old_autostart {
+        if old.is_file() {
+            carry_autostart();
+            retired.autostart = std::fs::remove_file(old).is_ok();
+        }
+    }
+    // Leaving the handler registered means two entries claim toolport://, and
+    // xdg may pick the stale one.
+    if stale_handler.is_file() {
+        retired.handler = std::fs::remove_file(stale_handler).is_ok();
+    }
+    retired
 }
 
 fn build_window(
@@ -515,7 +578,7 @@ fn run_startup_maintenance() {
 
 fn run_registry_startup_failure(error: String) {
     let app = adw::Application::builder()
-        .application_id("com.tsout.Toolport.NativePreview.Recovery")
+        .application_id("com.tsout.Toolport.Recovery")
         .build();
     app.connect_activate(move |app| {
         let path = crate::registry::resolved_path()
@@ -1358,7 +1421,7 @@ impl ServerPage {
                 self.list.append(&state_card(
                     "dialog-warning-symbolic",
                     "Configuration could not be displayed",
-                    "The native preview left the registry untouched. Open the current Toolport app to inspect or recover it.",
+                    "Toolport left the registry untouched. Open the app again to inspect or recover it.",
                     true,
                 ));
             }
@@ -7163,7 +7226,7 @@ fn build_content(
     page.append(&intro);
 
     let description = gtk::Label::builder()
-        .label("Your MCP servers, available everywhere. This native preview follows the active Omarchy palette and behaves like a regular Hyprland window.")
+        .label("Your MCP servers, available everywhere. Follows the active Omarchy palette and behaves like a regular Hyprland window.")
         .halign(gtk::Align::Fill)
         .wrap(true)
         .xalign(0.0)
@@ -10402,6 +10465,85 @@ fn state_card(icon_name: &str, title: &str, body: &str, error: bool) -> gtk::Box
 
 #[cfg(test)]
 mod tests {
+
+    fn preview_scratch(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-preview-migration-{}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// An upgraded preview install must not keep a login entry pointing at a
+    /// binary the package no longer installs, and launch-at-login must survive
+    /// the rename rather than being silently switched off.
+    #[test]
+    fn retiring_the_preview_carries_launch_at_login_across() {
+        let dir = preview_scratch("both");
+        let autostart = dir.join("ToolportNativePreview.desktop");
+        let handler = dir.join("com.tsout.Toolport.NativePreview.desktop");
+        std::fs::write(&autostart, "[Desktop Entry]").unwrap();
+        std::fs::write(&handler, "[Desktop Entry]").unwrap();
+
+        let carried = std::cell::Cell::new(false);
+        let retired = retire_preview_files(Some(&autostart), &handler, || carried.set(true));
+
+        assert!(
+            carried.get(),
+            "the new autostart entry must be written first"
+        );
+        assert_eq!(
+            retired,
+            RetiredPreview {
+                autostart: true,
+                handler: true
+            }
+        );
+        assert!(!autostart.exists() && !handler.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Someone who never turned launch-at-login on has no preview autostart
+    /// file, and the migration must not create one for them.
+    #[test]
+    fn retiring_the_preview_does_not_switch_launch_at_login_on() {
+        let dir = preview_scratch("handler-only");
+        let autostart = dir.join("ToolportNativePreview.desktop");
+        let handler = dir.join("com.tsout.Toolport.NativePreview.desktop");
+        std::fs::write(&handler, "[Desktop Entry]").unwrap();
+
+        let carried = std::cell::Cell::new(false);
+        let retired = retire_preview_files(Some(&autostart), &handler, || carried.set(true));
+
+        assert!(
+            !carried.get(),
+            "no preview entry means it was never enabled"
+        );
+        assert_eq!(
+            retired,
+            RetiredPreview {
+                autostart: false,
+                handler: true
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh install has neither file, and the migration must be a no-op
+    /// rather than reporting work it did not do.
+    #[test]
+    fn retiring_the_preview_on_a_fresh_install_does_nothing() {
+        let dir = preview_scratch("fresh");
+        let retired = retire_preview_files(
+            Some(&dir.join("ToolportNativePreview.desktop")),
+            &dir.join("com.tsout.Toolport.NativePreview.desktop"),
+            || panic!("must not touch autostart when the preview never ran"),
+        );
+        assert_eq!(retired, RetiredPreview::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
 
     #[test]

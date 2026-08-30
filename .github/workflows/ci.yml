@@ -41,7 +41,7 @@ jobs:
           key: ${{ runner.os }}-gtk-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-gtk-cargo-
 
-      - name: Build the opt-in native preview
+      - name: Build the native GTK shell
         run: cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --features gtk-desktop --bin toolport-gtk
 
       - name: Test the native shell module
