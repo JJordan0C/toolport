@@ -353,7 +353,7 @@ impl PermissionsPage {
         guard: crate::agent_guard::GuardView,
     ) {
         self.updating.set(true);
-        self.enabled.set_active(view.enabled);
+        super::settings::set_switch(&self.enabled, view.enabled);
         self.enabled.set_sensitive(true);
         self.render_rules(&view);
         self.render_presets(&view);

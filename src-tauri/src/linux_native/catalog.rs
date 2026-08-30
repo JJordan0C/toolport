@@ -474,6 +474,11 @@ impl CatalogPage {
 
     fn show_error(&self, error: &str) {
         self.pending_notice.borrow_mut().take();
+        // Cancel any success timer first. Otherwise a confirmation shown moments
+        // ago fires its four-second hide and takes this error off screen with it.
+        if let Some(timer) = self.feedback_timer.borrow_mut().take() {
+            timer.remove();
+        }
         self.feedback
             .set_label(&format!("Could not load the catalog: {error}"));
         self.feedback.remove_css_class("success");

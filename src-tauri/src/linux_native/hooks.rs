@@ -350,7 +350,13 @@ impl HooksPage {
                     let recent = gtk::gio::spawn_blocking(|| crate::hooks::read_recent(200)).await;
                     match recent {
                         Ok(Ok(recent)) => page.render(view, recent),
-                        _ => page.updating.set(false),
+                        // `render` is the only thing that re-enables the
+                        // controls, so a failed log read used to leave the
+                        // switch, Preview and Refresh dead with no way back.
+                        _ => {
+                            page.set_controls_sensitive(true);
+                            page.updating.set(false);
+                        }
                     }
                     page.show_success(if enabled {
                         "Agent activity recording enabled."
@@ -374,7 +380,7 @@ impl HooksPage {
 
     fn render(&self, view: crate::hooks::HooksView, recent: Vec<serde_json::Value>) {
         self.updating.set(true);
-        self.enabled.set_active(view.enabled);
+        super::settings::set_switch(&self.enabled, view.enabled);
         self.enabled
             .set_sensitive(view.enabled || view.binary.is_some());
         self.preview.set_sensitive(view.binary.is_some());

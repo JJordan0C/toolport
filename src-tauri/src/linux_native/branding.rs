@@ -62,6 +62,13 @@ pub(super) fn client_logo(id: &str) -> gtk::Image {
     )
 }
 
+/// True when `needle` appears in `name` as a whole word rather than as a
+/// substring of a longer one.
+fn name_has_word(name: &str, needle: &str) -> bool {
+    name.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| word == needle)
+}
+
 fn server_logo_key(name: &str) -> Option<&'static str> {
     let name = name.to_lowercase();
     [
@@ -98,10 +105,13 @@ fn server_logo_key(name: &str) -> Option<&'static str> {
         ("figma", "figma"),
         ("resend", "resend"),
         ("n8n", "n8n"),
-        ("git", "git"),
     ]
     .into_iter()
     .find_map(|(needle, key)| name.contains(needle).then_some(key))
+    // `git` is matched last and on a word boundary, because plain `contains`
+    // finds it inside unrelated names: "digitalocean" carries "git" at offset 2
+    // and would otherwise wear the Git logo. `github` is matched above, by name.
+    .or_else(|| name_has_word(&name, "git").then_some("git"))
 }
 
 pub(super) fn server_logo(name: &str, transport: &str) -> gtk::Image {
@@ -160,6 +170,17 @@ pub(super) fn server_logo(name: &str, transport: &str) -> gtk::Image {
 
 #[cfg(test)]
 mod tests {
+
+    /// Ordered substring matching found "git" inside unrelated names:
+    /// "digitalocean" carries it at offset 2 and wore the Git logo.
+    #[test]
+    fn a_name_that_merely_contains_git_does_not_get_the_git_logo() {
+        assert_eq!(server_logo_key("DigitalOcean"), None);
+        assert_eq!(server_logo_key("Digital Ocean MCP"), None);
+        assert_eq!(server_logo_key("git"), Some("git"));
+        assert_eq!(server_logo_key("Git MCP"), Some("git"));
+        assert_eq!(server_logo_key("GitHub"), Some("github"));
+    }
     use super::server_logo_key;
 
     #[test]

@@ -1333,8 +1333,13 @@ impl SettingsPage {
                 }
                 switch.set_sensitive(false);
                 page.begin_mutation();
+                // Claimed after the bump, so a second toggle started while this
+                // one is in flight makes this completion skip its render rather
+                // than putting the other switch back from a stale snapshot.
+                let generation = page.mutation_generation.get();
                 let confirm_was_on = page.confirm_destructive.is_active();
                 let deny_was_on = page.deny_destructive.is_active();
+                let switch = switch.clone();
                 let page = page.clone();
                 gtk::glib::spawn_future_local(async move {
                     let result = gtk::gio::spawn_blocking(move || {
@@ -1363,7 +1368,11 @@ impl SettingsPage {
                                 }
                                 _ => None,
                             };
-                            page.render_settings(settings);
+                            if page.mutation_generation.get() == generation {
+                                page.render_settings(settings);
+                            } else {
+                                switch.set_sensitive(true);
+                            }
                             let outcome =
                                 format!("{} {label}", if enabled { "Enabled" } else { "Disabled" });
                             page.feedback.set_label(&match displaced {
@@ -1376,10 +1385,16 @@ impl SettingsPage {
                             page.feedback.add_css_class("success");
                         }
                         Ok(Err(error)) => {
+                            // refresh() no-ops while a background tick holds the
+                            // guard, and render_settings is what re-enables the
+                            // switch, so restore it here rather than relying on
+                            // a refresh that may never run.
+                            switch.set_sensitive(true);
                             page.show_error(&error);
                             page.refresh();
                         }
                         Err(_) => {
+                            switch.set_sensitive(true);
                             page.show_error("the setting update stopped unexpectedly");
                             page.refresh();
                         }
@@ -2231,7 +2246,7 @@ fn settings_heading(title: &str, subtitle: &str) -> gtk::Box {
 /// handler that copies one to the other, and `set_active` to a value the switch
 /// already holds emits no signal to fix it up later. So a switch the user just
 /// flipped slid across and stayed grey. Always set both.
-fn set_switch(switch: &gtk::Switch, on: bool) {
+pub(super) fn set_switch(switch: &gtk::Switch, on: bool) {
     switch.set_active(on);
     switch.set_state(on);
 }

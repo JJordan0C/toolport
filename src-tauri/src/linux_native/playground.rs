@@ -15,6 +15,12 @@ pub(super) struct PlaygroundPage {
     prompts: gtk::Box,
     servers: Rc<RefCell<Vec<(String, String)>>>,
     loading: Rc<Cell<bool>>,
+    /// Set while the dropdown's model and selection are being replaced.
+    /// `set_model` autoselects index 0 and emits `notify::selected`, which would
+    /// otherwise start loading the first server and hold the `loading` guard, so
+    /// the restore of the real selection was dropped and the tabs showed a
+    /// different server from the one named in the dropdown.
+    updating_selection: Rc<Cell<bool>>,
     tool_filter: gtk::SearchEntry,
     /// The last loaded capabilities and policy, so the tool filter re-renders
     /// without reconnecting to the server.
@@ -129,13 +135,17 @@ impl PlaygroundPage {
             prompts,
             servers: Rc::new(RefCell::new(Vec::new())),
             loading: Rc::new(Cell::new(false)),
+            updating_selection: Rc::new(Cell::new(false)),
             tool_filter,
             last_load: Rc::new(RefCell::new(None)),
         };
         let page_for_selection = playground.clone();
-        playground
-            .server
-            .connect_selected_notify(move |_| page_for_selection.load_selected());
+        playground.server.connect_selected_notify(move |_| {
+            if page_for_selection.updating_selection.get() {
+                return;
+            }
+            page_for_selection.load_selected();
+        });
         let page_for_filter = playground.clone();
         playground
             .tool_filter
@@ -171,8 +181,13 @@ impl PlaygroundPage {
                     let selected = selected_server_index(&servers, previous.as_deref());
                     *page.servers.borrow_mut() = servers;
                     let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+                    page.updating_selection.set(true);
                     page.server
                         .set_model(Some(&gtk::StringList::new(&name_refs)));
+                    if !names.is_empty() {
+                        page.server.set_selected(selected);
+                    }
+                    page.updating_selection.set(false);
                     page.server.set_sensitive(!names.is_empty());
                     if names.is_empty() {
                         page.set_status("Add a server before using Playground.");
@@ -180,7 +195,6 @@ impl PlaygroundPage {
                         *page.last_load.borrow_mut() = None;
                         page.clear_lists();
                     } else {
-                        page.server.set_selected(selected);
                         page.load_selected();
                     }
                 }
