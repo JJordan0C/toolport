@@ -162,7 +162,7 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
     welcome.append(&benefits);
     let detected = gtk::Label::builder()
         .label("Checking for supported AI clients…")
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
         .css_classes(["toolport-muted"])
@@ -211,7 +211,7 @@ fn present(app: &adw::Application, parent: &adw::ApplicationWindow, client_page:
         copy.append(
             &gtk::Label::builder()
                 .label(&starter.description)
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
                 .lines(2)
@@ -647,7 +647,7 @@ impl CallVerifier {
         root.set_visible(false);
 
         let title = gtk::Label::builder()
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["heading"])
@@ -656,7 +656,7 @@ impl CallVerifier {
         root.append(
             &gtk::Label::builder()
                 .label("In that client, ask your agent to run this read-only prompt:")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
                 .css_classes(["toolport-muted"])
@@ -667,7 +667,7 @@ impl CallVerifier {
         prompt_row.add_css_class("toolport-setting-row");
         let prompt = gtk::Label::builder()
             .label("List the tools you can use through Toolport.")
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .selectable(true)
             .wrap(true)
@@ -963,7 +963,7 @@ fn wizard_page(title: &str, subtitle: &str) -> gtk::Box {
     page.append(
         &gtk::Label::builder()
             .label(title)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["title-2"])
@@ -972,7 +972,7 @@ fn wizard_page(title: &str, subtitle: &str) -> gtk::Box {
     page.append(
         &gtk::Label::builder()
             .label(subtitle)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["toolport-muted"])
@@ -1004,7 +1004,7 @@ fn info_row(icon: &str, title: &str, detail: &str) -> gtk::Box {
     copy.append(
         &gtk::Label::builder()
             .label(detail)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["toolport-muted"])
