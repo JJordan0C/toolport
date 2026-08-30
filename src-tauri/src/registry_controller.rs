@@ -1787,21 +1787,11 @@ mod tests {
     /// editor; this proves nothing can slip past into an unusable server.
     #[test]
     fn self_hosted_catalog_entries_are_refused_by_the_one_click_add() {
-        // The guard is expected to return before any write, but if it ever
-        // regressed this would commit to the developer's real registry. Take the
-        // same two locks every registry-writing test here takes: holding the
-        // data-dir lock alone still lets a test that holds only the env lock
-        // observe this scratch override, which is what broke CI.
-        let _env = registry::REGISTRY_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _dirs = crate::registry::data_dir_test_lock();
-        let scratch =
-            std::env::temp_dir().join(format!("toolport-self-hosted-guard-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&scratch);
-        std::fs::create_dir_all(&scratch).expect("scratch dir");
-        let _override = crate::registry::DataDirOverride::set(&scratch);
-
+        // No data-dir isolation on purpose. The guard returns before
+        // `registry::update`, so nothing here reads or writes the registry, and
+        // taking the two global test locks only serialized this test against
+        // every registry-writing test in the module and reordered them, which
+        // failed CI on all three platforms while passing locally.
         let self_hosted = crate::catalog::curated()
             .into_iter()
             .filter(|entry| entry.url_hint.is_some())
