@@ -9,10 +9,11 @@ pub(super) struct PlaygroundPage {
     app: adw::Application,
     server: gtk::DropDown,
     feedback: gtk::Label,
+    view_stack: gtk::Stack,
     tools: gtk::Box,
     resources: gtk::Box,
     prompts: gtk::Box,
-    server_ids: Rc<RefCell<Vec<String>>>,
+    servers: Rc<RefCell<Vec<(String, String)>>>,
     loading: Rc<Cell<bool>>,
     tool_filter: gtk::SearchEntry,
     /// The last loaded capabilities and policy, so the tool filter re-renders
@@ -48,10 +49,10 @@ impl PlaygroundPage {
             .build();
         let page = gtk::Box::new(gtk::Orientation::Vertical, 14);
         page.add_css_class("toolport-page");
-        page.set_margin_top(28);
-        page.set_margin_bottom(28);
-        page.set_margin_start(28);
-        page.set_margin_end(28);
+        page.set_margin_top(20);
+        page.set_margin_bottom(20);
+        page.set_margin_start(20);
+        page.set_margin_end(20);
         page.append(
             &gtk::Label::builder()
                 .label("Test servers directly")
@@ -61,16 +62,22 @@ impl PlaygroundPage {
         );
         page.append(
             &gtk::Label::builder()
-                .label("Inspect tools, resources, and prompts, then run them locally without going through an AI client. Playground calls appear in Activity.")
+                .label(
+                    "Run a server's tools locally, without an AI client. Calls appear in Activity.",
+                )
                 .halign(gtk::Align::Start)
                 .xalign(0.0)
                 .wrap(true)
                 .css_classes(["toolport-muted"])
                 .build(),
         );
+        // The server picker and the tool filter are both "narrow down what I am
+        // looking at", and each was taking a full row on its own.
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let server = gtk::DropDown::new(None::<gtk::gio::ListModel>, None::<gtk::Expression>);
-        server.set_hexpand(true);
-        page.append(&server);
+        server.set_hexpand(false);
+        server.set_size_request(220, -1);
+        controls.append(&server);
         let feedback = gtk::Label::builder()
             .halign(gtk::Align::Fill)
             .xalign(0.0)
@@ -78,13 +85,14 @@ impl PlaygroundPage {
             .css_classes(["toolport-feedback"])
             .build();
         feedback.set_label("Choose a server to load its capabilities.");
-        page.append(&feedback);
 
         let tool_filter = gtk::SearchEntry::builder()
             .placeholder_text("Filter tools")
             .css_classes(["toolport-search"])
+            .hexpand(true)
             .build();
-        page.append(&tool_filter);
+        controls.append(&tool_filter);
+        page.append(&controls);
         let view_stack = gtk::Stack::builder()
             .transition_type(gtk::StackTransitionType::Crossfade)
             .transition_duration(120)
@@ -99,7 +107,14 @@ impl PlaygroundPage {
         switcher.set_stack(Some(&view_stack));
         switcher.set_halign(gtk::Align::Start);
         page.append(&switcher);
+        page.append(&feedback);
         page.append(&view_stack);
+        // The filter only ever applied to tools, so on the other two tabs it was
+        // a control that did nothing.
+        let filter_for_tab = tool_filter.clone();
+        view_stack.connect_visible_child_name_notify(move |stack| {
+            filter_for_tab.set_visible(stack.visible_child_name().as_deref() == Some("tools"));
+        });
         scroller.set_child(Some(&page));
         root.append(&scroller);
 
@@ -108,10 +123,11 @@ impl PlaygroundPage {
             app: app.clone(),
             server,
             feedback,
+            view_stack,
             tools,
             resources,
             prompts,
-            server_ids: Rc::new(RefCell::new(Vec::new())),
+            servers: Rc::new(RefCell::new(Vec::new())),
             loading: Rc::new(Cell::new(false)),
             tool_filter,
             last_load: Rc::new(RefCell::new(None)),
@@ -144,20 +160,27 @@ impl PlaygroundPage {
             .await;
             match result {
                 Ok(Ok(servers)) => {
+                    let previous = page.selected_server_id();
+                    if *page.servers.borrow() == servers {
+                        return;
+                    }
                     let names = servers
                         .iter()
-                        .map(|(_, name)| name.as_str())
+                        .map(|(_, name)| name.clone())
                         .collect::<Vec<_>>();
-                    *page.server_ids.borrow_mut() =
-                        servers.iter().map(|(id, _)| id.clone()).collect();
-                    page.server.set_model(Some(&gtk::StringList::new(&names)));
+                    let selected = selected_server_index(&servers, previous.as_deref());
+                    *page.servers.borrow_mut() = servers;
+                    let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+                    page.server
+                        .set_model(Some(&gtk::StringList::new(&name_refs)));
                     page.server.set_sensitive(!names.is_empty());
                     if names.is_empty() {
-                        page.feedback
-                            .set_label("Add a server before using Playground.");
+                        page.set_status("Add a server before using Playground.");
+                        page.set_capability_counts(None);
+                        *page.last_load.borrow_mut() = None;
                         page.clear_lists();
                     } else {
-                        page.server.set_selected(0);
+                        page.server.set_selected(selected);
                         page.load_selected();
                     }
                 }
@@ -172,12 +195,16 @@ impl PlaygroundPage {
             return;
         }
         let selected = self.server.selected() as usize;
-        let Some(server_id) = self.server_ids.borrow().get(selected).cloned() else {
+        let Some(server_id) = self
+            .servers
+            .borrow()
+            .get(selected)
+            .map(|(id, _)| id.clone())
+        else {
             self.loading.set(false);
             return;
         };
-        self.feedback.set_label("Connecting to server…");
-        self.feedback.remove_css_class("error");
+        self.set_status("Connecting to server…");
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || {
@@ -239,11 +266,37 @@ impl PlaygroundPage {
         }
         *self.last_load.borrow_mut() = Some((capabilities, policy));
         self.render_tools();
-        self.feedback.set_label(&format!(
-            "Loaded {tool_count} tools, {resource_count} resources, and {prompt_count} prompts."
-        ));
+        self.set_capability_counts(Some((tool_count, resource_count, prompt_count)));
+        // The counts belong on the tabs they describe, so the status line goes
+        // back to being transient and gets out of the way once a load succeeds.
+        self.set_status("");
+    }
+
+    /// Tab titles carry the counts; `None` clears them back to bare names for
+    /// the states where nothing is loaded.
+    fn set_capability_counts(&self, counts: Option<(usize, usize, usize)>) {
+        let labels = match counts {
+            Some((tools, resources, prompts)) => [
+                format!("Tools ({tools})"),
+                format!("Resources ({resources})"),
+                format!("Prompts ({prompts})"),
+            ],
+            None => ["Tools".into(), "Resources".into(), "Prompts".into()],
+        };
+        for (child, label) in [&self.tools, &self.resources, &self.prompts]
+            .into_iter()
+            .zip(labels)
+        {
+            self.view_stack.page(child).set_title(&label);
+        }
+    }
+
+    /// An empty message hides the line entirely rather than leaving a banner
+    /// sitting on the page with nothing in it.
+    fn set_status(&self, message: &str) {
+        self.feedback.set_label(message);
+        self.feedback.set_visible(!message.is_empty());
         self.feedback.remove_css_class("error");
-        self.feedback.add_css_class("success");
     }
 
     fn render_tools(&self) {
@@ -292,11 +345,35 @@ impl PlaygroundPage {
         }
     }
 
+    /// A pin or visibility change writes to the local registry, nothing more.
+    /// Updating the cached policy in place keeps a later filter re-render
+    /// honest without calling `load_selected`, which opens a fresh connection
+    /// to the server and refetches every tool for what is a local toggle.
+    fn remember_tool_enabled(&self, tool: &str, enabled: bool) {
+        if let Some((_, policy)) = self.last_load.borrow_mut().as_mut() {
+            if enabled {
+                policy.disabled.remove(tool);
+            } else {
+                policy.disabled.insert(tool.to_string());
+            }
+        }
+    }
+
+    fn remember_tool_pinned(&self, tool: &str, pinned: bool) {
+        if let Some((_, policy)) = self.last_load.borrow_mut().as_mut() {
+            if pinned {
+                policy.pinned.insert(tool.to_string());
+            } else {
+                policy.pinned.remove(tool);
+            }
+        }
+    }
+
     fn selected_server_id(&self) -> Option<String> {
-        self.server_ids
+        self.servers
             .borrow()
             .get(self.server.selected() as usize)
-            .cloned()
+            .map(|(id, _)| id.clone())
     }
 
     fn clear_lists(&self) {
@@ -308,11 +385,15 @@ impl PlaygroundPage {
     }
 
     fn show_error(&self, error: &str) {
-        self.feedback
-            .set_label(&format!("Playground error: {error}"));
-        self.feedback.remove_css_class("success");
+        self.set_status(&format!("Playground error: {error}"));
         self.feedback.add_css_class("error");
     }
+}
+
+fn selected_server_index(servers: &[(String, String)], previous: Option<&str>) -> u32 {
+    previous
+        .and_then(|previous| servers.iter().position(|(id, _)| id == previous))
+        .unwrap_or(0) as u32
 }
 
 fn capability_list() -> gtk::Box {
@@ -324,6 +405,24 @@ fn empty_capability(message: &str) -> gtk::Label {
         .label(message)
         .halign(gtk::Align::Start)
         .css_classes(["toolport-muted"])
+        .build()
+}
+
+/// GtkLabel implements `lines` as a negative Pango layout height, and Pango
+/// applies that as a line limit *per paragraph*, ellipsizing each one on its
+/// own. MCP tool descriptions are routinely multi-paragraph instruction blocks,
+/// so a two-line cap on a fifteen-paragraph description still rendered thirty
+/// lines and one tool filled the whole page. Collapsing the text to a single
+/// paragraph first is what makes the cap bind.
+fn one_paragraph(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn state_badge(text: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(text)
+        .css_classes(["toolport-badge", "caption"])
+        .valign(gtk::Align::Center)
         .build()
 }
 
@@ -344,6 +443,7 @@ fn tool_row(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("No description")
         .to_string();
+    let summary = one_paragraph(&description);
     let schema = tool
         .get("inputSchema")
         .cloned()
@@ -352,100 +452,181 @@ fn tool_row(
     row.add_css_class("toolport-card");
     let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
     copy.set_hexpand(true);
-    copy.append(
+
+    // Pinning and renaming moved into the row menu, so their state comes back
+    // as badges. Both are off for most tools, so most rows show nothing here.
+    let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    title.append(
         &gtk::Label::builder()
             .label(&name)
             .halign(gtk::Align::Start)
             .xalign(0.0)
-            .wrap(true)
+            .max_width_chars(48)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["heading"])
             .build(),
     );
+    let pinned_badge = state_badge("Pinned");
+    pinned_badge.set_visible(pinned);
+    title.append(&pinned_badge);
+    let renamed_badge = state_badge("Renamed");
+    renamed_badge.set_visible(exposure_override.is_some());
+    title.append(&renamed_badge);
+    copy.append(&title);
+
     copy.append(
         &gtk::Label::builder()
-            .label(&description)
+            .label(&summary)
             .halign(gtk::Align::Start)
             .xalign(0.0)
             .wrap(true)
             .lines(2)
+            .max_width_chars(60)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["toolport-muted"])
             .build(),
     );
     row.append(&copy);
 
-    let pin = gtk::ToggleButton::builder()
-        .icon_name("view-pin-symbolic")
-        .active(pinned)
-        .tooltip_text("Always surface this tool in lazy discovery")
+    // Built before the visibility toggle, which desensitizes it in place rather
+    // than rebuilding the row.
+    let run = gtk::Button::with_label("Run");
+    run.add_css_class("toolport-secondary-action");
+    run.set_valign(gtk::Align::Center);
+    run.set_sensitive(enabled);
+
+    // A compact icon toggle rather than a GtkSwitch: same single click, but the
+    // switch was the tallest widget in the row and set the row height.
+    let visibility = gtk::ToggleButton::builder()
+        .icon_name(if enabled {
+            "view-reveal-symbolic"
+        } else {
+            "view-conceal-symbolic"
+        })
+        .active(!enabled)
+        .valign(gtk::Align::Center)
+        .tooltip_text(if enabled {
+            "Exposed to clients. Hide it."
+        } else {
+            "Hidden from clients. Expose it."
+        })
+        .css_classes(["flat"])
         .build();
-    pin.add_css_class("flat");
+    // Reverting a failed write re-enters this handler, so the guard keeps the
+    // revert from being treated as a fresh toggle.
+    let reverting = Rc::new(Cell::new(false));
+    let page_for_visibility = page.clone();
+    let name_for_visibility = name.clone();
+    let run_for_visibility = run.clone();
+    visibility.connect_toggled(move |button| {
+        if reverting.get() {
+            return;
+        }
+        let Some(server_id) = page_for_visibility.selected_server_id() else {
+            return;
+        };
+        let enabled = !button.is_active();
+        button.set_sensitive(false);
+        let page = page_for_visibility.clone();
+        let name = name_for_visibility.clone();
+        let button = button.clone();
+        let run = run_for_visibility.clone();
+        let reverting = reverting.clone();
+        gtk::glib::spawn_future_local(async move {
+            let result = {
+                let name = name.clone();
+                gtk::gio::spawn_blocking(move || {
+                    crate::registry_controller::set_tool_enabled(&server_id, &name, enabled)
+                })
+                .await
+            };
+            button.set_sensitive(true);
+            match result {
+                Ok(Ok(_)) => {
+                    page.remember_tool_enabled(&name, enabled);
+                    set_visibility_look(&button, enabled);
+                    run.set_sensitive(enabled);
+                }
+                Ok(Err(error)) => {
+                    // The registry rejected the change, so the control must not
+                    // keep claiming it happened.
+                    reverting.set(true);
+                    button.set_active(enabled);
+                    reverting.set(false);
+                    page.show_error(&error);
+                }
+                Err(_) => {
+                    reverting.set(true);
+                    button.set_active(enabled);
+                    reverting.set(false);
+                    page.show_error("the tool visibility update stopped unexpectedly");
+                }
+            }
+        });
+    });
+
+    let actions = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let pin_item = super::toolport_menu_button(pin_label(pinned));
+    let rename_item = super::toolport_menu_button("Rename for clients\u{2026}");
+    actions.append(&pin_item);
+    actions.append(&rename_item);
+    let popover = super::toolport_menu_popover();
+    popover.set_child(Some(&actions));
+    let menu = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text(format!("More actions for {name}"))
+        .popover(&popover)
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .build();
+
+    let is_pinned = Rc::new(Cell::new(pinned));
     let page_for_pin = page.clone();
     let name_for_pin = name.clone();
-    pin.connect_toggled(move |button| {
+    let badge_for_pin = pinned_badge.clone();
+    let popover_for_pin = popover.clone();
+    pin_item.connect_clicked(move |item| {
+        popover_for_pin.popdown();
         let Some(server_id) = page_for_pin.selected_server_id() else {
             return;
         };
-        let pinned = button.is_active();
-        button.set_sensitive(false);
+        let pinned = !is_pinned.get();
+        item.set_sensitive(false);
         let page = page_for_pin.clone();
         let name = name_for_pin.clone();
-        let button = button.clone();
+        let item = item.clone();
+        let badge = badge_for_pin.clone();
+        let is_pinned = is_pinned.clone();
         gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::registry_controller::set_tool_pinned(&server_id, &name, pinned)
-            })
-            .await;
-            button.set_sensitive(true);
+            let result = {
+                let name = name.clone();
+                gtk::gio::spawn_blocking(move || {
+                    crate::registry_controller::set_tool_pinned(&server_id, &name, pinned)
+                })
+                .await
+            };
+            item.set_sensitive(true);
             match result {
-                Ok(Ok(_)) => page.load_selected(),
+                Ok(Ok(_)) => {
+                    page.remember_tool_pinned(&name, pinned);
+                    is_pinned.set(pinned);
+                    badge.set_visible(pinned);
+                    if let Some(label) = item.child().and_downcast::<gtk::Label>() {
+                        label.set_label(pin_label(pinned));
+                    }
+                }
                 Ok(Err(error)) => page.show_error(&error),
                 Err(_) => page.show_error("the pin update stopped unexpectedly"),
             }
         });
     });
-    row.append(&pin);
 
-    let visibility = gtk::Switch::builder()
-        .active(enabled)
-        .valign(gtk::Align::Center)
-        .tooltip_text("Expose this tool to connected clients")
-        .build();
-    let page_for_visibility = page.clone();
-    let name_for_visibility = name.clone();
-    visibility.connect_state_set(move |switch, enabled| {
-        let Some(server_id) = page_for_visibility.selected_server_id() else {
-            return gtk::glib::Propagation::Stop;
-        };
-        switch.set_sensitive(false);
-        let page = page_for_visibility.clone();
-        let name = name_for_visibility.clone();
-        let switch = switch.clone();
-        gtk::glib::spawn_future_local(async move {
-            let result = gtk::gio::spawn_blocking(move || {
-                crate::registry_controller::set_tool_enabled(&server_id, &name, enabled)
-            })
-            .await;
-            switch.set_sensitive(true);
-            match result {
-                Ok(Ok(_)) => page.load_selected(),
-                Ok(Err(error)) => page.show_error(&error),
-                Err(_) => page.show_error("the tool visibility update stopped unexpectedly"),
-            }
-        });
-        gtk::glib::Propagation::Stop
-    });
-    row.append(&visibility);
-
-    let exposure = gtk::Button::builder()
-        .icon_name("document-edit-symbolic")
-        .tooltip_text("Rename or replace the description shown to clients")
-        .build();
-    exposure.add_css_class("flat");
     let page_for_exposure = page.clone();
     let name_for_exposure = name.clone();
     let description_for_exposure = description.clone();
-    exposure.connect_clicked(move |_| {
+    let popover_for_exposure = popover.clone();
+    rename_item.connect_clicked(move |_| {
+        popover_for_exposure.popdown();
         open_exposure_editor(
             &page_for_exposure,
             &name_for_exposure,
@@ -453,28 +634,42 @@ fn tool_row(
             exposure_override.clone(),
         );
     });
-    row.append(&exposure);
 
-    let run = gtk::Button::with_label("Run");
-    run.add_css_class("toolport-secondary-action");
-    run.set_sensitive(enabled);
     let name_for_run = name.clone();
     run.connect_clicked(move |_| {
         let name = name_for_run.clone();
         let title = format!("Run {name}");
         let tool_name = name.clone();
-        open_json_action(
-            &page,
-            &title,
-            "Arguments as JSON",
-            &schema,
-            move |server_id, arguments| {
-                crate::playground::call_tool(&server_id, &tool_name, arguments)
-            },
-        );
+        open_json_action(&page, &title, &schema, move |server_id, arguments| {
+            crate::playground::call_tool(&server_id, &tool_name, arguments)
+        });
     });
+
+    row.append(&visibility);
+    row.append(&menu);
     row.append(&run);
     row
+}
+
+fn pin_label(pinned: bool) -> &'static str {
+    if pinned {
+        "Unpin from discovery"
+    } else {
+        "Pin for discovery"
+    }
+}
+
+fn set_visibility_look(button: &gtk::ToggleButton, enabled: bool) {
+    button.set_icon_name(if enabled {
+        "view-reveal-symbolic"
+    } else {
+        "view-conceal-symbolic"
+    });
+    button.set_tooltip_text(Some(if enabled {
+        "Exposed to clients. Hide it."
+    } else {
+        "Hidden from clients. Expose it."
+    }));
 }
 
 fn open_exposure_editor(
@@ -539,14 +734,14 @@ fn open_exposure_editor(
     root.append(
         &gtk::Label::builder()
             .label(format!("Original description: {original_description}"))
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["caption", "toolport-muted"])
             .build(),
     );
     let feedback = gtk::Label::builder()
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
         .css_classes(["toolport-feedback"])
@@ -679,7 +874,6 @@ fn prompt_row(prompt: serde_json::Value, page: PlaygroundPage) -> gtk::Box {
         open_json_action(
             &page,
             &title,
-            "Prompt arguments as JSON",
             &serde_json::json!({"type": "object"}),
             move |server_id, arguments| {
                 crate::playground::get_prompt(&server_id, &prompt_name, arguments)
@@ -701,7 +895,7 @@ fn action_row(
     copy.append(
         &gtk::Label::builder()
             .label(title)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["heading"])
@@ -709,11 +903,12 @@ fn action_row(
     );
     copy.append(
         &gtk::Label::builder()
-            .label(description)
+            .label(one_paragraph(description))
             .halign(gtk::Align::Start)
             .xalign(0.0)
             .wrap(true)
             .lines(2)
+            .max_width_chars(60)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .css_classes(["toolport-muted"])
             .build(),
@@ -721,6 +916,7 @@ fn action_row(
     row.append(&copy);
     let button = gtk::Button::with_label(action);
     button.add_css_class("toolport-secondary-action");
+    button.set_valign(gtk::Align::Center);
     button.connect_clicked(move |_| activate());
     row.append(&button);
     row
@@ -932,10 +1128,21 @@ fn build_form_row(field: &FormField) -> (gtk::Box, FormWidget) {
     (row, widget)
 }
 
+/// Empty means hidden. `toolport-feedback` paints a background, so an empty
+/// label leaves a blank pill sitting in the dialog.
+fn set_dialog_status(feedback: &gtk::Label, message: &str, error: bool) {
+    feedback.set_label(message);
+    feedback.set_visible(!message.is_empty());
+    if error {
+        feedback.add_css_class("error");
+    } else {
+        feedback.remove_css_class("error");
+    }
+}
+
 fn open_json_action(
     page: &PlaygroundPage,
     title: &str,
-    label: &str,
     schema: &serde_json::Value,
     execute: impl FnOnce(String, serde_json::Value) -> Result<serde_json::Value, String>
         + Send
@@ -944,13 +1151,26 @@ fn open_json_action(
     let Some(parent) = page.app.active_window() else {
         return;
     };
+    // No default height: the window sizes to its content, and the scrollers
+    // below cap how far that can go. A fixed 540 left a one-field form sitting
+    // above a screenful of nothing.
     let dialog = adw::Window::builder()
         .title(title)
         .transient_for(&parent)
         .modal(true)
-        .default_width(660)
-        .default_height(540)
+        .default_width(560)
         .build();
+    let shell = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    // The window title was set but never shown, because nothing here drew a
+    // header bar the way the result dialog does.
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(
+        &gtk::Label::builder()
+            .label(title)
+            .css_classes(["heading"])
+            .build(),
+    ));
+    shell.append(&header);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
     root.set_margin_top(18);
     root.set_margin_bottom(18);
@@ -958,9 +1178,9 @@ fn open_json_action(
     root.set_margin_end(18);
     root.append(
         &gtk::Label::builder()
-            .label(label)
+            .label("Arguments")
             .halign(gtk::Align::Start)
-            .css_classes(["heading"])
+            .css_classes(["toolport-muted", "caption"])
             .build(),
     );
 
@@ -975,9 +1195,12 @@ fn open_json_action(
         widgets.push(widget);
     }
     let widgets = Rc::new(widgets);
+    // propagate_natural_height plus a cap is what makes these size to their
+    // content: min_content_height with vexpand demanded 150px and then took
+    // every spare pixel, which is where the dead space came from.
     let form_scroll = gtk::ScrolledWindow::builder()
-        .min_content_height(150)
-        .vexpand(true)
+        .propagate_natural_height(true)
+        .max_content_height(300)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&form)
         .build();
@@ -986,8 +1209,9 @@ fn open_json_action(
     editor.set_wrap_mode(gtk::WrapMode::WordChar);
     editor.buffer().set_text("{}");
     let editor_scroll = gtk::ScrolledWindow::builder()
-        .min_content_height(150)
-        .vexpand(true)
+        .propagate_natural_height(true)
+        .min_content_height(120)
+        .max_content_height(300)
         .child(&editor)
         .build();
     let has_form = !widgets.is_empty();
@@ -1026,21 +1250,35 @@ fn open_json_action(
         });
         root.append(&json_toggle);
     }
+    // Kept, because it is the only place the raw contract is visible, but
+    // collapsed: it was a wall of JSON taking half the dialog by default.
     let schema_text = serde_json::to_string_pretty(schema).unwrap_or_else(|_| "{}".into());
-    root.append(
-        &gtk::Label::builder()
-            .label(format!("Input schema\n{schema_text}"))
-            .halign(gtk::Align::Start)
-            .xalign(0.0)
-            .selectable(true)
-            .wrap(true)
-            .css_classes(["caption", "toolport-muted"])
-            .build(),
-    );
+    let schema_view = gtk::ScrolledWindow::builder()
+        .propagate_natural_height(true)
+        .max_content_height(220)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(
+            &gtk::Label::builder()
+                .label(&schema_text)
+                .halign(gtk::Align::Fill)
+                .xalign(0.0)
+                .selectable(true)
+                .wrap(true)
+                .css_classes(["caption", "toolport-muted", "monospace"])
+                .build(),
+        )
+        .build();
+    let schema_expander = gtk::Expander::builder()
+        .label("Input schema")
+        .child(&schema_view)
+        .css_classes(["toolport-details-expander"])
+        .build();
+    root.append(&schema_expander);
     let feedback = gtk::Label::builder()
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
+        .visible(false)
         .css_classes(["toolport-feedback"])
         .build();
     root.append(&feedback);
@@ -1052,7 +1290,8 @@ fn open_json_action(
     actions.append(&cancel);
     actions.append(&run);
     root.append(&actions);
-    dialog.set_content(Some(&root));
+    shell.append(&root);
+    dialog.set_content(Some(&shell));
     // Cancelling mid-call abandons the wait (the server finishes on its own);
     // the completion handler checks this before touching the closed dialog.
     let cancelled = Rc::new(Cell::new(false));
@@ -1076,13 +1315,11 @@ fn open_json_action(
             match serde_json::from_str::<serde_json::Value>(&text) {
                 Ok(serde_json::Value::Object(object)) => serde_json::Value::Object(object),
                 Ok(_) => {
-                    feedback.set_label("Arguments must be a JSON object.");
-                    feedback.add_css_class("error");
+                    set_dialog_status(&feedback, "Arguments must be a JSON object.", true);
                     return;
                 }
                 Err(error) => {
-                    feedback.set_label(&format!("Invalid JSON: {error}"));
-                    feedback.add_css_class("error");
+                    set_dialog_status(&feedback, &format!("Invalid JSON: {error}"), true);
                     return;
                 }
             }
@@ -1095,8 +1332,7 @@ fn open_json_action(
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        feedback.set_label(&error);
-                        feedback.add_css_class("error");
+                        set_dialog_status(&feedback, &error, true);
                         return;
                     }
                 }
@@ -1107,8 +1343,7 @@ fn open_json_action(
             return;
         };
         button.set_sensitive(false);
-        feedback.remove_css_class("error");
-        feedback.set_label("Calling… 0s");
+        set_dialog_status(&feedback, "Calling… 0s", false);
         let started = std::time::Instant::now();
         let done = Rc::new(Cell::new(false));
         {
@@ -1118,7 +1353,11 @@ fn open_json_action(
                 if done.get() {
                     return gtk::glib::ControlFlow::Break;
                 }
-                feedback.set_label(&format!("Calling… {}s", started.elapsed().as_secs()));
+                set_dialog_status(
+                    &feedback,
+                    &format!("Calling… {}s", started.elapsed().as_secs()),
+                    false,
+                );
                 gtk::glib::ControlFlow::Continue
             });
         }
@@ -1208,6 +1447,41 @@ fn show_output(page: &PlaygroundPage, title: &str, value: serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A multi-paragraph tool description has to become one paragraph before
+    /// the label's two-line cap can bind, because Pango limits lines per
+    /// paragraph rather than per layout.
+    #[test]
+    fn multi_paragraph_descriptions_collapse_to_a_single_paragraph() {
+        let description = "Prepare a direct Linear file upload.\n\nWorkflow:\n1. Call this tool.\n2. Upload raw bytes.\n\nExample:\n  curl -X PUT";
+        let collapsed = one_paragraph(description);
+        assert!(!collapsed.contains('\n'), "newlines survived: {collapsed}");
+        assert!(
+            !collapsed.contains("  "),
+            "runs of spaces survived: {collapsed}"
+        );
+        assert!(collapsed.starts_with("Prepare a direct Linear file upload. Workflow:"));
+        assert!(collapsed.ends_with("Example: curl -X PUT"));
+    }
+
+    #[test]
+    fn a_single_line_description_is_left_alone() {
+        assert_eq!(
+            one_paragraph("Retrieve an attachment's content by ID."),
+            "Retrieve an attachment's content by ID."
+        );
+    }
+
+    #[test]
+    fn refreshed_server_choices_keep_the_selected_server() {
+        let servers = vec![
+            ("linear".to_string(), "Linear".to_string()),
+            ("stripe".to_string(), "Stripe".to_string()),
+        ];
+        assert_eq!(selected_server_index(&servers, Some("stripe")), 1);
+        assert_eq!(selected_server_index(&servers, Some("removed")), 0);
+        assert_eq!(selected_server_index(&servers, None), 0);
+    }
 
     #[test]
     fn primitive_schemas_become_typed_forms_and_complex_ones_fall_back() {
