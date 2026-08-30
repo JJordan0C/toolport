@@ -166,7 +166,9 @@ fn status_from(
                     .as_ref()
                     .map(|t| t.path.to_string_lossy().to_string()),
                 project_covered: c.target.is_none()
-                    && PROJECT_FILES.iter().any(|f| f.clients.contains(&c.id.as_str())),
+                    && PROJECT_FILES
+                        .iter()
+                        .any(|f| f.clients.contains(&c.id.as_str())),
                 state,
                 on_disk,
             }

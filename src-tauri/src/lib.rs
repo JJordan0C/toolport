@@ -38,6 +38,10 @@ pub mod router;
 pub mod routine_advisor;
 pub mod routine_candidates;
 pub mod routine_catalog;
+// Same gate as `approval_broker`, which it imports: without a desktop shell
+// there is no broker to hold routine suggestions, and an ungated declaration
+// broke `--no-default-features` for anyone building only the gateway.
+#[cfg(any(feature = "desktop", feature = "gtk-desktop"))]
 pub mod routine_controller;
 pub mod routines;
 pub mod rules;
