@@ -376,6 +376,27 @@ fn default_keep_paths() -> Vec<PathBuf> {
         let ext = std::env::consts::EXE_SUFFIX;
         push(&mut paths, dir.join(format!("toolport-gateway{ext}")));
         push(&mut paths, dir.join(format!("conduit-gateway{ext}")));
+        // A dev/debug build lives in the `-dev` data dir, but the PRODUCTION
+        // install's gateways are live processes serving real clients. Without
+        // this, running a dev build reaps every production gateway mid-call
+        // (observed: a debug launch killed 18 of them). The reverse direction
+        // is not added: a production build must still reap dev leftovers.
+        if let Some(name) = dir
+            .parent()
+            .and_then(|d| d.file_name())
+            .and_then(|n| n.to_str())
+        {
+            if let Some(stripped) = name.strip_suffix("-dev") {
+                if let Some(base) = dir.parent().and_then(|d| d.parent()) {
+                    let production = base.join(stripped).join("bin");
+                    push(
+                        &mut paths,
+                        production.join(format!("toolport-gateway{ext}")),
+                    );
+                    push(&mut paths, production.join(format!("conduit-gateway{ext}")));
+                }
+            }
+        }
     }
     paths
 }
