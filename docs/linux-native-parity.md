@@ -105,9 +105,13 @@ scope line and in the tooltips.
   WebKit light, dark, and system selector. This is the native theme contract.
 - Updates are owned by pacman or the Omarchy update flow. The Tauri downloader
   remains available only in the shipping cross-platform shell.
-- The GTK binary and package retain preview identity while both Linux shells are
-  installable side by side. Production identity changes only at the replacement
-  release so desktop IDs and package files cannot collide early.
+- The GTK binary and package retain preview identity until the replacement
+  release, so desktop IDs do not collide early. The package conflicts with
+  `toolport` / `toolport-bin` rather than installing beside it: both shells read
+  the same `~/.config/Toolport`, and only one can hold the approval broker's
+  owner lock, so with both running HIL prompts reach whichever started first
+  while the other shows an empty queue. They also both claim
+  `/usr/bin/toolport-gateway`. Rollback is uninstall and reinstall the other.
 - Updater-only process recovery commands are not exposed as native UI. The
   package lifecycle and stale-gateway action replace that workflow.
 - Clearing retained activity is one explicit action covering the call audit,

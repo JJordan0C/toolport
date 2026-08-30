@@ -10,6 +10,12 @@ license=('MIT')
 depends=('gtk4' 'libadwaita' 'libsecret' 'glib2' 'dbus' 'hicolor-icon-theme')
 makedepends=('cargo' 'desktop-file-utils' 'appstream' 'zip')
 provides=('toolport-native-preview')
+# Both shells read the same ~/.config/Toolport and only one can own the approval
+# broker: the second to start gets an inert one, so HIL prompts appear in
+# whichever launched first and the other window shows an empty queue forever.
+# They also share /usr/bin/toolport-gateway. One at a time, by construction.
+# `toolport` covers the deb-derived toolport-bin, which provides it.
+conflicts=('toolport' 'toolport-bin')
 options=('!lto')
 source=("toolport-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
