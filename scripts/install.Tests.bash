@@ -101,15 +101,17 @@ EOF
   # test. Ubuntu CI never runs this file, so that hole only ever opens on the
   # maintainer's own machine, which is the worst place for it.
   #
-  # `pacman` exists so the Arch branch is entered on every platform, making the
-  # coverage below deterministic instead of dependent on the host distro. Each
-  # helper records its argv and its stdin, then fails - unless it is named in
-  # TOOLPORT_TEST_AUR_HELPER, which is how the success path is exercised.
-  cat > "$shim_dir/pacman" <<'EOF'
-#!/usr/bin/env bash
-exit 0
-EOF
-  chmod +x "$shim_dir/pacman"
+  # Since 1.18.0 the Arch branch installs the native package and returns instead
+  # of falling through to the AppImage, so these tests must be able to say which
+  # kind of host they are simulating. install.sh reads TOOLPORT_OS_RELEASE, and
+  # every test gets a non-Arch one by default; the Arch tests below point at an
+  # Arch one. Without this the file cannot pass on a maintainer's own Arch box,
+  # where the real pacman is on PATH and cannot be shadowed away.
+  printf 'ID=ubuntu\nID_LIKE=debian\n' > "$shim_dir/os-release-generic"
+  printf 'ID=omarchy\nID_LIKE=arch\n' > "$shim_dir/os-release-arch"
+
+  # Shadowing the AUR helpers still matters on an Arch box: without it a stray
+  # code path could reach the real paru/yay in the middle of a unit test.
   local helper
   for helper in paru yay pamac pikaur trizen omarchy; do
     cat > "$shim_dir/$helper" <<EOF
@@ -141,7 +143,8 @@ run_install() {
   # install.sh never lets them, and an inherited terminal would block them
   # forever. Only the Arch test below pipes anything, which is what makes its
   # stdin assertion falsifiable while these stay deterministic.
-  output="$(cd "$workdir" && PATH="$shim:$PATH" HOME="$home" XDG_BIN_HOME="$bindir" env "$@" bash "$INSTALL_SH" </dev/null 2>&1)"
+  output="$(cd "$workdir" && PATH="$shim:$PATH" HOME="$home" XDG_BIN_HOME="$bindir" \
+    TOOLPORT_OS_RELEASE="$shim/os-release-generic" env "$@" bash "$INSTALL_SH" </dev/null 2>&1)"
   rc=$?
   set -e
   printf '%s\t%s' "$rc" "$output"
@@ -191,7 +194,7 @@ mkdir -p "$home" "$bindir"
 printf 'existing working install' > "$bindir/toolport"
 make_shim "$shim" "$(fake_release "sha256:$(printf '0%.0s' $(seq 1 64))" 64)"
 set +e
-mismatch_output="$(cd "$workdir" && PATH="$shim:$PATH" HOME="$home" XDG_BIN_HOME="$bindir" bash "$INSTALL_SH" </dev/null 2>&1)"
+mismatch_output="$(cd "$workdir" && PATH="$shim:$PATH" HOME="$home" XDG_BIN_HOME="$bindir" TOOLPORT_OS_RELEASE="$shim/os-release-generic" bash "$INSTALL_SH" </dev/null 2>&1)"
 mismatch_rc=$?
 set -e
 if [ "$mismatch_rc" = "1" ] && [ "$(cat "$bindir/toolport")" = "existing working install" ]; then
@@ -222,7 +225,8 @@ shim="$workdir/shim"; home="$workdir/home"; bindir="$workdir/bin"
 mkdir -p "$home" "$bindir"
 make_shim "$shim" "$(fake_release "sha256:$fake_sha256" 64)"
 set +e
-curl_fail_output="$(cd "$workdir" && PATH="$shim:$PATH" HOME="$home" XDG_BIN_HOME="$bindir" TOOLPORT_TEST_CURL_FAIL=1 bash "$INSTALL_SH" </dev/null 2>&1)"
+curl_fail_output="$(cd "$workdir" && PATH="$shim:$PATH" HOME="$home" XDG_BIN_HOME="$bindir" \
+  TOOLPORT_OS_RELEASE="$shim/os-release-generic" TOOLPORT_TEST_CURL_FAIL=1 bash "$INSTALL_SH" </dev/null 2>&1)"
 curl_fail_rc=$?
 set -e
 check "reports the download failure" "Download failed" "$curl_fail_output"
@@ -239,38 +243,88 @@ fi
 echo "    output: $(printf '%s' "$curl_fail_output" | tr '\n' ' ' | cut -c1-150)"
 rm -rf "$workdir"
 
-echo "Arch: installs the AppImage and leaves the AUR alone"
-# The AppImage stopped bundling wayland in 1.16.0, so it works on Mesa as well as
-# NVIDIA and Arch no longer needs steering to a native package. `toolport-bin` is
-# still documented for anyone who wants one; the installer must not reach for an
-# AUR helper on the user's behalf, least of all under `curl ... | bash`.
+echo "Arch: adds the signed repository and installs the native package"
+# Since 1.18.0 Arch gets the native GTK package from Toolport's own pacman repo,
+# so updates arrive with an ordinary `pacman -Syu` instead of a Toolport-specific
+# command or a self-updater fighting the package manager. The installer must add
+# the repo, pin-trust the signing key, install, and never touch the AppImage or
+# reach for an AUR helper on the user's behalf.
 arch_workdir="$(mktemp -d)"
 arch_shim="$arch_workdir/shim"; arch_home="$arch_workdir/home"; arch_bin="$arch_workdir/bin"
 mkdir -p "$arch_home" "$arch_bin"
 make_shim "$arch_shim" "$(fake_release "sha256:$fake_sha256" 64)"
+
+# pacman-key and sudo are recorded, not executed: this asserts what the installer
+# asks the system to do without letting it touch the real keyring or /etc.
+arch_conf="$arch_workdir/pacman.conf"
+: > "$arch_conf"
+cat > "$arch_shim/pacman-key" <<EOF
+#!/usr/bin/env bash
+printf 'pacman-key %s\n' "\$*" >> "$arch_shim/pacman-key.log"
+EOF
+cat > "$arch_shim/sudo" <<'EOF'
+#!/usr/bin/env bash
+exec "$@"
+EOF
+cat > "$arch_shim/pacman" <<EOF
+#!/usr/bin/env bash
+printf 'pacman %s\n' "\$*" >> "$arch_shim/pacman.log"
+EOF
+chmod +x "$arch_shim/pacman-key" "$arch_shim/sudo" "$arch_shim/pacman"
+
 set +e
 arch_output="$(cd "$arch_workdir" && PATH="$arch_shim:$PATH" HOME="$arch_home" \
-  XDG_BIN_HOME="$arch_bin" bash "$INSTALL_SH" 2>&1)"
+  XDG_BIN_HOME="$arch_bin" TOOLPORT_OS_RELEASE="$arch_shim/os-release-arch" \
+  TOOLPORT_PACMAN_CONF="$arch_conf" TOOLPORT_REPO_KEY_ID="DEADBEEFDEADBEEF" \
+  bash "$INSTALL_SH" 2>&1)"
 arch_rc=$?
 set -e
 arch_argv="$(cat "$arch_shim/helper-argv.log" 2>/dev/null || true)"
 
-check "installs the AppImage on Arch" "Installed the AppImage" "$arch_output"
-check "still points at toolport-bin for those who want it" "toolport-bin" "$arch_output"
 if [ "$arch_rc" = "0" ]; then
   echo "  ok: exit code 0"; pass=$((pass + 1))
 else
   echo "  FAIL: exit code $arch_rc (wanted 0)"; fail=$((fail + 1))
+fi
+check "installs the native package" "Installing toolport" "$arch_output"
+check "explains how updates arrive" "pacman -Syu" "$arch_output"
+if grep -q '^\[toolport\]' "$arch_conf" 2>/dev/null; then
+  echo "  ok: repository added to pacman.conf"; pass=$((pass + 1))
+else
+  echo "  FAIL: no [toolport] section in pacman.conf"; fail=$((fail + 1))
+fi
+# The pin is the security property: --lsign-key must name the expected
+# fingerprint, so a key swapped at the host cannot become trusted.
+if grep -q -- "--lsign-key DEADBEEFDEADBEEF" "$arch_shim/pacman-key.log" 2>/dev/null; then
+  echo "  ok: trusted only the pinned fingerprint"; pass=$((pass + 1))
+else
+  echo "  FAIL: did not lsign the pinned key id"; fail=$((fail + 1))
+fi
+if grep -q -- "-Sy .*toolport" "$arch_shim/pacman.log" 2>/dev/null; then
+  echo "  ok: installed toolport with pacman"; pass=$((pass + 1))
+else
+  echo "  FAIL: pacman was not asked to install toolport"; fail=$((fail + 1))
 fi
 if [ -z "$arch_argv" ]; then
   echo "  ok: no AUR helper was invoked"; pass=$((pass + 1))
 else
   echo "  FAIL: an AUR helper ran: $(printf '%s' "$arch_argv" | head -c 80)"; fail=$((fail + 1))
 fi
-if [ -x "$arch_bin/toolport" ]; then
-  echo "  ok: AppImage installed to XDG_BIN_HOME"; pass=$((pass + 1))
+if [ -e "$arch_bin/toolport" ]; then
+  echo "  FAIL: installed an AppImage on Arch"; fail=$((fail + 1))
 else
-  echo "  FAIL: no AppImage at $arch_bin/toolport"; fail=$((fail + 1))
+  echo "  ok: no AppImage on Arch"; pass=$((pass + 1))
+fi
+# A second run must be idempotent: the repo block is added once, not appended
+# on every install.
+(cd "$arch_workdir" && PATH="$arch_shim:$PATH" HOME="$arch_home" \
+  XDG_BIN_HOME="$arch_bin" TOOLPORT_OS_RELEASE="$arch_shim/os-release-arch" \
+  TOOLPORT_PACMAN_CONF="$arch_conf" TOOLPORT_REPO_KEY_ID="DEADBEEFDEADBEEF" \
+  bash "$INSTALL_SH" >/dev/null 2>&1) || true
+if [ "$(grep -c '^\[toolport\]' "$arch_conf")" = "1" ]; then
+  echo "  ok: repository block added once, not per run"; pass=$((pass + 1))
+else
+  echo "  FAIL: pacman.conf gained a duplicate [toolport] section"; fail=$((fail + 1))
 fi
 rm -rf "$arch_workdir"
 

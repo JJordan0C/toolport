@@ -1,0 +1,172 @@
+name: Arch repository
+
+# Builds the native GTK package from a published tag and publishes it to the
+# Toolport pacman repository on Cloudflare R2, so Arch users get updates through
+# `pacman -Syu` like everything else on their system.
+#
+# Manual dispatch, not tag-triggered: the PKGBUILD's sha256 is computed from the
+# tag tarball AFTER the tag exists, so a tag push alone cannot be trusted to have
+# a matching PKGBUILD committed yet. Run this once the release is published.
+#
+# The build container REPORTS, it does not sign. Signing and upload happen on the
+# runner in later, separately-scoped steps, so code from a mutable `archlinux`
+# image tag never sees the signing key or the R2 credentials.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Published release tag to package, e.g. v1.18.0"
+        required: true
+      dry_run:
+        description: "Build and validate only; do not publish to R2"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arch-repo
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish to the pacman repo
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require a published, non-prerelease tag
+        run: |
+          state="$(gh release view "$TAG" --json isDraft,isPrerelease,tagName 2>/dev/null)" || {
+            echo "::error::$TAG has no GitHub release. Publish it first."; exit 1; }
+          [ "$(echo "$state" | jq -r .isDraft)" = "false" ] || {
+            echo "::error::$TAG is still a draft. The repo must only serve published releases."; exit 1; }
+          [ "$(echo "$state" | jq -r .isPrerelease)" = "false" ] || {
+            echo "::error::$TAG is a prerelease; the pacman repo is stable-only."; exit 1; }
+
+      # The committed PKGBUILD is the single source of truth for what gets built.
+      # If it does not describe this tag, something was not updated at release
+      # time and building anyway would publish a package that claims a version it
+      # is not. Fail loudly instead.
+      - name: Check the PKGBUILD matches the tag
+        run: |
+          want="${TAG#v}"
+          have="$(sed -n 's/^pkgver=//p' packaging/linux/native/PKGBUILD)"
+          if [ "$want" != "$have" ]; then
+            echo "::error::PKGBUILD pkgver is $have but the tag is $want. Bump it and re-run updpkgsums."
+            exit 1
+          fi
+          if grep -q "sha256sums=('SKIP')" packaging/linux/native/PKGBUILD; then
+            echo "::error::PKGBUILD still has sha256sums=('SKIP'). Run updpkgsums against the tag."
+            exit 1
+          fi
+
+      # A real chroot-equivalent build. --nodeps is deliberate: GTK and libadwaita
+      # are runtime dependencies this container never has to satisfy to prove the
+      # package builds and lays its files down correctly.
+      - name: Build the package in an Arch container
+        run: |
+          mkdir -p pkgout
+          docker run --rm \
+            -v "$PWD:/src:ro" -v "$PWD/pkgout:/out" \
+            -w /build archlinux:base-devel bash -euc '
+            pacman -Syu --noconfirm --needed archlinux-keyring namcap git > /dev/null
+            useradd -m builder
+            cp /src/packaging/linux/native/PKGBUILD /build/
+            chown -R builder /build /out
+            sudo -u builder makepkg --noconfirm --nocheck --syncdeps --nodeps
+            namcap PKGBUILD || true
+            pkg=$(ls -1 *.pkg.tar.zst | grep -v -- "-debug-" | head -1)
+            echo "built $pkg"
+            namcap "$pkg" || true
+            bsdtar -tf "$pkg" > contents.txt
+            for want in usr/bin/toolport-gtk usr/bin/toolport-gateway; do
+              grep -qx "$want" contents.txt || { echo "::error::$want missing from $pkg"; exit 1; }
+            done
+            grep -q "^usr/share/applications/com.tsout.Toolport.desktop$" contents.txt \
+              || { echo "::error::desktop entry missing from $pkg"; exit 1; }
+            cp *.pkg.tar.zst /out/
+          '
+          ls -la pkgout
+
+      - name: Sign the package
+        if: ${{ !inputs.dry_run }}
+        env:
+          # Step-scoped on purpose: the build step above runs code from a mutable
+          # image tag and has no business being able to read this key.
+          GPG_PRIVATE_KEY: ${{ secrets.REPO_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.REPO_GPG_PASSPHRASE }}
+        run: |
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "::error::REPO_GPG_PRIVATE_KEY is not set. Add it before publishing."; exit 1
+          fi
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          keyid="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')"
+          echo "signing with $keyid"
+          for p in pkgout/*.pkg.tar.zst; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+              --local-user "$keyid" --detach-sign --no-armor "$p"
+          done
+          ls -la pkgout
+
+      # Fetch the existing database so older versions stay installable, add the
+      # new package to it, and push the whole set back. repo-add on a fresh db
+      # each run would silently drop every prior version.
+      - name: Rebuild the repository database
+        if: ${{ !inputs.dry_run }}
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          AWS_DEFAULT_REGION: auto
+          GPG_PASSPHRASE: ${{ secrets.REPO_GPG_PASSPHRASE }}
+        run: |
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp "s3://$R2_BUCKET/x86_64/" pkgout/ --recursive \
+            --endpoint-url "$endpoint" --exclude "*" \
+            --include "toolport.db*" --include "toolport.files*" || true
+          keyid="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')"
+          cd pkgout
+          # --sign signs the database itself; pacman verifies it before trusting
+          # any package listed in it.
+          GPGKEY="$keyid" repo-add --sign --key "$keyid" toolport.db.tar.gz *.pkg.tar.zst
+          ls -la
+
+      - name: Publish to R2
+        if: ${{ !inputs.dry_run }}
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          # Packages first, database last: a client that syncs mid-upload then
+          # sees the old database, which points only at files already present,
+          # rather than a new database naming a package that has not landed.
+          aws s3 sync pkgout/ "s3://$R2_BUCKET/x86_64/" \
+            --endpoint-url "$endpoint" --exclude "toolport.db*" --exclude "toolport.files*"
+          aws s3 sync pkgout/ "s3://$R2_BUCKET/x86_64/" \
+            --endpoint-url "$endpoint" --exclude "*" \
+            --include "toolport.db*" --include "toolport.files*"
+          echo "published $TAG to the pacman repo"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Arch repository"
+            echo
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo "Dry run: built and validated \`$TAG\`, published nothing."
+            else
+              echo "Published \`$TAG\`. Users on the repo get it with their next \`pacman -Syu\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

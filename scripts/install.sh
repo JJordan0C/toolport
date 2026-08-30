@@ -184,6 +184,66 @@ download_and_verify() {
   fi
 }
 
+# Add the Toolport pacman repository and install the native GTK package.
+#
+# Deliberately not a self-updater: a packaged app overwriting /usr/bin fights
+# pacman and breaks file ownership. Adding a repo once means every later update
+# is an ordinary system update.
+# Fingerprint of the key that signs the Toolport pacman repository. Pinned so a
+# compromised or swapped key at repo.toolport.app cannot be trusted by pacman.
+# Replace when the signing key rotates.
+REPO_SIGNING_KEY="REPLACE_ME_WITH_THE_REPO_SIGNING_KEY_FINGERPRINT"
+
+install_arch_repo() {
+  # Overridable so the test suite can point at a scratch pacman.conf and a local
+  # key instead of writing to /etc and reaching the network.
+  repo_url="${TOOLPORT_REPO_URL:-https://repo.toolport.app}"
+  pacman_conf="${TOOLPORT_PACMAN_CONF:-/etc/pacman.conf}"
+  keyring_url="$repo_url/toolport.gpg"
+
+  sudo=""
+  if [ "$(id -u)" -ne 0 ]; then
+    command -v sudo >/dev/null 2>&1 && sudo="sudo" ||
+      err "Adding the Toolport repository needs root: re-run as root or install sudo."
+  fi
+
+  # The expected fingerprint is pinned here rather than read out of whatever the
+  # URL served: --lsign-key only signs the fingerprint it is given, so a key
+  # swapped at the host cannot become trusted. Importing it is harmless; trusting
+  # it is what this pins.
+  repo_key_id="${TOOLPORT_REPO_KEY_ID:-$REPO_SIGNING_KEY}"
+  case "$repo_key_id" in
+    *REPLACE_ME*|"")
+      err "This build of the installer has no repository signing key pinned. Grab the package from the Releases page, or report this."
+      ;;
+  esac
+
+  say "Importing the Toolport signing key"
+  tmpkey="$tmp/toolport.gpg"
+  curl -fsSL "$keyring_url" -o "$tmpkey" ||
+    err "Could not fetch the signing key from $keyring_url"
+  $sudo pacman-key --add "$tmpkey" ||
+    err "pacman-key could not import the Toolport signing key."
+  $sudo pacman-key --lsign-key "$repo_key_id" ||
+    err "pacman-key could not trust $repo_key_id. The key served by $keyring_url is not the one this installer expects."
+
+  if grep -q '^\[toolport\]' "$pacman_conf" 2>/dev/null; then
+    say "Toolport repository already configured"
+  else
+    say "Adding the Toolport repository to $pacman_conf"
+    printf '\n[toolport]\nServer = %s/$arch\n' "$repo_url" |
+      $sudo tee -a "$pacman_conf" >/dev/null ||
+      err "Could not write to $pacman_conf"
+  fi
+
+  say "Installing toolport"
+  $sudo pacman -Sy --noconfirm toolport ||
+    err "pacman could not install toolport. Check the output above."
+
+  say "Installed. Launch Toolport from your app menu, or run: toolport-gtk"
+  say "Updates arrive with your normal system update (pacman -Syu)."
+}
+
 install_linux() {
   [ "$arch" = "x86_64" ] ||
     err "Linux builds are x86_64 only right now (you're on $arch). Use Development mode or grab a build from the Releases page."
@@ -213,19 +273,19 @@ install_linux() {
     return
   fi
 
-  # Everything else, Arch/Omarchy included, gets the AppImage. It used to be the
-  # wrong choice on a rolling release, but only because it bundled wayland 1.20:
-  # the host's Mesa resolved against it, libEGL_mesa failed to load, and the
-  # window never painted. Releases from 1.16.0 unbundle those libraries (see
-  # scripts/patch-appimage.sh), so the AppImage now works on Mesa and NVIDIA
-  # alike and there is nothing left to steer around.
-  #
-  # `toolport-bin` in the AUR is still there for anyone who would rather have a
-  # real package; it is a preference now, not a workaround, so this script does
-  # not reach for an AUR helper on the user's behalf.
-  if command -v pacman >/dev/null 2>&1; then
-    say "Arch detected: installing the AppImage."
-    say "Prefer a native package? paru -S toolport-bin (or: omarchy pkg aur add toolport-bin)"
+  # Arch and derivatives get the native GTK package from Toolport's own pacman
+  # repository, so updates arrive with `pacman -Syu` like everything else rather
+  # than needing a Toolport-specific command or a self-updater fighting pacman.
+  # The AppImage below stays the fallback for every other distribution.
+  # Detected from os-release, not from `command -v pacman`: a Debian box can have
+  # pacman installed without being Arch, and the tests need to simulate either
+  # host regardless of what they are running on. Omarchy reports ID=omarchy with
+  # ID_LIKE=arch, so both fields are checked.
+  os_release="${TOOLPORT_OS_RELEASE:-/etc/os-release}"
+  if command -v pacman >/dev/null 2>&1 &&
+    grep -qE '^(ID|ID_LIKE)=.*\barch\b' "$os_release" 2>/dev/null; then
+    install_arch_repo
+    return
   fi
 
   url="$(asset_url '_amd64[.]AppImage')"
