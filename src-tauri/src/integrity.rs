@@ -73,6 +73,11 @@ struct Pin {
     /// `destructiveHint` at pin time, if the tool advertised one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dh: Option<bool>,
+    /// Small per-field fingerprints used only to explain which part of a tool
+    /// definition drifted. We deliberately do not duplicate full schemas in the
+    /// pin store; the whole-definition fingerprint remains the trust boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parts: Option<DefinitionParts>,
     /// Epoch ms this tool's definition was first pinned (identity provenance). Set once
     /// and never moved. 0 = a legacy pin from before timestamps; backfilled on the next
     /// check so the identity view has a usable date instead of 1970.
@@ -82,6 +87,14 @@ struct Pin {
     /// when the fingerprint actually changes, so "last changed" reflects real drift.
     #[serde(default)]
     last_changed: u64,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+struct DefinitionParts {
+    description: String,
+    input_schema: String,
+    output_schema: String,
+    annotations: String,
 }
 
 /// On-disk pin value: either the legacy bare fingerprint string (pins written before
@@ -103,6 +116,7 @@ impl From<PinRepr> for Pin {
                 fp,
                 ro: None,
                 dh: None,
+                parts: None,
                 first_seen: 0,
                 last_changed: 0,
             },
@@ -126,10 +140,30 @@ fn pin_of(tool: &Value) -> Pin {
         fp: fingerprint(tool),
         ro: read_hint(tool, "readOnlyHint"),
         dh: read_hint(tool, "destructiveHint"),
+        parts: Some(definition_parts(tool)),
         // Timestamps are reconciled against the prior baseline in `check`, not set here.
         first_seen: 0,
         last_changed: 0,
     }
+}
+
+fn definition_parts(tool: &Value) -> DefinitionParts {
+    DefinitionParts {
+        description: definition_field_fingerprint(tool, "description"),
+        input_schema: definition_field_fingerprint(tool, "inputSchema"),
+        output_schema: definition_field_fingerprint(tool, "outputSchema"),
+        annotations: definition_field_fingerprint(tool, "annotations"),
+    }
+}
+
+fn definition_field_fingerprint(tool: &Value, key: &str) -> String {
+    let encoded = tool
+        .get(key)
+        .map(|value| serde_json::to_string(value).unwrap_or_default())
+        .unwrap_or_else(|| "<absent>".to_string());
+    let mut hash = Sha256::new();
+    hash.update(encoded.as_bytes());
+    to_hex(&hash.finalize())
 }
 
 /// A safety annotation went from `true` to no-longer-`true` (either flipped to `false`
@@ -3086,7 +3120,26 @@ fn changed_event(server: &str, tool: &str, severity: &str, old: &Pin, new: &Pin)
     e["new_ro"] = json!(new.ro);
     e["prev_dh"] = json!(old.dh);
     e["new_dh"] = json!(new.dh);
+    let changed_fields = changed_definition_fields(old, new);
+    if !changed_fields.is_empty() {
+        e["changed_fields"] = json!(changed_fields);
+    }
     e
+}
+
+fn changed_definition_fields(old: &Pin, new: &Pin) -> Vec<&'static str> {
+    let (Some(old), Some(new)) = (&old.parts, &new.parts) else {
+        return Vec::new();
+    };
+    [
+        ("description", old.description != new.description),
+        ("input_schema", old.input_schema != new.input_schema),
+        ("output_schema", old.output_schema != new.output_schema),
+        ("annotations", old.annotations != new.annotations),
+    ]
+    .into_iter()
+    .filter_map(|(field, changed)| changed.then_some(field))
+    .collect()
 }
 
 /// Human-readable annotation delta for the quarantine card, e.g.
@@ -5822,6 +5875,7 @@ mod tests {
             fp: "v1:old".into(),
             ro: Some(true),
             dh: None,
+            parts: None,
             first_seen: 1,
             last_changed: 1,
         };
@@ -5866,6 +5920,41 @@ mod tests {
         );
         let unchanged = json!({ "prev_ro": true, "new_ro": true });
         assert_eq!(annotation_change_detail(&unchanged), None);
+    }
+
+    #[test]
+    fn changed_event_records_which_definition_fields_moved() {
+        let old = pin(&json!({
+            "name": "linear__save_issue",
+            "description": "Save an issue",
+            "inputSchema": {"type": "object", "required": ["id"]},
+            "outputSchema": {"type": "object"},
+            "annotations": {"readOnlyHint": false}
+        }));
+        let new = pin(&json!({
+            "name": "linear__save_issue",
+            "description": "Save an issue and return its URL",
+            "inputSchema": {"type": "object", "required": ["id", "title"]},
+            "outputSchema": {"type": "object"},
+            "annotations": {"readOnlyHint": false}
+        }));
+        let event = changed_event("linear", "linear__save_issue", SEV_INFO, &old, &new);
+        assert_eq!(
+            event["changed_fields"],
+            json!(["description", "input_schema"])
+        );
+    }
+
+    #[test]
+    fn legacy_pin_does_not_claim_unretained_field_details() {
+        let old = legacy_pin("v2:old");
+        let new = pin(&json!({
+            "name": "linear__save_issue",
+            "description": "Save an issue",
+            "inputSchema": {"type": "object"}
+        }));
+        let event = changed_event("linear", "linear__save_issue", SEV_INFO, &old, &new);
+        assert!(event.get("changed_fields").is_none());
     }
 
     #[test]
@@ -6263,6 +6352,7 @@ mod tests {
             fp: fp.to_string(),
             ro: None,
             dh: None,
+            parts: None,
             first_seen: 0,
             last_changed: 0,
         }
