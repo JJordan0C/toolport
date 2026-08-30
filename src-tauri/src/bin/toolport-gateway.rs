@@ -7606,11 +7606,13 @@ fn handle_request_with_cancel(
                 // minus these 4 meta-tools. Estimating over the cached slice avoids
                 // cloning the whole catalog on a serve.
                 let agg;
+                let unblocked;
                 let catalog: &[Value] = if cached.is_empty() {
                     agg = router.aggregated_tools();
                     &agg
                 } else {
-                    cached
+                    unblocked = drop_blocked_from_cache(cached.to_vec(), router, reg);
+                    &unblocked
                 };
                 // MCP Apps hosts discover the UI resource linkage only through
                 // tools/list. Preserve those few tools when the requesting host
@@ -7648,11 +7650,13 @@ fn handle_request_with_cancel(
             // search query. Scoped to the client's servers, same as full mode.
             if grouped_discovery() {
                 let agg;
+                let unblocked;
                 let catalog: &[Value] = if cached.is_empty() {
                     agg = router.aggregated_tools();
                     &agg
                 } else {
-                    cached
+                    unblocked = drop_blocked_from_cache(cached.to_vec(), router, reg);
+                    &unblocked
                 };
                 let owners = unique_prefix_owners(reg);
                 let scoped = scope_tools(catalog, allowed, |n| {
@@ -7711,7 +7715,7 @@ fn handle_request_with_cancel(
             let catalog = if cached.is_empty() {
                 router.aggregated_tools()
             } else {
-                cached.to_vec()
+                drop_blocked_from_cache(cached.to_vec(), router, reg)
             };
             let owners = unique_prefix_owners(reg);
             let mut scoped = scope_tools(&catalog, allowed, |n| {
@@ -10224,6 +10228,31 @@ fn router_is_fail_closed(router: &Arc<Mutex<Arc<Router>>>) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .catalog_fail_closed()
+}
+
+/// Drop cached entries the live policy now blocks.
+///
+/// The catalog cache is written under the policy in force at the time and is
+/// preferred by `tools/list` for an instant answer, so a policy change (or a
+/// quarantine) otherwise keeps advertising a tool `route_call` will refuse.
+/// Blocking was always enforced; this stops the catalog disagreeing with it.
+fn drop_blocked_from_cache(catalog: Vec<Value>, router: &Router, reg: &Registry) -> Vec<Value> {
+    // The destructive gate is evaluated straight off the tool JSON rather than
+    // through `router.is_blocked`, because the cache exists precisely to answer
+    // `tools/list` before the servers finish connecting, and until then the
+    // router has no `blocked` entries to consult.
+    let deny_destructive = reg.deny_destructive_effective();
+    catalog
+        .into_iter()
+        .filter(|tool| {
+            if deny_destructive && is_destructive(tool) {
+                return false;
+            }
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_none_or(|name| !router.is_blocked(name))
+        })
+        .collect()
 }
 
 fn persist_and_emit_with_sessions(
@@ -15746,6 +15775,44 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+
+    /// The catalog cache is a snapshot taken under the policy in force when it
+    /// was written, and `tools/list` prefers it so it can answer before the
+    /// servers finish connecting. A destructive tool cached while the gate was
+    /// off must not keep being advertised after the gate is turned on, or the
+    /// catalog contradicts the refusal `route_call` will give.
+    #[test]
+    fn a_cache_written_before_the_destructive_gate_stops_advertising_it_after() {
+        let cached = vec![
+            serde_json::json!({"name": "db__list", "description": "read"}),
+            serde_json::json!({
+                "name": "db__drop", "description": "drop it",
+                "annotations": {"destructiveHint": true}
+            }),
+        ];
+        let router = Router::new();
+
+        let mut off = Registry::default();
+        off.deny_destructive = false;
+        let names: Vec<String> = drop_blocked_from_cache(cached.clone(), &router, &off)
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        assert_eq!(names, vec!["db__list", "db__drop"]);
+
+        let mut on = Registry::default();
+        on.deny_destructive = true;
+        let names: Vec<String> = drop_blocked_from_cache(cached, &router, &on)
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["db__list"],
+            "a router with no connected servers has no `blocked` entries yet, so the \
+             destructive gate has to be read off the tool itself"
+        );
+    }
     use super::*;
     // Test-only: the blend-ranking test builds these directly. Kept here rather than at
     // module scope so a non-test build doesn't warn about an unused import.

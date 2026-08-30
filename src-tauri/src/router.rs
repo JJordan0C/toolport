@@ -896,6 +896,17 @@ impl Router {
     }
 
     /// Every downstream tool, with its exposed (sanitized) name.
+    /// True when the live policy blocks this exposed tool.
+    ///
+    /// The persisted catalog cache is a snapshot taken under whatever policy was
+    /// in force when it was written, and `tools/list` prefers it for an instant
+    /// answer. Without this the cache keeps advertising a tool that
+    /// `route_call` will refuse, which is the display half of the hazard
+    /// `adopt_restored_routes` already guards the routing half of.
+    pub fn is_blocked(&self, exposed: &str) -> bool {
+        self.blocked.contains_key(exposed)
+    }
+
     pub fn aggregated_tools(&self) -> Vec<Value> {
         let mut tools = self.tools.clone();
         // MCP 2026-07-28 recommends deterministic tool ordering so both response
