@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -43,10 +43,21 @@ pub(super) struct SettingsPage {
     folder_list: gtk::Box,
     folder_button: gtk::Button,
     routine_list: gtk::Box,
+    rendered_routines: Rc<RefCell<Option<Vec<crate::routines::RoutineSuggestion>>>>,
     quarantine_list: gtk::Box,
     allowed_list: gtk::Box,
     refresh_button: gtk::Button,
+    /// True only while switches are being set programmatically, so their
+    /// `state-set` handlers know not to treat it as a user action.
     updating: Rc<Cell<bool>>,
+    /// Re-entrancy guard for a refresh in flight. Was `updating`, which
+    /// `render_settings` clears at its end, releasing the guard mid-refresh.
+    refreshing: Rc<Cell<bool>>,
+    /// Bumped by every settings mutation. A refresh whose read began before the
+    /// bump discards its snapshot rather than rendering a value the user has
+    /// since changed: a background tick landing after a toggle used to put the
+    /// old value straight back into the switch.
+    mutation_generation: Rc<Cell<u64>>,
 }
 
 impl SettingsPage {
@@ -78,10 +89,10 @@ impl SettingsPage {
             .build();
         let page = gtk::Box::new(gtk::Orientation::Vertical, 14);
         page.add_css_class("toolport-page");
-        page.set_margin_top(28);
-        page.set_margin_bottom(28);
-        page.set_margin_start(28);
-        page.set_margin_end(28);
+        page.set_margin_top(20);
+        page.set_margin_bottom(20);
+        page.set_margin_start(20);
+        page.set_margin_end(20);
         page.append(
             &gtk::Label::builder()
                 .label("Safety and desktop behavior")
@@ -92,9 +103,10 @@ impl SettingsPage {
         page.append(
             &gtk::Label::builder()
                 .label("These settings are shared with the gateway and the current Toolport app. Team-enforced protections stay locked on.")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
+            .hexpand(true)
                 .css_classes(["toolport-muted"])
                 .build(),
         );
@@ -102,17 +114,58 @@ impl SettingsPage {
             .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
+            .hexpand(true)
             .css_classes(["toolport-feedback"])
             .build();
-        feedback.set_label("Open Settings to load current values.");
+        // Visibility and the four-second expiry both follow the text, so every
+        // writer on this page gets them for free: an empty bar can never sit
+        // there as a blank painted strip, and a confirmation cannot stay up
+        // indefinitely. Only messages styled as confirmations expire, matching
+        // Catalog, where only `show_success` starts a timer.
+        let feedback_timer: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
+        {
+            let slot = feedback_timer.clone();
+            feedback.connect_notify_local(Some("label"), move |label, _| {
+                label.set_visible(!label.label().is_empty());
+                // Cancel the outgoing timer first, so an older callback cannot
+                // clear a message that has since been replaced.
+                if let Some(timer) = slot.borrow_mut().take() {
+                    timer.remove();
+                }
+                if label.label().is_empty() {
+                    return;
+                }
+                let label = label.clone();
+                let inner = slot.clone();
+                let timer = gtk::glib::timeout_add_local_once(
+                    std::time::Duration::from_secs(4),
+                    move || {
+                        // Released before clearing, because clearing re-enters
+                        // this handler and it takes the same slot.
+                        inner.borrow_mut().take();
+                        // Only confirmations expire. Errors stay put, and so
+                        // do progress lines like "Loading settings…", which
+                        // carry neither class and would otherwise vanish
+                        // mid-operation.
+                        if label.has_css_class("success") {
+                            label.set_label("");
+                        }
+                    },
+                );
+                slot.borrow_mut().replace(timer);
+            });
+        }
+        feedback.set_label("");
+        feedback.set_visible(false);
         page.append(&feedback);
 
         // Security posture in one line, before the individual switches, so the
         // overall stance is legible without reading every toggle.
         let posture = gtk::Label::builder()
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
+            .hexpand(true)
             .visible(false)
             .css_classes(["toolport-feedback"])
             .build();
@@ -152,9 +205,10 @@ impl SettingsPage {
         pinned_section.append(
             &gtk::Label::builder()
                 .label("Tools pinned in Playground always surface in lazy discovery with their full schema.")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
+            .hexpand(true)
                 .css_classes(["toolport-muted"])
                 .build(),
         );
@@ -178,12 +232,12 @@ impl SettingsPage {
         safety.add_css_class("toolport-settings-group");
         let (deny_row, deny_destructive) = setting_switch_row(
             "Block destructive tools",
-            "Hide and reject tools marked destructive across every server.",
+            "Hide and reject tools marked destructive across every server. Replaces agent confirmation.",
         );
         safety.append(&deny_row);
         let (confirm_row, confirm_destructive) = setting_switch_row(
             "Agent confirmation",
-            "Require the AI client to replay a one-time confirmation token.",
+            "Require the AI client to replay a one-time confirmation token. Replaces blocking.",
         );
         safety.append(&confirm_row);
         let (approval_row, human_approval) = setting_switch_row(
@@ -256,9 +310,10 @@ impl SettingsPage {
         stale_copy.append(
             &gtk::Label::builder()
                 .label("Stop gateways left behind by an upgrade without interrupting the current endpoint.")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
+            .hexpand(true)
                 .css_classes(["toolport-muted"])
                 .build(),
         );
@@ -287,9 +342,10 @@ impl SettingsPage {
         updates_copy.append(
             &gtk::Label::builder()
                 .label("The native Linux app never downloads or replaces itself. Update Toolport through Omarchy or your normal pacman upgrade flow.")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
+            .hexpand(true)
                 .css_classes(["toolport-muted"])
                 .build(),
         );
@@ -297,16 +353,14 @@ impl SettingsPage {
         desktop.append(&updates);
         page.append(&desktop);
 
-        page.append(&settings_heading(
-            "Project folder routing",
-            "Automatically use the matching server profile when an MCP client reports a project root. The longest matching folder wins.",
-        ));
-        let folder_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        folder_actions.set_halign(gtk::Align::End);
         let folder_button = gtk::Button::with_label("Add folder mapping");
         folder_button.add_css_class("toolport-secondary-action");
-        folder_actions.append(&folder_button);
-        page.append(&folder_actions);
+        folder_button.set_valign(gtk::Align::Center);
+        page.append(&settings_heading_with_action(
+            "Project folder routing",
+            "Automatically use the matching server profile when an MCP client reports a project root. The longest matching folder wins.",
+            &folder_button,
+        ));
         let folder_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         folder_list.add_css_class("toolport-settings-group");
         folder_list.append(
@@ -336,20 +390,21 @@ impl SettingsPage {
         diagnostics_copy.append(
             &gtk::Label::builder()
                 .label("Diagnostics redact secrets. The data folder contains your registry, audit, and gateway logs.")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
+            .hexpand(true)
                 .css_classes(["toolport-muted"])
                 .build(),
         );
         diagnostics.append(&diagnostics_copy);
-        let diagnostics_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let diagnostics_actions = action_wrap();
         let copy_diagnostics = gtk::Button::with_label("Copy diagnostics");
         copy_diagnostics.add_css_class("toolport-secondary-action");
-        diagnostics_actions.append(&copy_diagnostics);
+        diagnostics_actions.insert(&copy_diagnostics, -1);
         let open_data = gtk::Button::with_label("Open data folder");
         open_data.add_css_class("toolport-secondary-action");
-        diagnostics_actions.append(&open_data);
+        diagnostics_actions.insert(&open_data, -1);
         diagnostics.append(&diagnostics_actions);
         page.append(&diagnostics);
 
@@ -357,7 +412,7 @@ impl SettingsPage {
             "Shared HTTP endpoint",
             "A supervised, authenticated local endpoint for clients that cannot launch an MCP process.",
         ));
-        let endpoint = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let endpoint = gtk::Box::new(gtk::Orientation::Vertical, 8);
         endpoint.add_css_class("toolport-setting-row");
         let endpoint_copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
         endpoint_copy.set_hexpand(true);
@@ -370,9 +425,10 @@ impl SettingsPage {
         );
         let endpoint_status = gtk::Label::builder()
             .label("Checking endpoint…")
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
+            .hexpand(true)
             .selectable(true)
             .css_classes(["toolport-muted"])
             .build();
@@ -380,7 +436,7 @@ impl SettingsPage {
         endpoint.append(&endpoint_copy);
         let endpoint_button = gtk::Button::with_label("Start");
         endpoint_button.add_css_class("toolport-secondary-action");
-        let endpoint_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let endpoint_actions = action_wrap();
         let copy_endpoint = gtk::Button::with_label("Copy URL");
         copy_endpoint.add_css_class("toolport-secondary-action");
         copy_endpoint.set_sensitive(false);
@@ -394,34 +450,42 @@ impl SettingsPage {
         reveal_endpoint_token.set_tooltip_text(Some(
             "Reveal the administrator bearer token on screen; hide it again with the same button",
         ));
-        endpoint_actions.append(&copy_endpoint);
-        endpoint_actions.append(&copy_endpoint_token);
-        endpoint_actions.append(&reveal_endpoint_token);
-        endpoint_actions.append(&endpoint_button);
+        endpoint_actions.insert(&copy_endpoint, -1);
+        endpoint_actions.insert(&copy_endpoint_token, -1);
+        endpoint_actions.insert(&reveal_endpoint_token, -1);
+        endpoint_actions.insert(&endpoint_button, -1);
         endpoint.append(&endpoint_actions);
         let endpoint_token_value = gtk::Label::builder()
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
+            .hexpand(true)
             .selectable(true)
             .visible(false)
             .css_classes(["toolport-muted", "caption", "monospace"])
             .build();
         endpoint.append(&endpoint_token_value);
         page.append(&endpoint);
-        let http_client_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        http_client_actions.set_halign(gtk::Align::End);
+        // The scoped-client list had no heading of its own, so its empty state
+        // floated under the gateway row with nothing naming it.
         let add_http_client = gtk::Button::with_label("Add scoped HTTP client");
         add_http_client.add_css_class("toolport-secondary-action");
+        add_http_client.set_valign(gtk::Align::Center);
         add_http_client.set_sensitive(false);
-        http_client_actions.append(&add_http_client);
-        page.append(&http_client_actions);
+        page.append(&settings_heading_with_action(
+            "Scoped HTTP clients",
+            "Each gets its own bearer token and server scope, so one endpoint can serve several clients.",
+            &add_http_client,
+        ));
         let http_client_list = gtk::Box::new(gtk::Orientation::Vertical, 8);
         http_client_list.add_css_class("toolport-settings-group");
         http_client_list.append(
             &gtk::Label::builder()
                 .label("Start the endpoint to manage scoped clients.")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
+                .xalign(0.0)
+                .wrap(true)
+                .hexpand(true)
                 .css_classes(["toolport-muted"])
                 .build(),
         );
@@ -451,9 +515,10 @@ impl SettingsPage {
         quarantine_list.append(
             &gtk::Label::builder()
                 .label("Checking for blocked tools…")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
+                .hexpand(true)
                 .css_classes(["toolport-muted"])
                 .build(),
         );
@@ -509,10 +574,13 @@ impl SettingsPage {
             folder_list,
             folder_button,
             routine_list,
+            rendered_routines: Rc::new(RefCell::new(None)),
             quarantine_list,
             allowed_list,
             refresh_button,
             updating: Rc::new(Cell::new(false)),
+            refreshing: Rc::new(Cell::new(false)),
+            mutation_generation: Rc::new(Cell::new(0)),
         };
         settings_page.connect_switches();
         let page_for_endpoint = settings_page.clone();
@@ -712,25 +780,14 @@ impl SettingsPage {
         self.folder_button
             .set_sensitive(!settings.profiles.is_empty());
         if settings.profiles.is_empty() {
-            self.folder_list.append(
-                &gtk::Label::builder()
-                    .label("Create a server profile before adding project folder routing.")
-                    .halign(gtk::Align::Start)
-                    .xalign(0.0)
-                    .wrap(true)
-                    .css_classes(["toolport-muted"])
-                    .build(),
-            );
+            self.folder_list.append(&empty_state(
+                "Create a server profile before adding project folder routing.",
+            ));
             return;
         }
         if settings.mappings.is_empty() {
-            self.folder_list.append(
-                &gtk::Label::builder()
-                    .label("No project folders are mapped yet.")
-                    .halign(gtk::Align::Start)
-                    .css_classes(["toolport-muted"])
-                    .build(),
-            );
+            self.folder_list
+                .append(&empty_state("No project folders are mapped yet."));
             return;
         }
         for mapping in settings.mappings {
@@ -799,15 +856,7 @@ impl SettingsPage {
             self.pinned_list.remove(&child);
         }
         if pins.is_empty() {
-            self.pinned_list.append(
-                &gtk::Label::builder()
-                    .label("No prerequisites are pinned. Pin a load-bearing tool from Playground when lazy discovery must always surface it.")
-                    .halign(gtk::Align::Start)
-                    .xalign(0.0)
-                    .wrap(true)
-                    .css_classes(["toolport-muted"])
-                    .build(),
-            );
+            self.pinned_list.append(&empty_state("No prerequisites are pinned. Pin a load-bearing tool from Playground when lazy discovery must always surface it."));
             return;
         }
         for pin in pins {
@@ -1020,13 +1069,8 @@ impl SettingsPage {
             self.http_client_list.remove(&child);
         }
         if settings.clients.is_empty() {
-            self.http_client_list.append(
-                &gtk::Label::builder()
-                    .label("No scoped HTTP clients are registered.")
-                    .halign(gtk::Align::Start)
-                    .css_classes(["toolport-muted"])
-                    .build(),
-            );
+            self.http_client_list
+                .append(&empty_state("No scoped HTTP clients are registered."));
             return;
         }
         for client in settings.clients {
@@ -1206,6 +1250,7 @@ impl SettingsPage {
             .label(token)
             .selectable(true)
             .wrap(true)
+            .hexpand(true)
             .xalign(0.0)
             .css_classes(["toolport-feedback", "success"])
             .build();
@@ -1287,19 +1332,46 @@ impl SettingsPage {
                     return gtk::glib::Propagation::Proceed;
                 }
                 switch.set_sensitive(false);
+                page.begin_mutation();
+                let confirm_was_on = page.confirm_destructive.is_active();
+                let deny_was_on = page.deny_destructive.is_active();
                 let page = page.clone();
                 gtk::glib::spawn_future_local(async move {
                     let result = gtk::gio::spawn_blocking(move || {
                         crate::registry_controller::set_essential_setting(setting, enabled)
                     })
                     .await;
+                    // Again on completion, so a read that started mid-write is
+                    // discarded too.
+                    page.begin_mutation();
                     match result {
                         Ok(Ok(settings)) => {
+                            // Blocking and confirmation are mutually exclusive in
+                            // the registry: blocking hides the tool, so there is
+                            // nothing left for the agent to confirm. Silently
+                            // flipping the other switch read as a bug, so say it.
+                            let displaced = match setting {
+                                crate::registry_controller::EssentialSetting::DenyDestructive
+                                    if enabled && !settings.confirm_destructive && confirm_was_on =>
+                                {
+                                    Some("Agent confirmation")
+                                }
+                                crate::registry_controller::EssentialSetting::ConfirmDestructive
+                                    if enabled && !settings.deny_destructive && deny_was_on =>
+                                {
+                                    Some("Destructive-tool blocking")
+                                }
+                                _ => None,
+                            };
                             page.render_settings(settings);
-                            page.feedback.set_label(&format!(
-                                "{} {label}",
-                                if enabled { "Enabled" } else { "Disabled" }
-                            ));
+                            let outcome =
+                                format!("{} {label}", if enabled { "Enabled" } else { "Disabled" });
+                            page.feedback.set_label(&match displaced {
+                                Some(other) => format!(
+                                    "{outcome}. {other} turned off, the two cannot both be on."
+                                ),
+                                None => outcome,
+                            });
                             page.feedback.remove_css_class("error");
                             page.feedback.add_css_class("success");
                         }
@@ -1324,6 +1396,7 @@ impl SettingsPage {
                     return gtk::glib::Propagation::Proceed;
                 }
                 switch.set_sensitive(false);
+                page.begin_mutation();
                 let page = page.clone();
                 gtk::glib::spawn_future_local(async move {
                     let result = gtk::gio::spawn_blocking(move || {
@@ -1334,10 +1407,11 @@ impl SettingsPage {
                         }
                     })
                     .await;
+                    page.begin_mutation();
                     match result {
                         Ok(Ok(())) => {
                             page.updating.set(true);
-                            page.launch_at_login.set_active(enabled);
+                            set_switch(&page.launch_at_login, enabled);
                             page.launch_at_login.set_sensitive(true);
                             page.updating.set(false);
                             page.feedback.set_label(if enabled {
@@ -1373,13 +1447,21 @@ impl SettingsPage {
         self.refresh_with_feedback(false)
     }
 
+    /// Claim a new generation. Any refresh already reading is now stale and will
+    /// drop its snapshot instead of rendering it over this change.
+    fn begin_mutation(&self) {
+        self.mutation_generation
+            .set(self.mutation_generation.get().wrapping_add(1));
+    }
+
     fn refresh_with_feedback(&self, announce: bool) {
-        if self.updating.replace(true) {
+        if self.refreshing.replace(true) {
             return;
         }
+        let generation = self.mutation_generation.get();
         self.refresh_button.set_sensitive(false);
         if announce {
-            self.feedback.set_label("Loading settings…");
+            self.set_status("Loading settings…");
         }
         let page = self.clone();
         let broker = self.broker.clone();
@@ -1412,10 +1494,18 @@ impl SettingsPage {
                     pinned,
                     restart_advice,
                 ))) => {
+                    // A toggle landed while this read was in flight, so the
+                    // snapshot is already out of date. Rendering it would put
+                    // the old value back into the switch the user just moved.
+                    if page.mutation_generation.get() != generation {
+                        page.refreshing.set(false);
+                        page.refresh_button.set_sensitive(true);
+                        return;
+                    }
                     page.render_settings(settings);
                     page.render_restart_advice(restart_advice);
                     page.updating.set(true);
-                    page.launch_at_login.set_active(launch_at_login);
+                    set_switch(&page.launch_at_login, launch_at_login);
                     page.launch_at_login.set_sensitive(true);
                     page.updating.set(false);
                     page.render_endpoint(page.bridge.status());
@@ -1426,17 +1516,19 @@ impl SettingsPage {
                     page.render_http_clients(http_clients);
                     page.render_pinned_prerequisites(pinned);
                     if announce {
-                        page.feedback.set_label("Settings are up to date.");
-                        page.feedback.remove_css_class("error");
-                        page.feedback.add_css_class("success");
+                        // Clearing, not announcing: the load succeeding is not
+                        // news, and a green "up to date" bar stacked above the
+                        // red approval-gates warning competed with it.
+                        page.set_status("");
                     }
+                    page.refreshing.set(false);
                 }
                 Ok(Err(error)) => {
-                    page.updating.set(false);
+                    page.refreshing.set(false);
                     page.show_error(&error);
                 }
                 Err(_) => {
-                    page.updating.set(false);
+                    page.refreshing.set(false);
                     page.show_error("the settings read stopped unexpectedly");
                 }
             }
@@ -1452,48 +1544,50 @@ impl SettingsPage {
             .add_css_class(if guarded { "success" } else { "error" });
         self.posture.set_visible(true);
         self.updating.set(true);
-        self.lazy_discovery.set_active(settings.lazy_discovery);
+        set_switch(&self.lazy_discovery, settings.lazy_discovery);
         self.lazy_discovery.set_sensitive(true);
         self.pinned_section.set_visible(settings.lazy_discovery);
-        self.code_mode.set_active(settings.code_mode);
+        set_switch(&self.code_mode, settings.code_mode);
         self.code_mode.set_sensitive(true);
-        self.allow_routine_writes
-            .set_active(settings.allow_routine_writes);
+        set_switch(&self.allow_routine_writes, settings.allow_routine_writes);
         self.allow_routine_writes.set_sensitive(settings.code_mode);
         self.allow_routine_writes.set_tooltip_text(
             (!settings.code_mode).then_some("Enable code mode to allow routine writes"),
         );
-        self.allow_agent_control
-            .set_active(settings.allow_agent_control);
+        set_switch(&self.allow_agent_control, settings.allow_agent_control);
         self.allow_agent_control.set_sensitive(true);
-        self.live_inspect.set_active(settings.live_inspect);
+        set_switch(&self.live_inspect, settings.live_inspect);
         self.live_inspect.set_sensitive(true);
-        self.deny_destructive.set_active(settings.deny_destructive);
+        set_switch(&self.deny_destructive, settings.deny_destructive);
         set_team_managed(&self.deny_destructive, settings.deny_destructive_forced);
-        self.confirm_destructive
-            .set_active(settings.confirm_destructive);
+        set_switch(&self.confirm_destructive, settings.confirm_destructive);
         set_team_managed(&self.confirm_destructive, false);
-        self.human_approval.set_active(settings.human_approval);
+        set_switch(&self.human_approval, settings.human_approval);
         set_team_managed(&self.human_approval, settings.human_approval_forced);
-        self.content_defense.set_active(settings.content_defense);
+        set_switch(&self.content_defense, settings.content_defense);
         set_team_managed(&self.content_defense, settings.content_defense_forced);
-        self.quarantine_on_drift
-            .set_active(settings.quarantine_on_drift);
+        set_switch(&self.quarantine_on_drift, settings.quarantine_on_drift);
         set_team_managed(
             &self.quarantine_on_drift,
             settings.quarantine_on_drift_forced,
         );
-        self.block_on_injection
-            .set_active(settings.block_on_injection);
+        set_switch(&self.block_on_injection, settings.block_on_injection);
         set_team_managed(&self.block_on_injection, settings.block_on_injection_forced);
-        self.pii_redaction.set_active(settings.pii_redaction);
+        set_switch(&self.pii_redaction, settings.pii_redaction);
         set_team_managed(&self.pii_redaction, settings.pii_redaction_forced);
         self.updating.set(false);
     }
 
-    fn show_error(&self, error: &str) {
-        self.feedback.set_label(&format!("Settings error: {error}"));
+    /// Visibility is handled by the `notify::label` hook installed in `new`, so
+    /// this only has to clear the styling an earlier message left behind.
+    fn set_status(&self, message: &str) {
+        self.feedback.set_label(message);
+        self.feedback.remove_css_class("error");
         self.feedback.remove_css_class("success");
+    }
+
+    fn show_error(&self, error: &str) {
+        self.set_status(&format!("Settings error: {error}"));
         self.feedback.add_css_class("error");
     }
 
@@ -1502,14 +1596,8 @@ impl SettingsPage {
             self.quarantine_list.remove(&child);
         }
         if entries.is_empty() {
-            self.quarantine_list.append(
-                &gtk::Label::builder()
-                    .label("No tools are quarantined.")
-                    .halign(gtk::Align::Start)
-                    .xalign(0.0)
-                    .css_classes(["toolport-muted"])
-                    .build(),
-            );
+            self.quarantine_list
+                .append(&empty_state("No tools are quarantined."));
             return;
         }
         if entries.len() > 1 {
@@ -1527,13 +1615,8 @@ impl SettingsPage {
             self.allowed_list.remove(&child);
         }
         if entries.is_empty() {
-            self.allowed_list.append(
-                &gtk::Label::builder()
-                    .label("No remembered approvals.")
-                    .halign(gtk::Align::Start)
-                    .css_classes(["toolport-muted"])
-                    .build(),
-            );
+            self.allowed_list
+                .append(&empty_state("No remembered approvals."));
             return;
         }
         for entry in entries {
@@ -1542,19 +1625,17 @@ impl SettingsPage {
     }
 
     fn render_routines(&self, suggestions: Vec<crate::routines::RoutineSuggestion>) {
+        if self.rendered_routines.borrow().as_ref() == Some(&suggestions) {
+            return;
+        }
+        *self.rendered_routines.borrow_mut() = Some(suggestions.clone());
         while let Some(child) = self.routine_list.first_child() {
             self.routine_list.remove(&child);
         }
         if suggestions.is_empty() {
-            self.routine_list.append(
-                &gtk::Label::builder()
-                    .label("No routine suggestions are waiting for review.")
-                    .halign(gtk::Align::Start)
-                    .xalign(0.0)
-                    .wrap(true)
-                    .css_classes(["toolport-muted"])
-                    .build(),
-            );
+            self.routine_list.append(&empty_state(
+                "No routine suggestions are waiting for review.",
+            ));
             return;
         }
         for suggestion in suggestions {
@@ -1805,13 +1886,26 @@ fn release_all_feedback(summary: &crate::registry_controller::ReleaseAllSummary)
     )
 }
 
+/// A wrapping container for a cluster of action buttons: on a narrow tile the
+/// buttons flow onto the next line instead of forcing a minimum window width.
+fn action_wrap() -> gtk::FlowBox {
+    let flow = gtk::FlowBox::new();
+    flow.set_selection_mode(gtk::SelectionMode::None);
+    flow.set_column_spacing(8);
+    flow.set_row_spacing(6);
+    flow.set_min_children_per_line(1);
+    flow.set_max_children_per_line(8);
+    flow.set_valign(gtk::Align::Center);
+    flow
+}
+
 fn quarantine_bulk_row(entries: &[QuarantinedTool], page: SettingsPage) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row.add_css_class("toolport-setting-row");
     let count = entries.len();
     let copy = gtk::Label::builder()
         .label(format!("{count} tools are blocked."))
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
         .hexpand(true)
@@ -1889,9 +1983,10 @@ fn quarantine_row(entry: QuarantinedTool, page: SettingsPage) -> gtk::Box {
     copy.append(
         &gtk::Label::builder()
             .label(&entry.tool)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
+            .hexpand(true)
             .css_classes(["heading"])
             .build(),
     );
@@ -1903,9 +1998,10 @@ fn quarantine_row(entry: QuarantinedTool, page: SettingsPage) -> gtk::Box {
     copy.append(
         &gtk::Label::builder()
             .label(format!("{} · {}", entry.detail, scope))
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
+            .hexpand(true)
             .css_classes(["toolport-muted"])
             .build(),
     );
@@ -2027,9 +2123,10 @@ fn allowed_row(entry: AllowedTool, page: SettingsPage) -> gtk::Box {
     copy.append(
         &gtk::Label::builder()
             .label(format!("{} / {}", entry.server, entry.tool))
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
+            .hexpand(true)
             .css_classes(["heading"])
             .build(),
     );
@@ -2083,8 +2180,29 @@ fn set_team_managed(toggle: &gtk::Switch, forced: bool) {
     toggle.set_tooltip_text(forced.then_some("Required by your Toolport team"));
 }
 
+/// A section heading with its own action on the same row. Both of these used to
+/// sit on a line of their own, right-aligned against the whole page width.
+fn settings_heading_with_action(
+    title: &str,
+    subtitle: &str,
+    action: &impl IsA<gtk::Widget>,
+) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.set_margin_top(10);
+    let heading = settings_heading(title, subtitle);
+    heading.set_margin_top(0);
+    heading.set_hexpand(true);
+    row.append(&heading);
+    row.append(action);
+    row
+}
+
 fn settings_heading(title: &str, subtitle: &str) -> gtk::Box {
     let heading = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    // The page's own 14px spacing is the gap between rows within a section, so a
+    // heading sat the same distance from the section above it as from its own
+    // body, and read as belonging to the block before it.
+    heading.set_margin_top(10);
     heading.append(
         &gtk::Label::builder()
             .label(title)
@@ -2095,13 +2213,43 @@ fn settings_heading(title: &str, subtitle: &str) -> gtk::Box {
     heading.append(
         &gtk::Label::builder()
             .label(subtitle)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
+            .hexpand(true)
             .css_classes(["toolport-muted"])
             .build(),
     );
     heading
+}
+
+/// Empty states go straight into a `toolport-settings-group`, which carries no
+/// padding of its own: the rows inside it normally supply that via
+/// `toolport-setting-row`. Without this the text sits flush against the border.
+/// A `GtkSwitch` draws its knob from `active` but its "on" styling from `state`.
+/// The handlers here return `Propagation::Stop`, which suppresses the default
+/// handler that copies one to the other, and `set_active` to a value the switch
+/// already holds emits no signal to fix it up later. So a switch the user just
+/// flipped slid across and stayed grey. Always set both.
+fn set_switch(switch: &gtk::Switch, on: bool) {
+    switch.set_active(on);
+    switch.set_state(on);
+}
+
+fn empty_state(text: &str) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    row.add_css_class("toolport-setting-row");
+    row.append(
+        &gtk::Label::builder()
+            .label(text)
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .hexpand(true)
+            .css_classes(["toolport-muted"])
+            .build(),
+    );
+    row
 }
 
 fn setting_switch_row(title: &str, description: &str) -> (gtk::Box, gtk::Switch) {
@@ -2112,18 +2260,20 @@ fn setting_switch_row(title: &str, description: &str) -> (gtk::Box, gtk::Switch)
     copy.append(
         &gtk::Label::builder()
             .label(title)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
+            .hexpand(true)
             .css_classes(["heading"])
             .build(),
     );
     copy.append(
         &gtk::Label::builder()
             .label(description)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
+            .hexpand(true)
             .css_classes(["toolport-muted"])
             .build(),
     );
