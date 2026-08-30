@@ -1787,6 +1787,16 @@ mod tests {
     /// editor; this proves nothing can slip past into an unusable server.
     #[test]
     fn self_hosted_catalog_entries_are_refused_by_the_one_click_add() {
+        // The guard is expected to return before any write, but if it ever
+        // regressed this would commit to the developer's real registry. Hold
+        // the data dir so a red test stays a red test.
+        let _dirs = crate::registry::data_dir_test_lock();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-self-hosted-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        let _override = crate::registry::DataDirOverride::set(&scratch);
+
         let self_hosted = crate::catalog::curated()
             .into_iter()
             .filter(|entry| entry.url_hint.is_some())

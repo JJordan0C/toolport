@@ -10245,14 +10245,35 @@ fn drop_blocked_from_cache(catalog: Vec<Value>, router: &Router, reg: &Registry)
     catalog
         .into_iter()
         .filter(|tool| {
-            if deny_destructive && is_destructive(tool) {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                return true;
+            };
+            if deny_destructive && cached_tool_is_destructive(tool, name) {
                 return false;
             }
-            tool.get("name")
-                .and_then(Value::as_str)
-                .is_none_or(|name| !router.is_blocked(name))
+            !router.is_blocked(name)
         })
         .collect()
+}
+
+/// The destructive gate, evaluated the way the router evaluates it.
+///
+/// `blocked_reason` runs `is_destructive` on the ORIGINAL downstream tool, but a
+/// cached entry has already had its name rewritten to the namespaced form. With
+/// no `destructiveHint` the check falls back to scanning the name for write
+/// verbs, and that tokenizes on every non-alphanumeric, so judging the exposed
+/// name lets the SERVER prefix decide: every read-only tool on a server called
+/// `create_hub` or `send_grid` would be dropped. Restore the original name
+/// before asking.
+fn cached_tool_is_destructive(tool: &Value, exposed: &str) -> bool {
+    match conduit_lib::codemode::split_exposed_name(exposed) {
+        Some((_, original)) => {
+            let mut probe = tool.clone();
+            probe["name"] = Value::String(original.to_string());
+            is_destructive(&probe)
+        }
+        None => is_destructive(tool),
+    }
 }
 
 fn persist_and_emit_with_sessions(
@@ -15775,6 +15796,31 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+
+    /// A server whose NAME contains a write verb must not drag its read-only
+    /// tools out of the catalog. The destructive fallback scans the tool name for
+    /// verbs, and a cached entry carries the namespaced `server__tool` form, so
+    /// judging it whole lets the prefix decide for every tool on that server.
+    #[test]
+    fn a_server_named_after_a_write_verb_keeps_its_read_only_tools() {
+        let cached = vec![
+            serde_json::json!({"name": "create_hub__list_items", "description": "read only"}),
+            serde_json::json!({"name": "send_grid__get_template", "description": "read only"}),
+            serde_json::json!({"name": "plain__delete_item", "description": "really destructive"}),
+        ];
+        let router = Router::new();
+        let mut on = Registry::default();
+        on.deny_destructive = true;
+        let names: Vec<String> = drop_blocked_from_cache(cached, &router, &on)
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["create_hub__list_items", "send_grid__get_template"],
+            "the prefix must not decide, but a genuinely destructive tool still goes"
+        );
+    }
 
     /// The catalog cache is a snapshot taken under the policy in force when it
     /// was written, and `tools/list` prefers it so it can answer before the
