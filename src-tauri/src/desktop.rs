@@ -6767,10 +6767,18 @@ mod tests {
     /// install its own override, only for this drop to land and clear it. That
     /// test's `registry::load()` then read the REAL data dir, where its seeded
     /// `http_clients` row does not exist.
+    ///
+    /// `_generation` is held for the same reason, but against a different race:
+    /// this fixture's revoke path calls `write_registry`, which bumps the global
+    /// `REGISTRY_GENERATION`. The watcher tests sample that counter before their
+    /// load and refuse to publish if it moved, so a revoke landing in that window
+    /// turned their `Applied` into `LostRace`. Acquired first and declared last,
+    /// so it is taken before and released after the other two.
     struct RevokeFixture {
         _override: crate::registry::DataDirOverride,
         _data_dir: std::sync::MutexGuard<'static, ()>,
         _hooks: std::sync::MutexGuard<'static, ()>,
+        _generation: std::sync::MutexGuard<'static, ()>,
         state: RegistryState,
         client_id: String,
         http_id: String,
@@ -6784,6 +6792,9 @@ mod tests {
 
     impl RevokeFixture {
         fn new(label: &str) -> Self {
+            let generation = GEN_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let hooks = REVOKE_HOOK_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6806,6 +6817,7 @@ mod tests {
                 _override: over,
                 _data_dir: data_dir,
                 _hooks: hooks,
+                _generation: generation,
                 state: Mutex::new(reg),
                 client_id,
                 http_id,
