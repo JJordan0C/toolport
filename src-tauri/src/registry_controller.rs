@@ -1779,6 +1779,20 @@ fn set_server_enabled_at(
 
 #[cfg(test)]
 mod tests {
+
+    /// A filesystem-safe label for a scratch path. `thread::current().name()` is
+    /// the test's full path (`registry_controller::tests::foo`), and `:` is not a
+    /// legal filename character on Windows, so embedding it whole made every
+    /// fixture here fail there with `InvalidFilename`.
+    fn scratch_label() -> String {
+        std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .rsplit("::")
+            .next()
+            .unwrap_or("test")
+            .to_string()
+    }
     use super::*;
     use crate::registry::ServerEntry;
 
@@ -1843,7 +1857,7 @@ mod tests {
         std::env::temp_dir().join(format!(
             "toolport-controller-{label}-{}-{}.json",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            scratch_label()
         ))
     }
 
@@ -2259,7 +2273,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "toolport-client-rollback-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            scratch_label()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2286,7 +2300,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "toolport-client-first-connect-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            scratch_label()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2311,7 +2325,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "toolport-client-race-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            scratch_label()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2374,7 +2388,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "toolport-controller-secret-roundtrip-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            scratch_label()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
