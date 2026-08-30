@@ -47,10 +47,6 @@ impl ksni::Tray for ToolportTray {
         }
     }
 
-    fn icon_name(&self) -> String {
-        "toolport".into()
-    }
-
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         static ICON: LazyLock<ksni::Icon> = LazyLock::new(|| {
             let image = image::load_from_memory_with_format(
@@ -82,7 +78,6 @@ impl ksni::Tray for ToolportTray {
         vec![
             StandardItem {
                 label: "Open Toolport".into(),
-                icon_name: "window-new".into(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.commands.send(Command::Show);
                 }),
@@ -91,7 +86,6 @@ impl ksni::Tray for ToolportTray {
             .into(),
             StandardItem {
                 label: format!("Pending approvals ({})", self.pending),
-                icon_name: "security-high".into(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.commands.send(Command::ShowApprovals);
                 }),
@@ -101,7 +95,6 @@ impl ksni::Tray for ToolportTray {
             MenuItem::Separator,
             StandardItem {
                 label: "Quit Toolport".into(),
-                icon_name: "application-exit".into(),
                 activate: Box::new(|tray: &mut Self| {
                     let _ = tray.commands.send(Command::Quit);
                 }),
@@ -173,4 +166,45 @@ pub(super) fn start(app: &adw::Application) -> Option<ksni::blocking::Handle<Too
         gtk::glib::ControlFlow::Continue
     });
     Some(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_uses_the_embedded_icon_without_a_theme_lookup() {
+        let (commands, _receiver) = mpsc::channel();
+        let tray = ToolportTray {
+            commands,
+            pending: 0,
+        };
+        assert!(ksni::Tray::icon_name(&tray).is_empty());
+        let icons = ksni::Tray::icon_pixmap(&tray);
+        assert_eq!(icons.len(), 1);
+        assert_eq!((icons[0].width, icons[0].height), (32, 32));
+        assert_eq!(icons[0].data.len(), 32 * 32 * 4);
+    }
+
+    /// The tray menu is drawn by the host's icon theme, not by Toolport's CSS.
+    /// Omarchy's Yaru-sage has no `window-new` or `security-high`, so named
+    /// icons rendered as fallback squares next to a loud red exit glyph. The
+    /// menu stays text-only so it cannot break on whatever theme is active.
+    #[test]
+    fn tray_menu_items_do_not_name_theme_icons() {
+        let (commands, _receiver) = mpsc::channel();
+        let tray = ToolportTray {
+            commands,
+            pending: 0,
+        };
+        for item in ksni::Tray::menu(&tray) {
+            if let ksni::MenuItem::Standard(item) = item {
+                assert!(
+                    item.icon_name.is_empty(),
+                    "{} names a theme icon",
+                    item.label
+                );
+            }
+        }
+    }
 }
