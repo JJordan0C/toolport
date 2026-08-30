@@ -10,6 +10,7 @@ import { TransportPill } from "@/components/TransportPill";
 import { SecretsDialog } from "@/components/SecretsDialog";
 import { ServerDialog } from "@/components/ServerDialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { ServerLogo } from "@/components/ServerLogo";
 
 interface Props {
   server: ServerEntry;
@@ -134,6 +135,8 @@ export function RegistryServerRow({
             aria-label={`Toggle ${server.name}`}
           />
         </span>
+
+        <ServerLogo name={server.name} transport={server.transport} size={28} />
 
         <span className="min-w-0 truncate text-sm font-medium">{server.name}</span>
 
