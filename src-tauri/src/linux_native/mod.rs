@@ -5262,35 +5262,73 @@ impl RulesPage {
                 ));
             }
         }
-        // Clients Toolport cannot write global rules for are said out loud, not
-        // silently dropped: the user can still paste the set in by hand. Said
-        // once and then named, rather than the same sentence per client.
+        // Three different truths hide behind "no global rules file", and lumping
+        // them into one unsupported sentence overstates it (#848): Cursor and
+        // Copilot CLI are reached per project, and Claude Desktop is the chat app
+        // while Claude Code inside it is already covered above. Same split, and
+        // the same wording, as the React shell.
         let unsupported = view
             .clients
             .iter()
             .filter(|client| client.path.is_none())
-            .map(|client| client.name.as_str())
             .collect::<Vec<_>>();
-        if !unsupported.is_empty() {
-            let note = gtk::Box::new(gtk::Orientation::Vertical, 3);
-            note.append(
-                &gtk::Label::builder()
-                    .label("No rules file Toolport can write for these. Paste your set in by hand.")
-                    .halign(gtk::Align::Fill)
-                    .xalign(0.0)
-                    .wrap(true)
-                    .css_classes(["toolport-muted", "caption"])
-                    .build(),
+        let names = |group: &[&crate::rules::ClientStatus]| {
+            group
+                .iter()
+                .map(|client| client.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let project_only = unsupported
+            .iter()
+            .copied()
+            .filter(|client| client.project_covered)
+            .collect::<Vec<_>>();
+        let chat_desktop = unsupported
+            .iter()
+            .copied()
+            .filter(|client| client.id == "claude-desktop")
+            .collect::<Vec<_>>();
+        let manual_only = unsupported
+            .iter()
+            .copied()
+            .filter(|client| !client.project_covered && client.id != "claude-desktop")
+            .collect::<Vec<_>>();
+        let mut notes: Vec<String> = Vec::new();
+        if !project_only.is_empty() {
+            notes.push(format!(
+                "No global rules file for {}, but project rules reach {}: add a folder under Projects below.",
+                names(&project_only),
+                if project_only.len() == 1 { "it" } else { "them" }
+            ));
+        }
+        if !chat_desktop.is_empty() {
+            notes.push(
+                "Claude Desktop is the chat app and has no rules file; Claude Code inside it is covered by the Claude Code row above."
+                    .to_string(),
             );
-            note.append(
-                &gtk::Label::builder()
-                    .label(unsupported.join(" · "))
-                    .halign(gtk::Align::Fill)
-                    .xalign(0.0)
-                    .wrap(true)
-                    .css_classes(["caption"])
-                    .build(),
-            );
+        }
+        if !manual_only.is_empty() {
+            notes.push(format!(
+                "No rules file Toolport can write for {}. Paste your rules in by hand.",
+                names(&manual_only)
+            ));
+        }
+        if !notes.is_empty() {
+            let note = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            note.set_margin_top(6);
+            for line in notes {
+                note.append(
+                    &gtk::Label::builder()
+                        .label(&line)
+                        .halign(gtk::Align::Fill)
+                        .xalign(0.0)
+                        .wrap(true)
+                        .hexpand(true)
+                        .css_classes(["toolport-muted", "caption"])
+                        .build(),
+                );
+            }
             self.client_list.append(&note);
         }
         if view.projects.is_empty() {
