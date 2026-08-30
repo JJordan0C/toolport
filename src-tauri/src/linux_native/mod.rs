@@ -6772,6 +6772,9 @@ struct ApprovalPage {
     broker: crate::approval_broker::ApprovalBroker,
     timer: std::rc::Rc<std::cell::RefCell<Option<gtk::glib::SourceId>>>,
     rendered: std::rc::Rc<std::cell::RefCell<Vec<(String, u64)>>>,
+    /// True while the panel is explaining that another process owns approvals,
+    /// so the explanation renders once rather than on every poll.
+    showing_inert: std::rc::Rc<std::cell::RefCell<bool>>,
     deadlines: std::rc::Rc<std::cell::RefCell<Vec<(u64, gtk::Label)>>>,
     app: adw::Application,
     notified: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
@@ -6808,6 +6811,7 @@ impl ApprovalPage {
             broker,
             timer: std::rc::Rc::new(std::cell::RefCell::new(None)),
             rendered: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            showing_inert: std::rc::Rc::new(std::cell::RefCell::new(false)),
             deadlines: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             app: app.clone(),
             notified: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashSet::new())),
@@ -6839,6 +6843,28 @@ impl ApprovalPage {
             .map(|view| (view.id.clone(), view.deadline_ms))
             .collect::<Vec<_>>();
         self.reconcile_notifications(&pending);
+        // Another Toolport already holds the approval endpoint, so this window
+        // will never receive a prompt: the gateway hands every gated call to
+        // whichever process started first. Staying hidden would leave someone
+        // watching an empty queue while a call waits in the other window.
+        if !self.broker.owns_endpoint() {
+            self.root.set_visible(true);
+            self.count.set_visible(false);
+            if !self.showing_inert.replace(true) {
+                self.rendered.borrow_mut().clear();
+                while let Some(child) = self.list.first_child() {
+                    self.list.remove(&child);
+                }
+                self.deadlines.borrow_mut().clear();
+                self.list.append(&inert_broker_card());
+            }
+            return;
+        }
+        if self.showing_inert.replace(false) {
+            while let Some(child) = self.list.first_child() {
+                self.list.remove(&child);
+            }
+        }
         self.root.set_visible(!pending.is_empty());
         self.count.set_visible(pending.len() > 1);
         self.count.set_label(&format!("{} pending", pending.len()));
@@ -6928,6 +6954,35 @@ impl ApprovalPage {
         }
         self.refresh();
     }
+}
+
+/// Shown when another Toolport process owns the approval endpoint. Both shells
+/// read the same data directory and only one can hold that lock, so the other
+/// can never answer a prompt and has to say so rather than look idle.
+fn inert_broker_card() -> gtk::Box {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    card.add_css_class("toolport-card");
+    card.append(
+        &gtk::Label::builder()
+            .label("Another Toolport is handling approvals")
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .hexpand(true)
+            .css_classes(["heading"])
+            .build(),
+    );
+    card.append(
+        &gtk::Label::builder()
+            .label("Prompts go to whichever Toolport started first, so they will not appear here. Quit the other one and reopen this window to take over.")
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .hexpand(true)
+            .css_classes(["toolport-muted"])
+            .build(),
+    );
+    card
 }
 
 fn approval_card(
