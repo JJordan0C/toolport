@@ -6,6 +6,15 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Fixed
+
+- **Agent rules: the "no rules file" line no longer lumps three different situations
+  together.** Cursor and GitHub Copilot CLI have no global rules file but do read project
+  rules, so the Clients section now points them at the Projects section instead of calling
+  them unsupported; Claude Desktop is named as the chat app, with Claude Code inside it
+  covered by the Claude Code row; only clients with no rules file anywhere still say to
+  paste rules in by hand.
+
 ## [1.17.0] - 2026-08-23
 
 Toolport 1.17.0 brings one permission policy to Claude Code and Cursor, makes
