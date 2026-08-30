@@ -172,6 +172,11 @@ jobs:
           aws s3 sync pkgout/ "s3://$R2_BUCKET/x86_64/" \
             --endpoint-url "$endpoint" --exclude "*" \
             --include "toolport.db*" --include "toolport.files*"
+          # The public key is published from the copy versioned in this repo, so
+          # what install.sh imports is always the file reviewers can diff, and it
+          # cannot drift from a hand-uploaded object.
+          aws s3 cp packaging/linux/native/toolport.gpg "s3://$R2_BUCKET/toolport.gpg" \
+            --endpoint-url "$endpoint" --content-type application/pgp-keys
           echo "published $TAG to the pacman repo"
 
       - name: Summary
