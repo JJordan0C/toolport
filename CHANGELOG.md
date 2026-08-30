@@ -6,7 +6,68 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-08-30
+
+Toolport 1.18.0 replaces the Linux app with a native GTK shell, makes the
+destructive-tool setting hide what it refuses, and fixes catalog entries for
+servers you host yourself.
+
+### Added
+
+- **Linux runs a native GTK shell instead of the web view.** The Linux app is now
+  GTK4/libadwaita rather than Tauri: it follows the active Omarchy palette, behaves as
+  a regular Wayland window under Hyprland, and leaves tiling and geometry to the
+  compositor. Everything the cross-platform app does is here - servers, profiles and
+  secrets, client detection and connection, pending approvals with desktop
+  notifications, Activity, Catalog and starter stacks, Playground, Rules and project
+  rules, Teams, agent permissions and the activity recorder, the shared HTTP endpoint,
+  diagnostics, and first-run setup. Updates come from pacman or the Omarchy update
+  flow; there is no self-updater in this build.
+
+  Only one Toolport can be installed on Linux: the package is `toolport` and it
+  conflicts with `toolport-bin`. The two shells cannot sensibly run together anyway -
+  they read the same `~/.config/Toolport`, and only one process can hold the approval
+  broker's endpoint, so the second to start would show an empty approval queue while
+  prompts went to the first. Upgrading from the earlier preview package retires its
+  autostart entry and URL handler on first run, and carries launch-at-login across
+  rather than switching it off.
+
+- **Agent permissions has a "Never run sudo" preset.** The other presets each block one
+  destructive act; none covered privilege escalation, which is the case where an agent
+  can perform any of them as root. Denies `sudo` and `sudoedit`.
+
+- **Activity says which part of a tool definition drifted.** Pins now carry per-field
+  fingerprints alongside the whole-definition one, so a drift row can name the
+  description, the input schema, or the annotations instead of only reporting that
+  something changed. The whole-definition fingerprint is still what quarantine trusts.
+
+- **Server and client logos.** Catalog entries, registry rows and client cards show the
+  real mark, with a clean fallback where there is no asset.
+
+### Changed
+
+- **Blocking destructive tools now hides them from the catalog as well as refusing the
+  call.** The setting has always promised to "hide and reject", and the call was always
+  refused, but the catalog kept listing the tools because it is served from a cache
+  written under whatever policy was in force at the time. If you run with that setting
+  on, expect those tools to disappear from what your agents can see. Blocking behaviour
+  is unchanged.
+
+- **Clients are grouped by whether they are connected.** Available to connect sits above
+  Connected to Toolport, each with its own count, instead of one mixed list.
+
 ### Fixed
+
+- **Adding a self-hosted catalog entry created a server that could never connect.**
+  `n8n` and `Langfuse` describe an endpoint you host yourself, so the catalog carries a
+  hint rather than a URL. A one-click Add wrote an HTTP server with neither a command
+  nor a URL. Both Add paths now open the server editor prefilled, with the hint as the
+  URL placeholder rather than as text that could be saved as-is, and the underlying add
+  refuses an entry with no endpoint so no other caller can recreate it.
+
+- **A debug build reaped the production install's gateways.** The stale-gateway sweep
+  did not tell a `-dev` data directory's processes from the real install's, so running a
+  development build killed gateways that were serving live clients mid-call.
 
 - **Agent rules: the "no rules file" line no longer lumps three different situations
   together.** Cursor and GitHub Copilot CLI have no global rules file but do read project
@@ -3158,7 +3219,8 @@ driven by the agent on your terms, and supports two more clients.
 - First public release: local MCP gateway and manager with lazy discovery,
   per-agent profiles, the catalog, the tool playground, and the activity log.
 
-[Unreleased]: https://github.com/tsouth89/toolport/compare/v1.17.0...HEAD
+[Unreleased]: https://github.com/tsouth89/toolport/compare/v1.18.0...HEAD
+[1.18.0]: https://github.com/tsouth89/toolport/compare/v1.17.0...v1.18.0
 [1.17.0]: https://github.com/tsouth89/toolport/compare/v1.16.0...v1.17.0
 [1.16.0]: https://github.com/tsouth89/toolport/releases/tag/v1.16.0
 [1.6.2]: https://github.com/tsouth89/toolport/compare/v1.6.1...v1.6.2
