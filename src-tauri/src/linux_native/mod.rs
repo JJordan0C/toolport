@@ -739,19 +739,7 @@ fn build_sidebar(
         .build();
     root.append(&nav_scroll);
 
-    let theme_status = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    theme_status.add_css_class("toolport-theme-status");
-    let dot = gtk::Label::new(Some("●"));
-    dot.add_css_class("toolport-accent");
-    theme_status.append(&dot);
-    theme_status.append(
-        &gtk::Label::builder()
-            .label("Following Omarchy")
-            .css_classes(["caption", "toolport-muted"])
-            .build(),
-    );
     install_star_prompt(&root);
-    root.append(&theme_status);
     (root, quarantine_badge)
 }
 
@@ -7093,11 +7081,6 @@ fn build_content(
             .css_classes(["title"])
             .build(),
     ));
-    let mode = gtk::Label::builder()
-        .label("Native preview")
-        .css_classes(["toolport-mode-badge"])
-        .build();
-    header.pack_end(&mode);
     let add_server = gtk::Button::builder()
         .icon_name("list-add-symbolic")
         .tooltip_text("Add server")

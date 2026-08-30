@@ -432,15 +432,7 @@ dropdown popover row:selected {{
   color: @toolport_accent;
 }}
 
-.toolport-theme-status {{
-  margin: 12px;
-  padding: 10px 12px;
-  border: 1px solid alpha(@toolport_fg, 0.08);
-  border-radius: 10px;
-  background-color: alpha(@toolport_fg, 0.025);
-}}
 
-.toolport-accent {{ color: @toolport_accent; }}
 
 .toolport-mode-badge {{
   margin: 7px 2px;
