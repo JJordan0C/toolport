@@ -50,6 +50,7 @@ pub mod shaping;
 pub mod sharing_controller;
 pub mod stacks;
 pub mod teams;
+pub mod teams_plan;
 pub mod topology;
 pub mod usage_report;
 pub mod vendors;
