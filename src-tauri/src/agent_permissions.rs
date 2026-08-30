@@ -115,6 +115,13 @@ pub fn presets() -> Vec<Preset> {
             label: "Never read SSH keys".into(),
             rules: vec![rule("Read(~/.ssh/**)", Deny)],
         },
+        // Privilege escalation, which none of the others cover: the rest are
+        // about a specific destructive act, this is about the agent being able
+        // to perform any of them as root.
+        Preset {
+            label: "Never run sudo".into(),
+            rules: vec![rule("Bash(sudo *)", Deny), rule("Bash(sudoedit *)", Deny)],
+        },
     ]
 }
 
