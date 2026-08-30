@@ -22,7 +22,7 @@ function client(overrides: Partial<DetectedClient> = {}): DetectedClient {
 }
 
 describe("ClientsView", () => {
-  it("orders connected clients first and uses calm factual states", () => {
+  it("groups connected clients before clients available to connect", () => {
     render(
       <ClientsView
         clients={[
@@ -39,6 +39,8 @@ describe("ClientsView", () => {
       />,
     );
 
+    expect(screen.getByText("Connected to Toolport")).toBeInTheDocument();
+    expect(screen.getByText("Available to connect")).toBeInTheDocument();
     const rows = screen.getAllByRole("button");
     expect(rows[0]).toHaveTextContent("Claude Desktop");
     expect(rows[0]).toHaveTextContent("Connected");
@@ -61,7 +63,7 @@ describe("ClientsView", () => {
     );
 
     expect(screen.getByText("Custom configuration")).toBeInTheDocument();
-    expect(screen.getByText("1 using custom configuration.")).toBeInTheDocument();
+    expect(screen.getByText("Available to connect")).toBeInTheDocument();
     expect(
       screen.queryByText("Your installed clients are connected to Toolport."),
     ).not.toBeInTheDocument();
@@ -88,8 +90,8 @@ describe("ClientsView", () => {
       />,
     );
 
-    expect(screen.getByText("1 client connected")).toBeInTheDocument();
-    expect(screen.getByText("1 config read needs attention.")).toBeInTheDocument();
+    expect(screen.getByText("Connected to Toolport")).toBeInTheDocument();
+    expect(screen.getByText("Available to connect")).toBeInTheDocument();
     expect(
       screen.queryByText("Your installed clients are connected to Toolport."),
     ).not.toBeInTheDocument();
