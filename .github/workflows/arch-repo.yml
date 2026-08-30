@@ -107,7 +107,22 @@ jobs:
             echo "::error::REPO_GPG_PRIVATE_KEY is not set. Add it before publishing."; exit 1
           fi
           printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          # repo-add shells out to gpg itself, so make the whole agent
+          # non-interactive rather than relying on flags we do not control.
+          mkdir -p ~/.gnupg && chmod 700 ~/.gnupg
+          printf 'batch\npinentry-mode loopback\n' >> ~/.gnupg/gpg.conf
+          printf 'allow-loopback-pinentry\n' >> ~/.gnupg/gpg-agent.conf
+          gpgconf --reload gpg-agent || true
           keyid="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print $5; exit}')"
+          # Refuse to sign with anything other than the fingerprint the installer
+          # pins, so a wrong key in the secret cannot silently produce a repo no
+          # client will trust.
+          expected="A16BFA2E1014BD6BD718CC6E6621247E3FFA6AA7"
+          got="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')"
+          if [ "$got" != "$expected" ]; then
+            echo "::error::REPO_GPG_PRIVATE_KEY is $got but install.sh pins $expected."
+            exit 1
+          fi
           echo "signing with $keyid"
           for p in pkgout/*.pkg.tar.zst; do
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \

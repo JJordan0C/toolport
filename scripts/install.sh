@@ -192,7 +192,7 @@ download_and_verify() {
 # Fingerprint of the key that signs the Toolport pacman repository. Pinned so a
 # compromised or swapped key at repo.toolport.app cannot be trusted by pacman.
 # Replace when the signing key rotates.
-REPO_SIGNING_KEY="REPLACE_ME_WITH_THE_REPO_SIGNING_KEY_FINGERPRINT"
+REPO_SIGNING_KEY="A16BFA2E1014BD6BD718CC6E6621247E3FFA6AA7"
 
 install_arch_repo() {
   # Overridable so the test suite can point at a scratch pacman.conf and a local
