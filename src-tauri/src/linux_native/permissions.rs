@@ -14,6 +14,7 @@ pub(super) struct PermissionsPage {
     rules: gtk::Box,
     presets: gtk::FlowBox,
     profiles: gtk::Box,
+    profiles_expander: gtk::Expander,
     pattern: gtk::Entry,
     action: gtk::DropDown,
     add: gtk::Button,
@@ -52,19 +53,24 @@ impl PermissionsPage {
             .build();
         let content = gtk::Box::new(gtk::Orientation::Vertical, 14);
         content.add_css_class("toolport-page");
-        content.set_margin_top(28);
-        content.set_margin_bottom(28);
-        content.set_margin_start(28);
-        content.set_margin_end(28);
+        content.set_margin_top(20);
+        content.set_margin_bottom(20);
+        content.set_margin_start(20);
+        content.set_margin_end(20);
         content.append(
             &gtk::Label::builder()
                 .label("One native-tool policy across your agents")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
+                .xalign(0.0)
                 .wrap(true)
                 .css_classes(["title-2"])
                 .build(),
         );
-        content.append(&muted("Claude Code enforces these rules in its own settings. Cursor can evaluate the same policy through Toolport's guard hook."));
+        // Which agents enforce it is the "Where it is enforced" section's job now,
+        // so the lede only has to say what a native-tool policy covers.
+        content.append(&muted(
+            "Shell commands, file reads, and MCP calls, governed inside the agent itself.",
+        ));
         let feedback = gtk::Label::builder()
             .halign(gtk::Align::Fill)
             .xalign(0.0)
@@ -74,29 +80,11 @@ impl PermissionsPage {
         feedback.set_label("Open Agent permissions to load the current policy.");
         content.append(&feedback);
 
-        let policy = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        policy.add_css_class("toolport-settings-group");
-        let policy_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        policy_row.add_css_class("toolport-setting-row");
-        let policy_copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
-        policy_copy.set_hexpand(true);
-        policy_copy.append(&heading("Enforce in Claude Code"));
-        policy_copy.append(&muted("Writes only Toolport-owned rules into every Claude Code profile. Turning it off removes only those entries."));
-        policy_row.append(&policy_copy);
-        let enabled = gtk::Switch::builder().valign(gtk::Align::Center).build();
-        policy_row.append(&enabled);
-        policy.append(&policy_row);
-        let policy_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        policy_actions.add_css_class("toolport-setting-row");
-        let preview = gtk::Button::with_label("Preview exact settings files");
-        policy_actions.append(&preview);
-        policy.append(&policy_actions);
-        content.append(&policy);
-
-        content.append(&section_title(
-            "Rules",
-            "Claude Code syntax such as Bash(rm -rf *), Read(./.env), or mcp__github__create_issue.",
-        ));
+        // The rules are the thing you author; Claude Code and Cursor are two
+        // ways of delivering them. Authoring came third before, with "Enforce in
+        // Claude Code" at the top and "Claude Code profiles" three sections
+        // below it, so Claude Code appeared twice with the policy wedged between.
+        content.append(&section_title("Rules", "Claude Code pattern syntax."));
         let rules = gtk::Box::new(gtk::Orientation::Vertical, 0);
         rules.add_css_class("toolport-settings-group");
         content.append(&rules);
@@ -106,6 +94,7 @@ impl PermissionsPage {
         let action = gtk::DropDown::new(Some(actions), gtk::Expression::NONE);
         let pattern = gtk::Entry::builder()
             .placeholder_text("Bash(rm -rf *)")
+            .tooltip_text("Claude Code syntax, such as Bash(rm -rf *), Read(./.env), or mcp__github__create_issue")
             .hexpand(true)
             .build();
         let add = gtk::Button::with_label("Add rule");
@@ -115,10 +104,7 @@ impl PermissionsPage {
         editor.append(&add);
         content.append(&editor);
 
-        content.append(&section_title(
-            "Presets",
-            "Presets add rules for review. They do not enable enforcement.",
-        ));
+        content.append(&section_title("Presets", "Add a common rule to review."));
         let presets = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .column_spacing(7)
@@ -129,30 +115,69 @@ impl PermissionsPage {
         content.append(&presets);
 
         content.append(&section_title(
-            "Claude Code profiles",
-            "Every detected profile is shown so stale or unreadable settings cannot look protected.",
+            "Where it is enforced",
+            "The rules above do nothing until one of these is switched on.",
         ));
-        let profiles = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        profiles.add_css_class("toolport-settings-group");
-        content.append(&profiles);
 
-        content.append(&section_title(
-            "Cursor guard",
-            "Observe records what the policy would decide. Enforce applies Never and Ask first before shell, file-read, and MCP calls.",
+        let policy = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        policy.add_css_class("toolport-settings-group");
+        let policy_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        policy_row.add_css_class("toolport-setting-row");
+        let policy_copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        policy_copy.set_hexpand(true);
+        policy_copy.append(&heading("Claude Code"));
+        let claude_copy =
+            muted("Writes only Toolport-owned entries, and removes only those when switched off.");
+        claude_copy.set_tooltip_text(Some(
+            "Rules are written into every detected Claude Code profile. Nothing else in those settings files is touched.",
         ));
+        policy_copy.append(&claude_copy);
+        policy_row.append(&policy_copy);
+        let enabled = gtk::Switch::builder().valign(gtk::Align::Center).build();
+        policy_row.append(&enabled);
+        policy.append(&policy_row);
+        // The profiles list lives inside the Claude Code group it describes, and
+        // collapsed: with enforcement off every row just says "Off". The label
+        // carries the count so the state is readable without opening it, and
+        // `render_profiles` forces it open when a profile cannot be read, which
+        // is the case the list exists to make impossible to miss.
+        let profiles = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let profiles_expander = gtk::Expander::builder()
+            .label("Profiles")
+            .child(&profiles)
+            .css_classes(["toolport-details-expander"])
+            .build();
+        let profiles_row = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        profiles_row.add_css_class("toolport-setting-row");
+        profiles_row.append(&profiles_expander);
+        policy.append(&profiles_row);
+        let policy_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        policy_actions.add_css_class("toolport-setting-row");
+        let preview = gtk::Button::with_label("Preview exact settings files");
+        policy_actions.append(&preview);
+        policy.append(&policy_actions);
+        content.append(&policy);
+
         let guard_group = gtk::Box::new(gtk::Orientation::Vertical, 0);
         guard_group.add_css_class("toolport-settings-group");
         let guard_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         guard_row.add_css_class("toolport-setting-row");
         let guard_copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
         guard_copy.set_hexpand(true);
-        guard_copy.append(&heading("Guard mode"));
+        guard_copy.append(&heading("Cursor"));
+        guard_copy.append(&muted(
+            "Evaluates the same rules through Toolport's guard hook.",
+        ));
         let guard_status = muted("Loading Cursor hook status…");
         guard_status.set_selectable(true);
         guard_copy.append(&guard_status);
         guard_row.append(&guard_copy);
         let modes = gtk::StringList::new(&["Off", "Observe", "Enforce"]);
         let guard_mode = gtk::DropDown::new(Some(modes), gtk::Expression::NONE);
+        guard_mode.set_valign(gtk::Align::Center);
+        guard_mode.set_tooltip_text(Some(
+            "Observe records what the policy would decide. Enforce applies Never and Ask first before shell, file-read, and MCP calls.",
+        ));
         guard_row.append(&guard_mode);
         guard_group.append(&guard_row);
         let guard_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -172,6 +197,7 @@ impl PermissionsPage {
             rules,
             presets,
             profiles,
+            profiles_expander,
             pattern,
             action,
             add,
@@ -309,7 +335,9 @@ impl PermissionsPage {
             match result {
                 Ok((view, guard)) => {
                     page.render(view, guard);
-                    page.show_success("Permission policy is up to date.");
+                    // A load that worked is not a status. The bar is for the
+                    // outcome of an action, and for errors.
+                    page.set_status("");
                 }
                 Err(_) => {
                     page.updating.set(false);
@@ -428,6 +456,35 @@ impl PermissionsPage {
 
     fn render_profiles(&self, view: &crate::agent_permissions::PermissionsView) {
         clear_box(&self.profiles);
+        let unreadable = view
+            .profiles
+            .iter()
+            .filter(|profile| profile.state == "error")
+            .count();
+        let carrying = view
+            .profiles
+            .iter()
+            .filter(|profile| profile.state == "applied")
+            .count();
+        self.profiles_expander
+            .set_label(Some(&if view.profiles.is_empty() {
+                "Profiles".to_string()
+            } else if unreadable > 0 {
+                format!(
+                    "Profiles · {carrying} of {} carrying rules · {unreadable} unreadable",
+                    view.profiles.len()
+                )
+            } else {
+                format!(
+                    "Profiles · {carrying} of {} carrying rules",
+                    view.profiles.len()
+                )
+            }));
+        // A settings file Toolport cannot read is the one case this list exists
+        // for, so it opens itself rather than hiding behind a closed expander.
+        if unreadable > 0 {
+            self.profiles_expander.set_expanded(true);
+        }
         if view.profiles.is_empty() {
             self.profiles
                 .append(&padded(&muted("No Claude Code profile found.")));
@@ -614,16 +671,22 @@ impl PermissionsPage {
         window.present();
     }
 
-    fn show_success(&self, message: &str) {
+    /// An empty message hides the bar rather than leaving a blank strip, since
+    /// `toolport-feedback` paints a background.
+    fn set_status(&self, message: &str) {
         self.feedback.set_label(message);
+        self.feedback.set_visible(!message.is_empty());
         self.feedback.remove_css_class("error");
+        self.feedback.remove_css_class("success");
+    }
+
+    fn show_success(&self, message: &str) {
+        self.set_status(message);
         self.feedback.add_css_class("success");
     }
 
     fn show_error(&self, error: &str) {
-        self.feedback
-            .set_label(&format!("Permission error: {error}"));
-        self.feedback.remove_css_class("success");
+        self.set_status(&format!("Permission error: {error}"));
         self.feedback.add_css_class("error");
     }
 }
@@ -651,7 +714,7 @@ fn padded(label: &gtk::Label) -> gtk::Label {
 fn heading(text: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(text)
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
         .css_classes(["heading"])
@@ -661,7 +724,7 @@ fn heading(text: &str) -> gtk::Label {
 fn muted(text: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(text)
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
         .css_classes(["toolport-muted"])
