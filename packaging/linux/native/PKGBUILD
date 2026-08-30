@@ -7,7 +7,13 @@ pkgdesc='One local MCP gateway for every AI client, with a native GTK shell'
 arch=('x86_64')
 url='https://github.com/tsouth89/toolport'
 license=('MIT')
-depends=('gtk4' 'libadwaita' 'libsecret' 'glib2' 'dbus' 'hicolor-icon-theme')
+# No libsecret: on Linux the keyring crate uses sync-secret-service, which talks
+# to the Secret Service over D-Bus rather than linking libsecret, and namcap
+# confirms neither binary links it. A provider is a runtime choice, and without
+# one Toolport falls back to its own encrypted file backend.
+depends=('gtk4' 'libadwaita' 'glib2' 'dbus' 'hicolor-icon-theme')
+optdepends=('gnome-keyring: store credentials in the system keyring instead of the encrypted file backend'
+            'kwallet: same, on KDE')
 makedepends=('cargo' 'desktop-file-utils' 'appstream' 'zip')
 # The GTK shell replaces the Tauri one on Linux rather than sitting beside it:
 # both read the same ~/.config/Toolport, only one can hold the approval broker's

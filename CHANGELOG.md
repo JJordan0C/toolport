@@ -8,27 +8,32 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [1.18.0] - 2026-08-30
 
-Toolport 1.18.0 replaces the Linux app with a native GTK shell, makes the
-destructive-tool setting hide what it refuses, and fixes catalog entries for
-servers you host yourself.
+Toolport 1.18.0 adds a native GTK shell for Arch and other current-GTK Linux
+distributions, makes the destructive-tool setting hide what it refuses, and
+fixes catalog entries for servers you host yourself. The `.deb` and AppImage
+builds are unchanged and remain the Linux download everywhere else.
 
 ### Added
 
-- **Linux runs a native GTK shell instead of the web view.** The Linux app is now
-  GTK4/libadwaita rather than Tauri: it follows the active Omarchy palette, behaves as
-  a regular Wayland window under Hyprland, and leaves tiling and geometry to the
-  compositor. Everything the cross-platform app does is here - servers, profiles and
+- **A native GTK shell for Arch, Omarchy, and other current-GTK distributions.** Not a
+  rewrite of the Linux app for every distribution: this is a second Linux build,
+  packaged for Arch as `toolport`, and it needs GTK 4.10 or newer and libadwaita 1.4 or
+  newer. That rules out Ubuntu 22.04 and Debian 12, which keep the existing `.deb` and
+  AppImage, as does anywhere the native package is not available. Where it does run it
+  is GTK4/libadwaita rather than a web view: it follows the active Omarchy palette,
+  behaves as a regular Wayland window under Hyprland, and leaves tiling and geometry to
+  the compositor. Everything the cross-platform app does is here - servers, profiles and
   secrets, client detection and connection, pending approvals with desktop
   notifications, Activity, Catalog and starter stacks, Playground, Rules and project
   rules, Teams, agent permissions and the activity recorder, the shared HTTP endpoint,
   diagnostics, and first-run setup. Updates come from pacman or the Omarchy update
   flow; there is no self-updater in this build.
 
-  Only one Toolport can be installed on Linux: the package is `toolport` and it
-  conflicts with `toolport-bin`. The two shells cannot sensibly run together anyway -
-  they read the same `~/.config/Toolport`, and only one process can hold the approval
-  broker's endpoint, so the second to start would show an empty approval queue while
-  prompts went to the first. Upgrading from the earlier preview package retires its
+  Only one Toolport should run at a time. Both builds read the same
+  `~/.config/Toolport`, and only one process can hold the approval broker's endpoint, so
+  the second to start shows an empty approval queue while prompts go to the first - it
+  now says so rather than looking idle. On Arch the `toolport` package conflicts with
+  `toolport-bin`, so the two cannot be installed together there. Upgrading from the earlier preview package retires its
   autostart entry and URL handler on first run, and carries launch-at-login across
   rather than switching it off.
 
