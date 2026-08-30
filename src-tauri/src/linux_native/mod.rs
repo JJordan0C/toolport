@@ -3,6 +3,7 @@
 //! This module is feature-gated so the existing Tauri application and every
 //! non-Linux build remain unchanged while the native shell is developed.
 
+mod branding;
 mod catalog;
 mod hooks;
 mod http_bridge;
@@ -141,7 +142,7 @@ fn ensure_url_scheme_handlers() {
         }
         let desktop_path = applications.join("com.tsout.Toolport.NativePreview.desktop");
         let contents = format!(
-            "[Desktop Entry]\nType=Application\nName=Toolport (native preview)\nExec={} %u\nNoDisplay=true\nMimeType=x-scheme-handler/toolport;x-scheme-handler/conduit;\n",
+            "[Desktop Entry]\nType=Application\nName=Toolport (native preview)\nExec={} %u\nIcon=toolport\nNoDisplay=true\nMimeType=x-scheme-handler/toolport;x-scheme-handler/conduit;\n",
             exe.display()
         );
         if std::fs::write(&desktop_path, contents).is_err() {
@@ -185,9 +186,9 @@ fn build_window(
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Toolport")
+        .icon_name("toolport")
         .default_width(saved_state.as_ref().map(|s| s.width).unwrap_or(1120))
         .default_height(saved_state.as_ref().map(|s| s.height).unwrap_or(720))
-        .maximized(saved_state.as_ref().is_some_and(|s| s.maximized))
         .resizable(true)
         .hide_on_close(true)
         .build();
@@ -215,7 +216,7 @@ fn build_window(
     let server_page_for_reap = server_page.clone();
     let client_page = ClientPage::new(app, bridge.clone());
     let activity_page = ActivityPage::new(app);
-    let catalog_page = CatalogPage::new();
+    let catalog_page = CatalogPage::new(server_page.clone());
     let playground_page = PlaygroundPage::new(app);
     let teams_page = TeamsPage::new(app);
     let rules_page = RulesPage::new(app);
@@ -225,6 +226,8 @@ fn build_window(
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
         .transition_duration(140)
+        .hhomogeneous(false)
+        .vhomogeneous(false)
         .build();
     stack.add_named(&content, Some("servers"));
     stack.add_named(&client_page.root, Some("clients"));
@@ -250,7 +253,6 @@ fn build_window(
         permissions_page.clone(),
         settings_page.clone(),
     );
-    start_quarantine_watch(app, quarantine_badge);
     // The Settings tab must not go stale while open: quarantine, remembered
     // approvals, and routine suggestions all change underneath it (the shipping
     // app polls the same way).
@@ -277,14 +279,74 @@ fn build_window(
     split.set_sidebar(Some(&adw::NavigationPage::new(&sidebar, "Navigation")));
     split.set_content(Some(&adw::NavigationPage::new(&stack, "Toolport")));
 
+    let review_quarantine = gtk::gio::SimpleAction::new("review-quarantine", None);
+    let app_for_quarantine = app.clone();
+    let window_for_quarantine = window.clone();
+    review_quarantine.connect_activate(move |_, _| {
+        if let Some(action) = app_for_quarantine.lookup_action("show-settings") {
+            action.activate(None);
+        }
+        window_for_quarantine.present();
+    });
+    app.add_action(&review_quarantine);
+
+    let review_security = gtk::gio::SimpleAction::new("review-security", None);
+    let app_for_security = app.clone();
+    let window_for_security = window.clone();
+    let activity_for_security = activity_page.clone();
+    review_security.connect_activate(move |_, _| {
+        if let Some(action) = app_for_security.lookup_action("show-activity") {
+            action.activate(None);
+        }
+        activity_for_security.reveal_security();
+        window_for_security.present();
+    });
+    app.add_action(&review_security);
+
+    let show_approvals = gtk::gio::SimpleAction::new("show-approvals", None);
+    let window_for_approvals = window.clone();
+    show_approvals.connect_activate(move |_, _| window_for_approvals.present());
+    app.add_action(&show_approvals);
+
+    let alerts = gtk::Overlay::new();
+    alerts.set_child(Some(&split));
+    let approval_host = adw::Clamp::builder()
+        .maximum_size(720)
+        .tightening_threshold(560)
+        .child(&approval_page.root)
+        .build();
+    approval_host.set_valign(gtk::Align::Start);
+    approval_host.set_margin_top(64);
+    approval_host.set_margin_start(12);
+    approval_host.set_margin_end(12);
+    alerts.add_overlay(&approval_host);
+    let security_event_alert = SecurityEventAlert::new();
+    let quarantine_alert = QuarantineAlert::new();
+    let security_alerts = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    security_alerts.append(&security_event_alert.root);
+    security_alerts.append(&quarantine_alert.root);
+    let quarantine_host = adw::Clamp::builder()
+        .maximum_size(620)
+        .tightening_threshold(480)
+        .child(&security_alerts)
+        .build();
+    quarantine_host.set_valign(gtk::Align::End);
+    quarantine_host.set_margin_start(12);
+    quarantine_host.set_margin_end(12);
+    quarantine_host.set_margin_bottom(16);
+    alerts.add_overlay(&quarantine_host);
+    start_quarantine_watch(app, quarantine_badge, quarantine_alert);
+    start_security_event_watch(app, security_event_alert);
+
     let narrow = adw::Breakpoint::new(
-        adw::BreakpointCondition::parse("max-width: 700px")
+        adw::BreakpointCondition::parse("max-width: 620px")
             .expect("the native-shell breakpoint is a static valid condition"),
     );
     narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
+    narrow.add_setter(&split, "show-content", Some(&true.to_value()));
     window.add_breakpoint(narrow);
 
-    window.set_content(Some(&split));
+    window.set_content(Some(&alerts));
     theme.attach(&window);
     let state = state::RegistryController::new(move |snapshot| {
         server_page.render(snapshot);
@@ -307,7 +369,45 @@ fn build_window(
     approval_page.attach(&window);
     teams_page.attach_background_sync(&window);
     onboarding::install(app, &window, client_page);
-    start_startup_reap(app, bridge_for_reap, server_page_for_reap);
+    if std::env::var_os("TOOLPORT_DEBUG_MEASURE").is_none() {
+        start_startup_reap(app, bridge_for_reap, server_page_for_reap);
+    }
+    if std::env::var_os("TOOLPORT_DEBUG_MEASURE").is_some() {
+        let window_for_measure = window.clone();
+        let app_for_measure = app.clone();
+        gtk::glib::timeout_add_seconds_local_once(2, move || {
+            fn dump(widget: &gtk::Widget, depth: usize) {
+                let (min, natural, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+                if min > 200 {
+                    let text = widget
+                        .downcast_ref::<gtk::Label>()
+                        .map(|label| label.text().chars().take(40).collect::<String>())
+                        .or_else(|| {
+                            widget
+                                .downcast_ref::<gtk::Button>()
+                                .and_then(|b| b.label())
+                                .map(|l| l.chars().take(40).collect())
+                        })
+                        .unwrap_or_default();
+                    eprintln!(
+                        "{:indent$}{} min={min} nat={natural} visible={} css={:?} text={text:?}",
+                        "",
+                        widget.type_(),
+                        widget.is_visible(),
+                        widget.css_classes(),
+                        indent = depth * 2
+                    );
+                }
+                let mut child = widget.first_child();
+                while let Some(current) = child {
+                    dump(&current, depth + 1);
+                    child = current.next_sibling();
+                }
+            }
+            dump(window_for_measure.upcast_ref::<gtk::Widget>(), 0);
+            app_for_measure.quit();
+        });
+    }
     if present {
         window.present();
     }
@@ -429,14 +529,15 @@ fn run_registry_startup_failure(error: String) {
             .resizable(true)
             .build();
         let page = gtk::Box::new(gtk::Orientation::Vertical, 16);
-        page.set_margin_top(28);
-        page.set_margin_bottom(28);
-        page.set_margin_start(28);
-        page.set_margin_end(28);
+        page.set_margin_top(20);
+        page.set_margin_bottom(20);
+        page.set_margin_start(20);
+        page.set_margin_end(20);
         page.append(
             &gtk::Label::builder()
                 .label("Toolport could not start safely")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
+            .xalign(0.0)
                 .wrap(true)
                 .css_classes(["title-1"])
                 .build(),
@@ -444,7 +545,7 @@ fn run_registry_startup_failure(error: String) {
         page.append(
             &gtk::Label::builder()
                 .label("The registry was not replaced. Close other Toolport processes and try again. If the problem continues, restore a registry backup or move the unreadable registry aside before reopening Toolport.")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
                 .build(),
@@ -452,7 +553,7 @@ fn run_registry_startup_failure(error: String) {
         page.append(
             &gtk::Label::builder()
                 .label(format!("Registry: {path}\n\nError: {error}"))
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
                 .selectable(true)
@@ -491,8 +592,7 @@ fn build_sidebar(
     let header = adw::HeaderBar::new();
     header.add_css_class("toolport-header");
     let brand = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let mark = gtk::Label::new(Some("T"));
-    mark.add_css_class("toolport-mark");
+    let mark = branding::toolport_mark();
     brand.append(&mark);
     brand.append(
         &gtk::Label::builder()
@@ -665,29 +765,34 @@ fn install_star_prompt(container: &gtk::Box) {
     if marker().is_none_or(|marker| marker.exists()) {
         return;
     }
-    let card = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    // Vertical, with copy short enough to sit on one line: the sidebar is ~220px
+    // wide, so a horizontal row of label plus two buttons squeezes the label into
+    // a five-line column.
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
     card.add_css_class("toolport-card");
     card.set_margin_start(12);
     card.set_margin_end(12);
+    card.set_margin_bottom(6);
     card.set_visible(false);
     card.append(
         &gtk::Label::builder()
-            .label("Enjoying Toolport? A star helps others find it.")
-            .halign(gtk::Align::Start)
-            .hexpand(true)
+            .label("Enjoying Toolport?")
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["caption", "toolport-muted"])
             .build(),
     );
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let retire = |card: &gtk::Box| {
         if let Some(marker) = marker() {
             let _ = std::fs::write(marker, b"1");
         }
         card.set_visible(false);
     };
-    let star = gtk::Button::with_label("Star");
+    let star = gtk::Button::with_label("Star on GitHub");
     star.add_css_class("toolport-secondary-action");
+    star.set_hexpand(true);
     {
         let card = card.clone();
         star.connect_clicked(move |_| {
@@ -695,7 +800,7 @@ fn install_star_prompt(container: &gtk::Box) {
             retire(&card);
         });
     }
-    card.append(&star);
+    actions.append(&star);
     let dismiss = gtk::Button::builder()
         .icon_name("window-close-symbolic")
         .tooltip_text("Dismiss forever")
@@ -705,7 +810,8 @@ fn install_star_prompt(container: &gtk::Box) {
         let card = card.clone();
         dismiss.connect_clicked(move |_| retire(&card));
     }
-    card.append(&dismiss);
+    actions.append(&dismiss);
+    card.append(&actions);
     container.append(&card);
     let card_for_timer = card.clone();
     gtk::glib::timeout_add_seconds_local_once(8, move || {
@@ -736,11 +842,346 @@ fn install_star_prompt(container: &gtk::Box) {
     });
 }
 
+#[derive(Clone)]
+struct SecurityEventAlert {
+    root: gtk::Box,
+    title: gtk::Label,
+    detail: gtk::Label,
+    timer: std::rc::Rc<std::cell::RefCell<Option<gtk::glib::SourceId>>>,
+}
+
+impl SecurityEventAlert {
+    fn new() -> Self {
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        root.add_css_class("toolport-global-alert");
+        root.add_css_class("security-event");
+        root.set_visible(false);
+        root.append(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
+
+        let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        copy.set_hexpand(true);
+        let title = gtk::Label::builder()
+            .halign(gtk::Align::Start)
+            .xalign(0.0)
+            .css_classes(["heading"])
+            .build();
+        copy.append(&title);
+        let detail = gtk::Label::builder()
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["toolport-muted", "caption"])
+            .build();
+        copy.append(&detail);
+        root.append(&copy);
+
+        let review = gtk::Button::with_label("Review");
+        review.add_css_class("toolport-secondary-action");
+        review.set_action_name(Some("app.review-security"));
+        root.append(&review);
+        let close = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Dismiss this alert")
+            .css_classes(["flat", "circular"])
+            .build();
+        root.append(&close);
+
+        let alert = Self {
+            root,
+            title,
+            detail,
+            timer: std::rc::Rc::new(std::cell::RefCell::new(None)),
+        };
+        for button in [review, close] {
+            let alert = alert.clone();
+            button.connect_clicked(move |_| alert.hide());
+        }
+        alert
+    }
+
+    fn show(&self, events: &[serde_json::Value]) {
+        let (title, detail) = security_alert_copy(events);
+        self.title.set_label(&title);
+        self.detail.set_label(&detail);
+        self.root.set_visible(true);
+        if let Some(timer) = self.timer.borrow_mut().take() {
+            timer.remove();
+        }
+        let root = self.root.clone();
+        let timer = self.timer.clone();
+        let source =
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(6), move || {
+                root.set_visible(false);
+                timer.borrow_mut().take();
+            });
+        *self.timer.borrow_mut() = Some(source);
+    }
+
+    fn hide(&self) {
+        if let Some(timer) = self.timer.borrow_mut().take() {
+            timer.remove();
+        }
+        self.root.set_visible(false);
+    }
+}
+
+#[derive(Clone)]
+struct QuarantineAlert {
+    root: gtk::Box,
+    title: gtk::Label,
+    detail: gtk::Label,
+    current: std::rc::Rc<std::cell::RefCell<String>>,
+    dismissed: std::rc::Rc<std::cell::RefCell<String>>,
+}
+
+impl QuarantineAlert {
+    fn new() -> Self {
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        root.add_css_class("toolport-global-alert");
+        root.add_css_class("security");
+        root.set_visible(false);
+
+        root.append(&gtk::Image::from_icon_name("security-high-symbolic"));
+        let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        copy.set_hexpand(true);
+        let title = gtk::Label::builder()
+            .halign(gtk::Align::Start)
+            .xalign(0.0)
+            .css_classes(["heading"])
+            .build();
+        copy.append(&title);
+        let detail = gtk::Label::builder()
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["toolport-muted", "caption"])
+            .build();
+        copy.append(&detail);
+        root.append(&copy);
+
+        let review = gtk::Button::with_label("Review");
+        review.add_css_class("suggested-action");
+        review.set_action_name(Some("app.review-quarantine"));
+        root.append(&review);
+        let close = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Dismiss this alert")
+            .css_classes(["flat", "circular"])
+            .build();
+        root.append(&close);
+
+        let alert = Self {
+            root,
+            title,
+            detail,
+            current: std::rc::Rc::new(std::cell::RefCell::new(String::new())),
+            dismissed: std::rc::Rc::new(std::cell::RefCell::new(String::new())),
+        };
+        for button in [review, close] {
+            let alert = alert.clone();
+            button.connect_clicked(move |_| alert.dismiss_current());
+        }
+        alert
+    }
+
+    fn update(&self, list: &[serde_json::Value]) {
+        if list.is_empty() {
+            self.root.set_visible(false);
+            self.current.borrow_mut().clear();
+            self.dismissed.borrow_mut().clear();
+            return;
+        }
+        let signature = quarantine_signature(list);
+        *self.current.borrow_mut() = signature.clone();
+        let refs = list.iter().collect::<Vec<_>>();
+        let (title, detail) = crate::integrity::quarantine_notification(&refs);
+        self.title.set_label(&title);
+        self.detail.set_label(&detail);
+        self.root.set_visible(*self.dismissed.borrow() != signature);
+    }
+
+    fn dismiss_current(&self) {
+        *self.dismissed.borrow_mut() = self.current.borrow().clone();
+        self.root.set_visible(false);
+    }
+}
+
+fn quarantine_signature(list: &[serde_json::Value]) -> String {
+    let mut keys = list
+        .iter()
+        .map(crate::integrity::quarantine_entry_key)
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.join("\n")
+}
+
+fn security_event_instance_key(event: &serde_json::Value) -> String {
+    format!(
+        "{}:{}",
+        crate::integrity::security_key(event),
+        event
+            .get("ts")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    )
+}
+
+fn security_event_needs_attention(event: &serde_json::Value) -> bool {
+    crate::integrity::event_severity(event) == "high"
+        && !crate::integrity::security_event_is_new_tool(event)
+}
+
+fn security_event_covered_by_quarantine(
+    event: &serde_json::Value,
+    quarantined: &[serde_json::Value],
+) -> bool {
+    match event.get("type").and_then(serde_json::Value::as_str) {
+        Some("pins_load_failed") => quarantined.iter().any(|record| {
+            record.get("change").and_then(serde_json::Value::as_str) == Some("tamper")
+        }),
+        Some("tool_drift" | "tool_poison_flag") => {
+            let tool = event.get("tool").and_then(serde_json::Value::as_str);
+            tool.is_some_and(|tool| {
+                quarantined.iter().any(|record| {
+                    record.get("tool").and_then(serde_json::Value::as_str) == Some(tool)
+                })
+            })
+        }
+        _ => false,
+    }
+}
+
+fn security_alert_copy(events: &[serde_json::Value]) -> (String, String) {
+    let events = security_attention_incidents(events);
+    let title = if events.len() == 1 {
+        "Toolport: security finding".to_string()
+    } else {
+        format!("Toolport: {} security findings", events.len())
+    };
+    let first = events
+        .first()
+        .map(security_event_kind)
+        .unwrap_or("A security finding was recorded");
+    let detail = if events.len() > 1 {
+        let remaining = events.len() - 1;
+        format!(
+            "{first}. {remaining} more {} ready to review.",
+            if remaining == 1 { "is" } else { "are" }
+        )
+    } else {
+        format!("{first}. Review the retained details in Activity.")
+    };
+    (title, detail)
+}
+
+fn newly_observed_security_events(
+    previous: Option<&std::collections::HashSet<String>>,
+    events: &[serde_json::Value],
+    quarantined: &[serde_json::Value],
+) -> (std::collections::HashSet<String>, Vec<serde_json::Value>) {
+    let current = events
+        .iter()
+        .map(security_event_instance_key)
+        .collect::<std::collections::HashSet<_>>();
+    let Some(previous) = previous else {
+        return (current, Vec::new());
+    };
+    let newcomers = events
+        .iter()
+        .filter(|event| !previous.contains(&security_event_instance_key(event)))
+        .filter(|event| security_event_needs_attention(event))
+        .filter(|event| !security_event_covered_by_quarantine(event, quarantined))
+        .cloned()
+        .collect::<Vec<_>>();
+    (current, security_attention_incidents(&newcomers))
+}
+
+fn security_attention_incidents(events: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter(|event| {
+            if event.get("type").and_then(serde_json::Value::as_str) != Some("result_injection") {
+                return true;
+            }
+            let server = event.get("server").and_then(serde_json::Value::as_str);
+            let tool = event.get("tool").and_then(serde_json::Value::as_str);
+            let ts = event
+                .get("ts")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            !events.iter().any(|candidate| {
+                candidate.get("type").and_then(serde_json::Value::as_str)
+                    == Some("result_injection_blocked")
+                    && candidate.get("server").and_then(serde_json::Value::as_str) == server
+                    && candidate.get("tool").and_then(serde_json::Value::as_str) == tool
+                    && (candidate
+                        .get("ts")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0)
+                        - ts)
+                        .abs()
+                        <= 1_000
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn start_security_event_watch(app: &adw::Application, alert: SecurityEventAlert) {
+    let app = app.clone();
+    let seen: std::rc::Rc<std::cell::RefCell<Option<std::collections::HashSet<String>>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let running = std::rc::Rc::new(std::cell::Cell::new(false));
+    let tick = move || {
+        if running.replace(true) {
+            return gtk::glib::ControlFlow::Continue;
+        }
+        let app = app.clone();
+        let alert = alert.clone();
+        let seen = seen.clone();
+        let running = running.clone();
+        gtk::glib::spawn_future_local(async move {
+            let result = gtk::gio::spawn_blocking(|| -> Result<_, String> {
+                Ok((
+                    crate::integrity::read_recent(25)
+                        .map_err(|error| format!("could not read security events: {error}"))?,
+                    crate::integrity::all_quarantined()?,
+                ))
+            })
+            .await;
+            running.set(false);
+            let Ok(Ok((events, quarantined))) = result else {
+                return;
+            };
+            let mut guard = seen.borrow_mut();
+            let (current, newcomers) =
+                newly_observed_security_events(guard.as_ref(), &events, &quarantined);
+            *guard = Some(current);
+            if newcomers.is_empty() {
+                return;
+            }
+            alert.show(&newcomers);
+            if app.active_window().is_some_and(|window| window.is_active()) {
+                return;
+            }
+            let (title, detail) = security_alert_copy(&newcomers);
+            let notification = gtk::gio::Notification::new(&title);
+            notification.set_body(Some(&detail));
+            notification.set_priority(gtk::gio::NotificationPriority::High);
+            notification.set_default_action("app.review-security");
+            app.send_notification(Some("toolport-security-finding"), &notification);
+        });
+        gtk::glib::ControlFlow::Continue
+    };
+    tick();
+    gtk::glib::timeout_add_local(std::time::Duration::from_secs(5), tick);
+}
+
 /// Poll the quarantine store every 15 seconds (matching the shipping app): keep
 /// the sidebar badge current, and send one OS notification per newly blocked
 /// tool batch. The first poll only establishes the baseline so a restart does
 /// not re-announce an already known backlog; the badge still shows it.
-fn start_quarantine_watch(app: &adw::Application, badge: gtk::Label) {
+fn start_quarantine_watch(app: &adw::Application, badge: gtk::Label, alert: QuarantineAlert) {
     let app = app.clone();
     let seen: std::rc::Rc<std::cell::RefCell<Option<std::collections::HashSet<String>>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -751,6 +1192,7 @@ fn start_quarantine_watch(app: &adw::Application, badge: gtk::Label) {
         }
         let app = app.clone();
         let badge = badge.clone();
+        let alert = alert.clone();
         let seen = seen.clone();
         let running = running.clone();
         gtk::glib::spawn_future_local(async move {
@@ -772,6 +1214,7 @@ fn start_quarantine_watch(app: &adw::Application, badge: gtk::Label) {
                 "Blocked tools awaiting re-approval; review them in Settings",
             ));
             badge.set_visible(!list.is_empty());
+            alert.update(&list);
             let keys: std::collections::HashSet<String> = list
                 .iter()
                 .map(crate::integrity::quarantine_entry_key)
@@ -791,6 +1234,7 @@ fn start_quarantine_watch(app: &adw::Application, badge: gtk::Label) {
                         let notification = gtk::gio::Notification::new(&title);
                         notification.set_body(Some(&body));
                         notification.set_priority(gtk::gio::NotificationPriority::High);
+                        notification.set_default_action("app.review-quarantine");
                         app.send_notification(Some("toolport-quarantine"), &notification);
                     }
                     *previous = keys;
@@ -855,6 +1299,7 @@ struct ServerPage {
     enabled_count: gtk::Label,
     profile_count: gtk::Label,
     profile_dropdown: gtk::DropDown,
+    profile_options: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
     add_profile: gtk::Button,
     delete_profile: gtk::Button,
     section_title: gtk::Label,
@@ -864,6 +1309,7 @@ struct ServerPage {
     list: gtk::Box,
     last_snapshot: std::rc::Rc<std::cell::RefCell<Option<state::RegistrySnapshot>>>,
     updating_profile: std::rc::Rc<std::cell::Cell<bool>>,
+    feedback_timer: std::rc::Rc<std::cell::RefCell<Option<gtk::glib::SourceId>>>,
     /// Per-row health widgets for the rows currently on screen, keyed by server
     /// id, so probe results can land on live labels without a re-render.
     health_rows: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, HealthRow>>>,
@@ -879,13 +1325,16 @@ struct ServerPage {
 #[derive(Clone)]
 struct HealthRow {
     label: gtk::Label,
+    /// Prefix the probe result is appended to, so the row keeps saying what
+    /// transport it is once the status lands.
+    transport: String,
     authenticate: gtk::Button,
     copy_error: gtk::Button,
 }
 
 impl ServerPage {
     fn render(&self, state: state::RegistryState) {
-        self.feedback.set_visible(false);
+        self.hide_feedback();
 
         match state {
             state::RegistryState::Ready(snapshot) => {
@@ -936,13 +1385,20 @@ impl ServerPage {
 
     fn render_profiles(&self, snapshot: &state::RegistrySnapshot) {
         self.updating_profile.set(true);
-        let names = snapshot
+        let options = snapshot
             .profiles
             .iter()
-            .map(|profile| profile.name.as_str())
+            .map(|profile| (profile.id.clone(), profile.name.clone()))
             .collect::<Vec<_>>();
-        let model = gtk::StringList::new(&names);
-        self.profile_dropdown.set_model(Some(&model));
+        if *self.profile_options.borrow() != options {
+            let names = options
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>();
+            let model = gtk::StringList::new(&names);
+            self.profile_dropdown.set_model(Some(&model));
+            *self.profile_options.borrow_mut() = options;
+        }
         let selected = snapshot
             .profiles
             .iter()
@@ -1091,8 +1547,9 @@ impl ServerPage {
 
     fn apply_probe(&self, server_id: &str, probe: crate::server_runtime::ProbeResult) {
         if let Some(row) = self.health_rows.borrow().get(server_id) {
-            let (line, class) = probe_status_line(&probe);
-            row.label.set_label(&line);
+            let (status, class) = probe_status_line(&probe);
+            row.label
+                .set_label(&format!("{} · {status}", row.transport));
             row.label.remove_css_class("success");
             row.label.remove_css_class("error");
             row.label.remove_css_class("review");
@@ -1115,6 +1572,7 @@ impl ServerPage {
     }
 
     fn show_feedback(&self, message: &str, error: bool) {
+        self.cancel_feedback_timer();
         self.feedback.set_label(message);
         if error {
             self.feedback.add_css_class("error");
@@ -1124,6 +1582,31 @@ impl ServerPage {
             self.feedback.remove_css_class("error");
         }
         self.feedback.set_visible(true);
+    }
+
+    fn show_confirmation(&self, message: &str) {
+        self.show_feedback(message, false);
+        let feedback = self.feedback.clone();
+        let feedback_timer = self.feedback_timer.clone();
+        let timer =
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(4), move || {
+                feedback.set_visible(false);
+                feedback.set_label("");
+                feedback_timer.borrow_mut().take();
+            });
+        *self.feedback_timer.borrow_mut() = Some(timer);
+    }
+
+    fn hide_feedback(&self) {
+        self.cancel_feedback_timer();
+        self.feedback.set_visible(false);
+        self.feedback.set_label("");
+    }
+
+    fn cancel_feedback_timer(&self) {
+        if let Some(timer) = self.feedback_timer.borrow_mut().take() {
+            timer.remove();
+        }
     }
 
     fn restore_after_error(&self, message: &str) {
@@ -1149,6 +1632,8 @@ struct ClientPage {
     refresh_button: gtk::Button,
     scanning: std::rc::Rc<std::cell::Cell<bool>>,
     profiles: std::rc::Rc<std::cell::RefCell<Vec<state::ProfileView>>>,
+    pending_confirmation: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    feedback_timer: std::rc::Rc<std::cell::RefCell<Option<gtk::glib::SourceId>>>,
 }
 
 impl ClientPage {
@@ -1181,14 +1666,15 @@ impl ClientPage {
             .build();
         let page = gtk::Box::new(gtk::Orientation::Vertical, 14);
         page.add_css_class("toolport-page");
-        page.set_margin_top(28);
-        page.set_margin_bottom(28);
-        page.set_margin_start(28);
-        page.set_margin_end(28);
+        page.set_margin_top(20);
+        page.set_margin_bottom(20);
+        page.set_margin_start(20);
+        page.set_margin_end(20);
         page.append(
             &gtk::Label::builder()
                 .label("Your AI clients, one Toolport gateway")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
+                .xalign(0.0)
                 .wrap(true)
                 .css_classes(["title-2"])
                 .build(),
@@ -1196,7 +1682,7 @@ impl ClientPage {
         page.append(
             &gtk::Label::builder()
                 .label("Toolport reads each supported client's local MCP configuration and shows whether its gateway is connected. This scan never changes client files.")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
                 .css_classes(["toolport-muted"])
@@ -1211,28 +1697,23 @@ impl ClientPage {
         feedback.set_label("Open Clients to scan this machine.");
         page.append(&feedback);
 
-        let summary = gtk::FlowBox::new();
+        let summary = gtk::Grid::new();
         summary.add_css_class("toolport-summary");
         summary.set_column_spacing(10);
-        summary.set_row_spacing(10);
-        summary.set_min_children_per_line(1);
-        summary.set_max_children_per_line(3);
-        summary.set_homogeneous(true);
-        summary.set_selection_mode(gtk::SelectionMode::None);
+        summary.set_column_homogeneous(true);
         let mut values = Vec::new();
-        for (value, label) in [("–", "Installed"), ("–", "Connected"), ("–", "Configured")] {
+        for (column, (value, label)) in
+            [("–", "Installed"), ("–", "Connected"), ("–", "Configured")]
+                .into_iter()
+                .enumerate()
+        {
             let (item, value) = summary_item(value, label);
+            item.set_size_request(0, -1);
+            item.set_hexpand(true);
             values.push(value);
-            summary.insert(&item, -1);
+            summary.attach(&item, column as i32, 0, 1, 1);
         }
         page.append(&summary);
-        page.append(
-            &gtk::Label::builder()
-                .label("Detected clients")
-                .halign(gtk::Align::Start)
-                .css_classes(["heading"])
-                .build(),
-        );
         let list = gtk::Box::new(gtk::Orientation::Vertical, 12);
         page.append(&list);
         scroller.set_child(Some(&page));
@@ -1251,6 +1732,8 @@ impl ClientPage {
             refresh_button,
             scanning: std::rc::Rc::new(std::cell::Cell::new(false)),
             profiles: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            pending_confirmation: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            feedback_timer: std::rc::Rc::new(std::cell::RefCell::new(None)),
         };
         let page_for_refresh = client_page.clone();
         client_page
@@ -1268,8 +1751,7 @@ impl ClientPage {
             return;
         }
         self.import_button.set_sensitive(false);
-        self.feedback
-            .set_label("Looking for servers in client configurations…");
+        self.show_progress("Looking for servers in client configurations…");
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let result =
@@ -1278,14 +1760,15 @@ impl ClientPage {
             page.import_button.set_sensitive(true);
             match result {
                 Ok(Ok(candidates)) if candidates.is_empty() => {
-                    page.feedback
-                        .set_label("No new client-configured servers are available to import.");
-                    page.feedback.remove_css_class("error");
-                    page.feedback.add_css_class("success");
+                    page.show_confirmation(
+                        "No new client-configured servers are available to import.",
+                    );
                 }
                 Ok(Ok(candidates)) => page.show_import_review(candidates),
-                Ok(Err(error)) => page.show_error(&error),
-                Err(_) => page.show_error("the import scan stopped unexpectedly"),
+                Ok(Err(error)) => {
+                    page.show_error(&format!("Could not inspect client configurations: {error}"))
+                }
+                Err(_) => page.show_error("The import scan stopped unexpectedly."),
             }
         });
     }
@@ -1297,23 +1780,53 @@ impl ClientPage {
         let Some(parent) = self.root.root().and_downcast::<gtk::Window>() else {
             return;
         };
-        #[allow(deprecated)]
-        let dialog = adw::MessageDialog::new(
-            Some(&parent),
-            Some("Import servers from clients"),
-            Some("Review the local servers Toolport found. Imported servers start disabled so you can inspect credentials and commands before enabling them."),
-        );
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("import", "Import selected");
-        dialog.set_close_response("cancel");
-        dialog.set_default_response(Some("import"));
-        dialog.set_response_appearance("import", adw::ResponseAppearance::Suggested);
+        let dialog = adw::Window::builder()
+            .application(&self.app)
+            .transient_for(&parent)
+            .modal(true)
+            .title("Import servers from clients")
+            .default_width(680)
+            .default_height(600)
+            .build();
+        dialog.add_css_class("toolport-editor");
 
-        let rows = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let header = adw::HeaderBar::new();
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+        let cancel = gtk::Button::with_label("Cancel");
+        cancel.add_css_class("toolport-secondary-action");
+        header.pack_start(&cancel);
+        let import = gtk::Button::with_label("Import selected");
+        import.add_css_class("suggested-action");
+        header.pack_end(&import);
+        root.append(&header);
+
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        body.add_css_class("toolport-editor-body");
+        body.append(
+            &gtk::Label::builder()
+                .label("Review the local servers Toolport found. Imported servers start disabled so you can inspect credentials and commands before enabling them.")
+                .halign(gtk::Align::Fill)
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["toolport-editor-lede"])
+                .build(),
+        );
+        let candidate_count = candidates.len();
+        let count = gtk::Label::builder()
+            .label(format!("{candidate_count} selected"))
+            .halign(gtk::Align::Start)
+            .css_classes(["toolport-badge", "success"])
+            .build();
+        body.append(&count);
+
+        let rows = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        rows.add_css_class("toolport-import-list");
         let mut selections = Vec::new();
         for candidate in candidates {
             let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-            row.add_css_class("toolport-setting-row");
+            row.add_css_class("toolport-import-row");
             let selected = gtk::CheckButton::builder().active(true).build();
             row.append(&selected);
             let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -1321,7 +1834,7 @@ impl ClientPage {
             copy.append(
                 &gtk::Label::builder()
                     .label(&candidate.name)
-                    .halign(gtk::Align::Start)
+                    .halign(gtk::Align::Fill)
                     .xalign(0.0)
                     .wrap(true)
                     .css_classes(["heading"])
@@ -1342,8 +1855,8 @@ impl ClientPage {
                     .label(format!("{} · {origin}", candidate.transport))
                     .halign(gtk::Align::Start)
                     .xalign(0.0)
-                    .wrap(true)
                     .ellipsize(gtk::pango::EllipsizeMode::Middle)
+                    .tooltip_text(&origin)
                     .css_classes(["toolport-muted"])
                     .build(),
             );
@@ -1354,33 +1867,50 @@ impl ClientPage {
         let scroller = gtk::ScrolledWindow::builder()
             .child(&rows)
             .hscrollbar_policy(gtk::PolicyType::Never)
-            .min_content_height(160)
-            .max_content_height(360)
+            .vexpand(true)
+            .css_classes(["toolport-import-scroller"])
             .build();
-        dialog.set_extra_child(Some(&scroller));
+        body.append(&scroller);
+        root.append(&body);
+        dialog.set_content(Some(&root));
+
         let selections = std::rc::Rc::new(selections);
-        let page = self.clone();
-        dialog.connect_response(None, move |dialog, response| {
-            if response == "import" {
-                let selected = selections
-                    .iter()
-                    .filter(|(check, _)| check.is_active())
-                    .map(|(_, key)| key.clone())
-                    .collect::<Vec<_>>();
-                if selected.is_empty() {
-                    page.feedback.set_label("Nothing selected for import.");
+        let selected_count = std::rc::Rc::new(std::cell::Cell::new(candidate_count));
+        for (check, _) in selections.iter() {
+            let selected_count = selected_count.clone();
+            let count = count.clone();
+            let import = import.clone();
+            check.connect_toggled(move |check| {
+                let next = if check.is_active() {
+                    selected_count.get() + 1
                 } else {
-                    page.run_import(selected);
-                }
-            }
-            dialog.close();
+                    selected_count.get().saturating_sub(1)
+                };
+                selected_count.set(next);
+                count.set_label(&format!("{next} selected"));
+                import.set_sensitive(next > 0);
+            });
+        }
+
+        let dialog_for_cancel = dialog.clone();
+        cancel.connect_clicked(move |_| dialog_for_cancel.close());
+        let page = self.clone();
+        let dialog_for_import = dialog.clone();
+        import.connect_clicked(move |_| {
+            let selected = selections
+                .iter()
+                .filter(|(check, _)| check.is_active())
+                .map(|(_, key)| key.clone())
+                .collect::<Vec<_>>();
+            dialog_for_import.close();
+            page.run_import(selected);
         });
         dialog.present();
     }
 
     fn run_import(&self, selected: Vec<String>) {
         self.import_button.set_sensitive(false);
-        self.feedback.set_label("Importing selected servers…");
+        self.show_progress("Importing selected servers…");
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(move || {
@@ -1390,16 +1920,13 @@ impl ClientPage {
             page.import_button.set_sensitive(true);
             match result {
                 Ok(Ok((_, added))) => {
-                    page.feedback.set_label(&format!(
+                    page.refresh_with_confirmation(format!(
                         "Imported {added} server{}. They remain disabled until reviewed.",
                         if added == 1 { "" } else { "s" }
                     ));
-                    page.feedback.remove_css_class("error");
-                    page.feedback.add_css_class("success");
-                    page.refresh();
                 }
-                Ok(Err(error)) => page.show_error(&error),
-                Err(_) => page.show_error("the import stopped unexpectedly"),
+                Ok(Err(error)) => page.show_error(&format!("Could not import servers: {error}")),
+                Err(_) => page.show_error("The import stopped unexpectedly."),
             }
         });
     }
@@ -1410,10 +1937,7 @@ impl ClientPage {
         }
         self.refresh_button.set_sensitive(false);
         self.import_button.set_sensitive(false);
-        self.feedback
-            .set_label("Scanning local client configurations…");
-        self.feedback.remove_css_class("error");
-        self.feedback.set_visible(true);
+        self.show_progress("Scanning local client configurations…");
         let page = self.clone();
         gtk::glib::spawn_future_local(async move {
             let result = gtk::gio::spawn_blocking(state::detect_client_views).await;
@@ -1422,8 +1946,8 @@ impl ClientPage {
             page.import_button.set_sensitive(true);
             match result {
                 Ok(Ok(snapshot)) => page.render(snapshot),
-                Ok(Err(error)) => page.show_error(&error),
-                Err(_) => page.show_error("the client scan stopped unexpectedly"),
+                Ok(Err(error)) => page.show_error(&format!("Could not scan clients: {error}")),
+                Err(_) => page.show_error("The client scan stopped unexpectedly."),
             }
         });
     }
@@ -1438,18 +1962,27 @@ impl ClientPage {
             .iter()
             .filter(|client| client.app_present || client.config_exists)
             .collect::<Vec<_>>();
-        let connected = clients
+        let connected_clients = installed
             .iter()
             .filter(|client| client.gateway_state == state::ClientGatewayState::Connected)
-            .count();
+            .copied()
+            .collect::<Vec<_>>();
+        let available_clients = installed
+            .iter()
+            .filter(|client| client.gateway_state != state::ClientGatewayState::Connected)
+            .copied()
+            .collect::<Vec<_>>();
         let configured = clients.iter().filter(|client| client.config_exists).count();
         self.installed_count.set_label(&installed.len().to_string());
-        self.connected_count.set_label(&connected.to_string());
+        self.connected_count
+            .set_label(&connected_clients.len().to_string());
         self.configured_count.set_label(&configured.to_string());
-        self.feedback
-            .set_label(&format!("Scanned {} supported clients", clients.len()));
-        self.feedback.remove_css_class("error");
-        self.feedback.add_css_class("success");
+        let confirmation = self
+            .pending_confirmation
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| format!("Scanned {} supported clients", clients.len()));
+        self.show_confirmation(&confirmation);
 
         let absent = clients
             .iter()
@@ -1463,7 +1996,22 @@ impl ClientPage {
                 false,
             ));
         }
-        for client in &installed {
+        if !available_clients.is_empty() {
+            self.list.append(&client_section_title(
+                "Available to connect",
+                available_clients.len(),
+            ));
+        }
+        for client in available_clients {
+            self.list.append(&client_card(client, self.clone()));
+        }
+        if !connected_clients.is_empty() {
+            self.list.append(&client_section_title(
+                "Connected to Toolport",
+                connected_clients.len(),
+            ));
+        }
+        for client in connected_clients {
             self.list.append(&client_card(client, self.clone()));
         }
         // Supported-but-absent clients: collapsed so they don't crowd the real
@@ -1499,18 +2047,114 @@ impl ClientPage {
     }
 
     fn show_error(&self, error: &str) {
-        self.feedback
-            .set_label(&format!("Could not scan clients: {error}"));
+        self.pending_confirmation.borrow_mut().take();
+        self.cancel_feedback_timer();
+        self.feedback.set_label(error);
         self.feedback.remove_css_class("success");
         self.feedback.add_css_class("error");
+        self.feedback.set_visible(true);
     }
+
+    fn show_progress(&self, message: &str) {
+        self.cancel_feedback_timer();
+        self.feedback.set_label(message);
+        self.feedback.remove_css_class("error");
+        self.feedback.remove_css_class("success");
+        self.feedback.set_visible(true);
+    }
+
+    fn show_confirmation(&self, message: &str) {
+        self.cancel_feedback_timer();
+        self.feedback.set_label(message);
+        self.feedback.remove_css_class("error");
+        self.feedback.add_css_class("success");
+        self.feedback.set_visible(true);
+        let feedback = self.feedback.clone();
+        let feedback_timer = self.feedback_timer.clone();
+        let timer =
+            gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(4), move || {
+                feedback.set_visible(false);
+                feedback.set_label("");
+                feedback_timer.borrow_mut().take();
+            });
+        *self.feedback_timer.borrow_mut() = Some(timer);
+    }
+
+    fn refresh_with_confirmation(&self, message: String) {
+        *self.pending_confirmation.borrow_mut() = Some(message);
+        self.refresh();
+    }
+
+    fn cancel_feedback_timer(&self) {
+        if let Some(timer) = self.feedback_timer.borrow_mut().take() {
+            timer.remove();
+        }
+    }
+}
+
+fn client_section_title(title: &str, count: usize) -> gtk::Box {
+    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    heading.set_margin_top(6);
+    heading.append(
+        &gtk::Label::builder()
+            .label(title)
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .css_classes(["heading"])
+            .build(),
+    );
+    let count = gtk::Label::new(Some(&count.to_string()));
+    count.add_css_class("toolport-badge");
+    heading.append(&count);
+    heading
+}
+
+fn toolport_menu_popover() -> gtk::Popover {
+    let popover = gtk::Popover::new();
+    popover.add_css_class("toolport-menu");
+    popover
+}
+
+fn toolport_menu_button(label: &str) -> gtk::Button {
+    let label = gtk::Label::builder()
+        .label(label)
+        .halign(gtk::Align::Start)
+        .xalign(0.0)
+        .build();
+    gtk::Button::builder()
+        .child(&label)
+        .css_classes(["flat", "toolport-menu-item"])
+        .build()
+}
+
+fn toolport_menu_choice_button(label: &str, selected: bool) -> gtk::Button {
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    content.append(
+        &gtk::Label::builder()
+            .label(label)
+            .halign(gtk::Align::Start)
+            .xalign(0.0)
+            .hexpand(true)
+            .build(),
+    );
+    if selected {
+        content.append(
+            &gtk::Image::builder()
+                .icon_name("object-select-symbolic")
+                .css_classes(["toolport-menu-check"])
+                .build(),
+        );
+    }
+    gtk::Button::builder()
+        .child(&content)
+        .css_classes(["flat", "toolport-menu-item"])
+        .build()
 }
 
 fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     card.add_css_class("toolport-card");
-    let icon = gtk::Image::from_icon_name("computer-symbolic");
-    icon.add_css_class("toolport-card-icon");
+    let icon = branding::client_logo(&client.id);
     card.append(&icon);
     let copy = gtk::Box::new(gtk::Orientation::Vertical, 3);
     copy.set_hexpand(true);
@@ -1524,7 +2168,22 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
     let detail = if client.config_error {
         "Configuration could not be read safely".to_string()
     } else if client.uses_connectors {
-        "Uses account connectors".to_string()
+        let mut detail = "Toolport gateway".to_string();
+        if client.gateway_state == state::ClientGatewayState::Connected {
+            detail.push_str(if client.shared_http {
+                " · Shared HTTP"
+            } else {
+                " · stdio"
+            });
+            detail.push_str(
+                &client
+                    .scope_name
+                    .as_deref()
+                    .map(|scope| format!(" · only {scope}"))
+                    .unwrap_or_else(|| " · follows active profile".to_string()),
+            );
+        }
+        detail
     } else {
         let mut detail = format!(
             "{} local MCP {}",
@@ -1557,7 +2216,7 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
     copy.append(
         &gtk::Label::builder()
             .label(detail)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -1565,86 +2224,88 @@ fn client_card(client: &state::ClientView, page: ClientPage) -> gtk::Box {
             .build(),
     );
     card.append(&copy);
-    let (status, class) = match client.gateway_state {
-        state::ClientGatewayState::Connected => ("Connected", "success"),
-        state::ClientGatewayState::Customized => ("Customized", "review"),
-        state::ClientGatewayState::Disconnected => ("Not connected", "disabled"),
-    };
-    let badge = gtk::Label::new(Some(status));
-    badge.add_css_class("toolport-badge");
-    badge.add_css_class(class);
-    badge.set_tooltip_text(Some(&format!("Client id: {}", client.id)));
-    card.append(&badge);
-    if !client.uses_connectors {
-        if client.movable_server_count > 0 && !client.config_error {
-            let migrate =
-                gtk::Button::with_label(&format!("Move in {}", client.movable_server_count));
-            migrate.add_css_class("toolport-secondary-action");
-            migrate.set_tooltip_text(Some(&format!(
-                "Import the {} {} this client manages directly, then rewrite its config to use only the Toolport gateway",
-                client.movable_server_count,
-                if client.movable_server_count == 1 {
-                    "server"
-                } else {
-                    "servers"
-                }
-            )));
-            let client_for_migrate = client.clone();
-            let page_for_migrate = page.clone();
-            migrate.connect_clicked(move |button| {
-                confirm_client_migrate(
-                    &client_for_migrate,
-                    button.clone(),
-                    page_for_migrate.clone(),
+    if client.gateway_state != state::ClientGatewayState::Connected {
+        let (status, class) = match client.gateway_state {
+            state::ClientGatewayState::Customized => ("Customized", "review"),
+            state::ClientGatewayState::Disconnected => ("Not connected", "disabled"),
+            state::ClientGatewayState::Connected => unreachable!(),
+        };
+        let badge = gtk::Label::new(Some(status));
+        badge.add_css_class("toolport-badge");
+        badge.add_css_class(class);
+        badge.set_tooltip_text(Some(&format!("Client id: {}", client.id)));
+        card.append(&badge);
+    }
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    actions.set_valign(gtk::Align::Center);
+    if !client.uses_connectors
+        && client.movable_server_count > 0
+        && !client.config_error
+        && client.gateway_state != state::ClientGatewayState::Connected
+    {
+        let migrate = gtk::Button::with_label(&format!("Move in {}", client.movable_server_count));
+        migrate.add_css_class("toolport-secondary-action");
+        migrate.set_tooltip_text(Some(&format!(
+            "Import the {} {} this client manages directly, then rewrite its config to use only the Toolport gateway",
+            client.movable_server_count,
+            if client.movable_server_count == 1 {
+                "server"
+            } else {
+                "servers"
+            }
+        )));
+        let client_for_migrate = client.clone();
+        let page_for_migrate = page.clone();
+        migrate.connect_clicked(move |button| {
+            confirm_client_migrate(
+                &client_for_migrate,
+                button.clone(),
+                page_for_migrate.clone(),
+            );
+        });
+        actions.append(&migrate);
+    }
+    match client.gateway_state {
+        state::ClientGatewayState::Disconnected => {
+            let connect = gtk::Button::with_label("Connect");
+            connect.add_css_class("suggested-action");
+            let client_for_connect = client.clone();
+            let page_for_connect = page.clone();
+            connect.connect_clicked(move |button| {
+                run_client_mutation(
+                    &client_for_connect,
+                    true,
+                    false,
+                    false,
+                    None,
+                    button,
+                    page_for_connect.clone(),
                 );
             });
-            card.append(&migrate);
+            actions.append(&connect);
+            actions.append(&shared_http_menu(client.clone(), false, page));
         }
-        match client.gateway_state {
-            state::ClientGatewayState::Disconnected => {
-                let connect = gtk::Button::with_label("Connect");
-                connect.add_css_class("suggested-action");
-                let client_for_connect = client.clone();
-                let page_for_connect = page.clone();
-                connect.connect_clicked(move |button| {
-                    run_client_mutation(
-                        &client_for_connect,
-                        true,
-                        false,
-                        false,
-                        None,
-                        button,
-                        page_for_connect.clone(),
-                    );
-                });
-                card.append(&connect);
-                card.append(&shared_http_menu(client.clone(), false, page));
-            }
-            state::ClientGatewayState::Customized => {
-                let reset = gtk::Button::with_label("Reset");
-                reset.add_css_class("toolport-secondary-action");
-                let client_for_reset = client.clone();
-                let page_for_reset = page.clone();
-                reset.connect_clicked(move |button| {
-                    confirm_client_reset(&client_for_reset, button.clone(), page_for_reset.clone());
-                });
-                card.append(&reset);
-                card.append(&shared_http_menu(client.clone(), true, page));
-            }
-            state::ClientGatewayState::Connected => {
-                if page.profiles.borrow().len() > 1 {
-                    card.append(&client_scope_menu(client.clone(), page.clone()));
-                }
-                card.append(&client_discovery_menu(client.clone(), page.clone()));
-                let disconnect = gtk::Button::with_label("Disconnect");
-                disconnect.add_css_class("toolport-secondary-action");
-                let client = client.clone();
-                disconnect.connect_clicked(move |button| {
-                    confirm_client_disconnect(&client, button.clone(), page.clone());
-                });
-                card.append(&disconnect);
-            }
+        state::ClientGatewayState::Customized => {
+            let reset = gtk::Button::with_label("Reset");
+            reset.add_css_class("toolport-secondary-action");
+            let client_for_reset = client.clone();
+            let page_for_reset = page.clone();
+            reset.connect_clicked(move |button| {
+                confirm_client_reset(&client_for_reset, button.clone(), page_for_reset.clone());
+            });
+            actions.append(&reset);
+            actions.append(&shared_http_menu(client.clone(), true, page));
         }
+        state::ClientGatewayState::Connected => {
+            if page.profiles.borrow().len() > 1 {
+                actions.append(&client_scope_menu(client.clone(), page.clone()));
+            }
+            actions.append(&connected_client_actions_menu(client.clone(), page));
+        }
+    }
+    if actions.first_child().is_some() {
+        card.append(&actions);
     }
     card
 }
@@ -1694,9 +2355,7 @@ fn confirm_client_migrate(client: &state::ClientView, button: gtk::Button, page:
     dialog.connect_response(None, move |dialog, response| {
         if response == "migrate" {
             button.set_sensitive(false);
-            page.feedback.set_label("Moving servers into Toolport…");
-            page.feedback.remove_css_class("error");
-            page.feedback.set_visible(true);
+            page.show_progress("Moving servers into Toolport…");
             let client_id = client.id.clone();
             let client_name = client.name.clone();
             let scope = client.scope_id.clone();
@@ -1729,8 +2388,7 @@ fn confirm_client_migrate(client: &state::ClientView, button: gtk::Button, page:
                 button.set_sensitive(true);
                 match result {
                     Ok(Ok(outcome)) => {
-                        page.refresh();
-                        page.feedback.set_label(&migrate_feedback(
+                        page.refresh_with_confirmation(migrate_feedback(
                             &client_name,
                             outcome.imported,
                             outcome.moved.len(),
@@ -1747,41 +2405,23 @@ fn confirm_client_migrate(client: &state::ClientView, button: gtk::Button, page:
     dialog.present();
 }
 
-fn client_discovery_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuButton {
-    let label = match client.discovery_mode.as_deref() {
-        Some("full") => "Full catalog",
-        Some("lazy") => "Lazy discovery",
-        Some("grouped") => "Grouped discovery",
-        _ => "Inherit discovery",
-    };
-    let menu = gtk::MenuButton::builder()
-        .icon_name("system-search-symbolic")
-        .tooltip_text(format!("{label} for {}", client.name))
-        .build();
-    menu.add_css_class("flat");
-    let popover = gtk::Popover::new();
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    content.set_margin_top(6);
-    content.set_margin_bottom(6);
-    content.set_margin_start(6);
-    content.set_margin_end(6);
-    // Advisory only, mirroring the shipping picker: local-model desktop apps do
-    // better browsing one server at a time; everyone else handles lazy's
-    // search-then-call chain and saves the most tokens.
-    let recommended = if matches!(client.id.as_str(), "lm-studio" | "jan" | "anythingllm") {
-        (
-            "grouped",
-            "Recommended: local models do better browsing one server at a time",
-        )
-    } else {
-        (
-            "lazy",
-            "Recommended: this client handles the search-then-call step and saves the most tokens",
-        )
-    };
+fn append_client_discovery_actions(
+    content: &gtk::Box,
+    client: &state::ClientView,
+    page: &ClientPage,
+    menu: &gtk::MenuButton,
+) {
+    content.append(
+        &gtk::Label::builder()
+            .label("Discovery")
+            .halign(gtk::Align::Start)
+            .xalign(0.0)
+            .css_classes(["toolport-menu-heading"])
+            .build(),
+    );
     for (label, mode, hint) in [
         (
-            "Inherit global discovery",
+            "Use global setting",
             None,
             "Follow the global discovery setting",
         ),
@@ -1801,27 +2441,16 @@ fn client_discovery_menu(client: state::ClientView, page: ClientPage) -> gtk::Me
             "One help tool per server; the client expands a server before calling it.",
         ),
     ] {
-        let button = gtk::Button::with_label(
-            if mode == Some(recommended.0) {
-                format!("{label} (recommended)")
-            } else {
-                label.to_string()
-            }
-            .as_str(),
-        );
-        button.add_css_class("flat");
-        button.set_tooltip_text(Some(if mode == Some(recommended.0) {
-            recommended.1
-        } else {
-            hint
-        }));
+        let selected = client.discovery_mode.as_deref() == mode;
+        let button = toolport_menu_choice_button(label, selected);
+        button.set_tooltip_text(Some(hint));
         let client_id = client.id.clone();
         let client_name = client.name.clone();
         let page = page.clone();
         let menu = menu.clone();
         button.connect_clicked(move |_| {
             menu.popdown();
-            page.feedback.set_label("Updating client discovery…");
+            page.show_progress("Updating client discovery…");
             let client_id = client_id.clone();
             let client_name = client_name.clone();
             let page = page.clone();
@@ -1832,9 +2461,9 @@ fn client_discovery_menu(client: state::ClientView, page: ClientPage) -> gtk::Me
                 .await;
                 match result {
                     Ok(Ok(_)) => {
-                        page.refresh();
-                        page.feedback
-                            .set_label(&format!("Updated discovery for {client_name}."));
+                        page.refresh_with_confirmation(format!(
+                            "Updated discovery for {client_name}."
+                        ));
                     }
                     Ok(Err(error)) => page.show_error(&error),
                     Err(_) => page.show_error("the discovery update stopped unexpectedly"),
@@ -1843,6 +2472,53 @@ fn client_discovery_menu(client: state::ClientView, page: ClientPage) -> gtk::Me
         });
         content.append(&button);
     }
+}
+
+fn connected_client_actions_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuButton {
+    let menu = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text(format!("Actions for {}", client.name))
+        .css_classes(["flat"])
+        .build();
+    let popover = toolport_menu_popover();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    content.set_margin_top(6);
+    content.set_margin_bottom(6);
+    content.set_margin_start(6);
+    content.set_margin_end(6);
+
+    if client.movable_server_count > 0 && !client.config_error {
+        let count = client.movable_server_count;
+        let migrate = toolport_menu_button(&format!(
+            "Move {count} {} into Toolport",
+            if count == 1 { "server" } else { "servers" }
+        ));
+        let client_for_migrate = client.clone();
+        let page_for_migrate = page.clone();
+        let menu_for_migrate = menu.clone();
+        migrate.connect_clicked(move |button| {
+            menu_for_migrate.popdown();
+            confirm_client_migrate(
+                &client_for_migrate,
+                button.clone(),
+                page_for_migrate.clone(),
+            );
+        });
+        content.append(&migrate);
+        content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    }
+
+    append_client_discovery_actions(&content, &client, &page, &menu);
+    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+    let disconnect = toolport_menu_button("Disconnect from Toolport");
+    disconnect.add_css_class("destructive-action");
+    let menu_for_disconnect = menu.clone();
+    disconnect.connect_clicked(move |button| {
+        menu_for_disconnect.popdown();
+        confirm_client_disconnect(&client, button.clone(), page.clone());
+    });
+    content.append(&disconnect);
     popover.set_child(Some(&content));
     menu.set_popover(Some(&popover));
     menu
@@ -1854,18 +2530,17 @@ fn shared_http_menu(client: state::ClientView, force: bool, page: ClientPage) ->
         .tooltip_text("Connection options")
         .build();
     menu.add_css_class("flat");
-    let popover = gtk::Popover::new();
+    let popover = toolport_menu_popover();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
     content.set_margin_top(6);
     content.set_margin_bottom(6);
     content.set_margin_start(6);
     content.set_margin_end(6);
-    let shared = gtk::Button::with_label(if force {
+    let shared = toolport_menu_button(if force {
         "Reset with Shared HTTP"
     } else {
         "Connect with Shared HTTP"
     });
-    shared.add_css_class("flat");
     let menu_for_click = menu.clone();
     shared.connect_clicked(move |button| {
         menu_for_click.popdown();
@@ -1892,15 +2567,14 @@ fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuBu
         .tooltip_text("Choose which profile this client can use")
         .build();
     menu.add_css_class("toolport-secondary-action");
-    let popover = gtk::Popover::new();
+    let popover = toolport_menu_popover();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
     content.set_margin_top(6);
     content.set_margin_bottom(6);
     content.set_margin_start(6);
     content.set_margin_end(6);
 
-    let active = gtk::Button::with_label("Follow active profile");
-    active.add_css_class("flat");
+    let active = toolport_menu_button("Follow active profile");
     let client_for_active = client.clone();
     let page_for_active = page.clone();
     let menu_for_active = menu.clone();
@@ -1918,8 +2592,7 @@ fn client_scope_menu(client: state::ClientView, page: ClientPage) -> gtk::MenuBu
     });
     content.append(&active);
     for profile in page.profiles.borrow().iter().cloned() {
-        let button = gtk::Button::with_label(&format!("Only {}", profile.name));
-        button.add_css_class("flat");
+        let button = toolport_menu_button(&format!("Only {}", profile.name));
         let client = client.clone();
         let page = page.clone();
         let menu = menu.clone();
@@ -2027,13 +2700,11 @@ fn run_client_mutation(
     page: ClientPage,
 ) {
     button.set_sensitive(false);
-    page.feedback.set_label(if connect {
+    page.show_progress(if connect {
         "Connecting client…"
     } else {
         "Disconnecting client…"
     });
-    page.feedback.remove_css_class("error");
-    page.feedback.set_visible(true);
     let client_id = client.id.clone();
     let client_name = client.name.clone();
     let bridge = page.bridge.clone();
@@ -2067,16 +2738,15 @@ fn run_client_mutation(
         button.set_sensitive(true);
         match result {
             Ok(Ok(_)) => {
-                page.refresh();
                 // The config write is not live until the client restarts; saying
                 // only "Connected" would misstate what the running client does.
-                page.feedback.set_label(&if connect {
+                page.refresh_with_confirmation(if connect {
                     format!(
-                        "Connected {client_name}. Not live yet: restart {client_name} so it picks up the Toolport gateway."
+                        "Connected {client_name} to Toolport. Restart {client_name} to apply it."
                     )
                 } else {
                     format!(
-                        "Disconnected {client_name}. It stays connected to the running gateway until it restarts."
+                        "Disconnected {client_name} from Toolport. Restart {client_name} to apply it."
                     )
                 });
             }
@@ -2086,12 +2756,21 @@ fn run_client_mutation(
     });
 }
 
+const RECENT_CALL_PREVIEW_LIMIT: usize = 10;
+
 #[derive(Clone)]
 struct ActivityPage {
     app: adw::Application,
     root: gtk::Box,
+    scroller: gtk::ScrolledWindow,
     list: gtk::Box,
+    security_status: gtk::Button,
+    security_status_icon: gtk::Image,
+    security_status_title: gtk::Label,
+    security_status_detail: gtk::Label,
     security_list: gtk::Box,
+    security_expander: gtk::Expander,
+    diagnostics_expander: gtk::Expander,
     stats_list: gtk::Box,
     identity_list: gtk::Box,
     search_list: gtk::Box,
@@ -2109,8 +2788,11 @@ struct ActivityPage {
     /// and so filter changes re-render without another disk read.
     last_snapshot: std::rc::Rc<std::cell::RefCell<Option<state::ActivitySnapshot>>>,
     filter_server: gtk::DropDown,
+    filter_server_options: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
     errors_only: gtk::ToggleButton,
     filter_count: gtk::Label,
+    show_more_calls: gtk::Button,
+    show_all_recent: std::rc::Rc<std::cell::Cell<bool>>,
     identity_search: gtk::SearchEntry,
     updating_filters: std::rc::Rc<std::cell::Cell<bool>>,
     savings_banner: gtk::Box,
@@ -2118,8 +2800,12 @@ struct ActivityPage {
     savings_dollars: gtk::Label,
     savings_model: gtk::DropDown,
     savings_detail: gtk::Label,
-    /// Dismissed security-finding identities (`integrity::security_key`),
-    /// insertion-ordered and persisted so a dismissal survives restarts.
+    expanded_stat_servers: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    server_stat_order: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    expanded_activity_rows: ActivityExpansionState,
+    /// Persisted security review markers. Routine drift uses a durable identity;
+    /// high-severity findings record the newest reviewed timestamp so a later
+    /// recurrence becomes visible again.
     security_dismissed: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
 }
 
@@ -2149,17 +2835,15 @@ impl ActivityPage {
             .icon_name("document-save-symbolic")
             .tooltip_text("Export activity")
             .build();
-        let export_menu = gtk::Popover::new();
+        let export_menu = toolport_menu_popover();
         let export_actions = gtk::Box::new(gtk::Orientation::Vertical, 4);
         export_actions.set_margin_top(6);
         export_actions.set_margin_bottom(6);
         export_actions.set_margin_start(6);
         export_actions.set_margin_end(6);
-        let export_json = gtk::Button::with_label("Export JSON");
-        export_json.add_css_class("flat");
+        let export_json = toolport_menu_button("Export JSON");
         export_actions.append(&export_json);
-        let export_csv = gtk::Button::with_label("Export CSV");
-        export_csv.add_css_class("flat");
+        let export_csv = toolport_menu_button("Export CSV");
         export_actions.append(&export_csv);
         export_menu.set_child(Some(&export_actions));
         export_button.set_popover(Some(&export_menu));
@@ -2174,22 +2858,23 @@ impl ActivityPage {
             .build();
         let page = gtk::Box::new(gtk::Orientation::Vertical, 14);
         page.add_css_class("toolport-page");
-        page.set_margin_top(28);
-        page.set_margin_bottom(28);
-        page.set_margin_start(28);
-        page.set_margin_end(28);
+        page.set_margin_top(20);
+        page.set_margin_bottom(20);
+        page.set_margin_start(20);
+        page.set_margin_end(20);
         page.append(
             &gtk::Label::builder()
                 .label("Every routed tool call, visible locally")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
+                .xalign(0.0)
                 .wrap(true)
                 .css_classes(["title-2"])
                 .build(),
         );
         page.append(
             &gtk::Label::builder()
-                .label("Toolport records outcomes and timing, never tool arguments or result data. The most recent 100 calls are shown below.")
-                .halign(gtk::Align::Start)
+                .label("Toolport records outcomes and timing, never tool arguments or result data. The latest 10 calls are shown first; up to 100 remain available.")
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
                 .css_classes(["toolport-muted"])
@@ -2225,28 +2910,88 @@ impl ActivityPage {
         }
         page.append(&summary);
 
+        let security_status = gtk::Button::new();
+        security_status.add_css_class("toolport-security-status");
+        security_status.set_tooltip_text(Some("Review retained security findings"));
+        let security_status_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let security_status_icon = gtk::Image::from_icon_name("security-high-symbolic");
+        security_status_icon.add_css_class("toolport-security-status-icon");
+        security_status_row.append(&security_status_icon);
+        let security_status_copy = gtk::Box::new(gtk::Orientation::Vertical, 1);
+        security_status_copy.set_hexpand(true);
+        let security_status_title = gtk::Label::builder()
+            .label("Protection active")
+            .halign(gtk::Align::Start)
+            .xalign(0.0)
+            .css_classes(["heading"])
+            .build();
+        security_status_copy.append(&security_status_title);
+        let security_status_detail = gtk::Label::builder()
+            .label("No important findings need review.")
+            .halign(gtk::Align::Start)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["toolport-muted", "caption"])
+            .build();
+        security_status_copy.append(&security_status_detail);
+        security_status_row.append(&security_status_copy);
+        security_status_row.append(&gtk::Image::from_icon_name("go-next-symbolic"));
+        security_status.set_child(Some(&security_status_row));
+        page.append(&security_status);
+
+        let performance = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        performance.set_margin_top(10);
         let savings_banner = gtk::Box::new(gtk::Orientation::Vertical, 6);
         savings_banner.add_css_class("toolport-card");
         savings_banner.set_visible(false);
-        savings_banner.append(
+        let savings_header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        savings_header.append(
             &gtk::Label::builder()
-                .label("Tool definitions lazy discovery keeps out of context")
+                .label("Context savings")
                 .halign(gtk::Align::Start)
+                .hexpand(true)
                 .css_classes(["heading"])
                 .build(),
         );
+        let savings_share = gtk::Button::with_label("Share");
+        savings_share.add_css_class("toolport-secondary-action");
+        savings_share.set_valign(gtk::Align::Center);
+        savings_share.set_tooltip_text(Some("Copy a shareable savings line to the clipboard"));
+        savings_header.append(&savings_share);
+        savings_banner.append(&savings_header);
         let savings_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let savings_value = gtk::Label::builder()
             .halign(gtk::Align::Start)
             .css_classes(["title-2"])
             .build();
         savings_row.append(&savings_value);
+        savings_row.append(
+            &gtk::Label::builder()
+                .label("tool-definition tokens kept out of agent context")
+                .halign(gtk::Align::Fill)
+                .xalign(0.0)
+                .valign(gtk::Align::End)
+                .wrap(true)
+                .css_classes(["toolport-muted"])
+                .build(),
+        );
+        savings_banner.append(&savings_row);
+        let estimate_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        estimate_row.append(
+            &gtk::Label::builder()
+                .label("Estimated input cost")
+                .halign(gtk::Align::Start)
+                .valign(gtk::Align::Center)
+                .css_classes(["toolport-muted", "caption"])
+                .build(),
+        );
         let savings_dollars = gtk::Label::builder()
             .halign(gtk::Align::Start)
-            .valign(gtk::Align::End)
-            .css_classes(["toolport-muted"])
+            .valign(gtk::Align::Center)
+            .hexpand(true)
+            .css_classes(["heading"])
             .build();
-        savings_row.append(&savings_dollars);
+        estimate_row.append(&savings_dollars);
         let savings_model = gtk::DropDown::from_strings(
             &SAVINGS_MODELS
                 .iter()
@@ -2255,32 +3000,28 @@ impl ActivityPage {
         );
         savings_model.set_selected(1); // Claude Sonnet, the shipping default.
         savings_model.add_css_class("toolport-input");
+        savings_model.add_css_class("toolport-compact-select");
         savings_model.set_valign(gtk::Align::Center);
-        savings_row.append(&savings_model);
-        let savings_share = gtk::Button::with_label("Share");
-        savings_share.add_css_class("toolport-secondary-action");
-        savings_share.set_valign(gtk::Align::Center);
-        savings_share.set_tooltip_text(Some("Copy a shareable savings line to the clipboard"));
-        savings_row.append(&savings_share);
-        savings_banner.append(&savings_row);
+        estimate_row.append(&savings_model);
+        savings_banner.append(&estimate_row);
         let savings_detail = gtk::Label::builder()
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["toolport-muted", "caption"])
             .build();
         savings_banner.append(&savings_detail);
-        page.append(&savings_banner);
+        performance.append(&savings_banner);
 
-        page.append(
+        performance.append(
             &gtk::Label::builder()
-                .label("Per-server breakdown")
+                .label("Per-server performance")
                 .halign(gtk::Align::Start)
                 .css_classes(["heading"])
                 .build(),
         );
         let stats_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        page.append(&stats_list);
+        performance.append(&stats_list);
         page.append(
             &gtk::Label::builder()
                 .label("Recent calls")
@@ -2291,10 +3032,14 @@ impl ActivityPage {
         let filter_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let filter_server = gtk::DropDown::from_strings(&["All servers"]);
         filter_server.add_css_class("toolport-input");
+        filter_server.add_css_class("toolport-activity-filter");
+        filter_server.set_valign(gtk::Align::Center);
         filter_server.set_tooltip_text(Some("Show calls from one server"));
         filter_row.append(&filter_server);
         let errors_only = gtk::ToggleButton::with_label("Errors only");
         errors_only.add_css_class("toolport-secondary-action");
+        errors_only.add_css_class("toolport-activity-filter");
+        errors_only.set_valign(gtk::Align::Center);
         filter_row.append(&errors_only);
         let filter_count = gtk::Label::builder()
             .halign(gtk::Align::End)
@@ -2305,16 +3050,49 @@ impl ActivityPage {
         page.append(&filter_row);
         let list = gtk::Box::new(gtk::Orientation::Vertical, 10);
         page.append(&list);
-        page.append(
+        let show_more_calls = gtk::Button::with_label("Show more calls");
+        show_more_calls.add_css_class("toolport-secondary-action");
+        show_more_calls.set_halign(gtk::Align::Center);
+        show_more_calls.set_visible(false);
+        page.append(&show_more_calls);
+
+        let performance_expander = gtk::Expander::new(Some("Performance and savings"));
+        performance_expander.add_css_class("toolport-details-expander");
+        performance_expander.set_child(Some(&performance));
+        page.append(&performance_expander);
+
+        let diagnostics = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        diagnostics.set_margin_top(10);
+        diagnostics.append(
             &gtk::Label::builder()
-                .label("Security events")
-                .halign(gtk::Align::Start)
-                .css_classes(["heading"])
+                .label("Review protection history or inspect the gateway's technical records.")
+                .halign(gtk::Align::Fill)
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["toolport-muted"])
+                .build(),
+        );
+        let security = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        security.set_margin_top(8);
+        security.append(
+            &gtk::Label::builder()
+                .label("These are retained findings, not necessarily active blocks. Review active quarantines in Settings.")
+                .halign(gtk::Align::Fill)
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["toolport-muted", "caption"])
                 .build(),
         );
         let security_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        page.append(&security_list);
-        page.append(
+        security.append(&security_list);
+        let security_expander = gtk::Expander::new(Some("Protection history"));
+        security_expander.add_css_class("toolport-card");
+        security_expander.set_child(Some(&security));
+        diagnostics.append(&security_expander);
+
+        let technical = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        technical.set_margin_top(8);
+        technical.append(
             &gtk::Label::builder()
                 .label("Tool identities")
                 .halign(gtk::Align::Start)
@@ -2325,10 +3103,10 @@ impl ActivityPage {
             .placeholder_text("Filter tools or servers")
             .css_classes(["toolport-search"])
             .build();
-        page.append(&identity_search);
+        technical.append(&identity_search);
         let identity_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        page.append(&identity_list);
-        page.append(
+        technical.append(&identity_list);
+        technical.append(
             &gtk::Label::builder()
                 .label("Discovery traces")
                 .halign(gtk::Align::Start)
@@ -2336,8 +3114,8 @@ impl ActivityPage {
                 .build(),
         );
         let search_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        page.append(&search_list);
-        page.append(
+        technical.append(&search_list);
+        technical.append(
             &gtk::Label::builder()
                 .label("Live inspector")
                 .halign(gtk::Align::Start)
@@ -2345,16 +3123,31 @@ impl ActivityPage {
                 .build(),
         );
         let inspect_list = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        page.append(&inspect_list);
+        technical.append(&inspect_list);
+        let technical_expander = gtk::Expander::new(Some("Technical records"));
+        technical_expander.add_css_class("toolport-card");
+        technical_expander.set_child(Some(&technical));
+        diagnostics.append(&technical_expander);
+        let diagnostics_expander = gtk::Expander::new(Some("Security and diagnostics"));
+        diagnostics_expander.add_css_class("toolport-details-expander");
+        diagnostics_expander.set_child(Some(&diagnostics));
+        page.append(&diagnostics_expander);
         scroller.set_child(Some(&page));
         root.append(&scroller);
 
         let activity_page = Self {
             app: app.clone(),
             root,
+            scroller,
             list,
+            security_status,
+            security_status_icon,
+            security_status_title,
+            security_status_detail,
             stats_list,
             security_list,
+            security_expander,
+            diagnostics_expander,
             identity_list,
             search_list,
             inspect_list,
@@ -2368,8 +3161,13 @@ impl ActivityPage {
             loading: std::rc::Rc::new(std::cell::Cell::new(false)),
             last_snapshot: std::rc::Rc::new(std::cell::RefCell::new(None)),
             filter_server,
+            filter_server_options: std::rc::Rc::new(std::cell::RefCell::new(vec![
+                "All servers".to_string()
+            ])),
             errors_only,
             filter_count,
+            show_more_calls,
+            show_all_recent: std::rc::Rc::new(std::cell::Cell::new(false)),
             identity_search,
             updating_filters: std::rc::Rc::new(std::cell::Cell::new(false)),
             savings_banner,
@@ -2377,6 +3175,13 @@ impl ActivityPage {
             savings_dollars,
             savings_model,
             savings_detail,
+            expanded_stat_servers: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashSet::new(),
+            )),
+            server_stat_order: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            expanded_activity_rows: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashSet::new(),
+            )),
             security_dismissed: std::rc::Rc::new(
                 std::cell::RefCell::new(load_security_dismissed()),
             ),
@@ -2420,10 +3225,21 @@ impl ActivityPage {
                 page_for_errors.render_recent();
             }
         });
+        let page_for_more = activity_page.clone();
+        activity_page.show_more_calls.connect_clicked(move |_| {
+            page_for_more
+                .show_all_recent
+                .set(!page_for_more.show_all_recent.get());
+            page_for_more.render_recent();
+        });
         let page_for_identity_search = activity_page.clone();
         activity_page
             .identity_search
             .connect_search_changed(move |_| page_for_identity_search.render_identities());
+        let page_for_security = activity_page.clone();
+        activity_page
+            .security_status
+            .connect_clicked(move |_| page_for_security.reveal_security());
         let page_for_clear = activity_page.clone();
         activity_page
             .clear_button
@@ -2516,14 +3332,40 @@ impl ActivityPage {
     }
 
     fn render(&self, snapshot: state::ActivitySnapshot) {
+        let (security_changed, identities_changed, traces_changed, inspect_changed) = {
+            let previous = self.last_snapshot.borrow();
+            let previous = previous.as_ref();
+            (
+                activity_section_changed(
+                    previous.map(|snapshot| snapshot.security_events.as_slice()),
+                    &snapshot.security_events,
+                ),
+                activity_section_changed(
+                    previous.map(|snapshot| snapshot.tool_identities.as_slice()),
+                    &snapshot.tool_identities,
+                ),
+                activity_section_changed(
+                    previous.map(|snapshot| snapshot.search_traces.as_slice()),
+                    &snapshot.search_traces,
+                ),
+                activity_section_changed(
+                    previous.map(|snapshot| snapshot.inspect_calls.as_slice()),
+                    &snapshot.inspect_calls,
+                ),
+            )
+        };
         while let Some(child) = self.stats_list.first_child() {
             self.stats_list.remove(&child);
         }
-        while let Some(child) = self.search_list.first_child() {
-            self.search_list.remove(&child);
+        if traces_changed {
+            while let Some(child) = self.search_list.first_child() {
+                self.search_list.remove(&child);
+            }
         }
-        while let Some(child) = self.inspect_list.first_child() {
-            self.inspect_list.remove(&child);
+        if inspect_changed {
+            while let Some(child) = self.inspect_list.first_child() {
+                self.inspect_list.remove(&child);
+            }
         }
         self.call_count.set_label(&snapshot.call_count.to_string());
         let success_rate = if snapshot.call_count == 0 {
@@ -2549,13 +3391,10 @@ impl ActivityPage {
         self.tokens_saved.set_tooltip_text(Some(
             "Tool-definition tokens lazy discovery has kept out of your agent's context",
         ));
-        self.feedback.set_label(if snapshot.call_count == 0 {
-            "No tool calls have been retained yet."
-        } else {
-            "Activity is stored only on this machine."
-        });
+        self.feedback.set_label("");
         self.feedback.remove_css_class("error");
-        self.feedback.add_css_class("success");
+        self.feedback.remove_css_class("success");
+        self.feedback.set_visible(false);
         self.clear_button.set_sensitive(
             snapshot.call_count > 0
                 || !snapshot.search_traces.is_empty()
@@ -2564,33 +3403,35 @@ impl ActivityPage {
 
         // Rebuild the server filter's choices, keeping the current selection when
         // that server still exists in the data.
-        {
+        let server_options = activity_server_filter_options(&snapshot.recent);
+        if *self.filter_server_options.borrow() != server_options {
             self.updating_filters.set(true);
             let previous = self.selected_filter_server();
-            let mut servers: Vec<&str> = Vec::new();
-            for call in &snapshot.recent {
-                if !servers.contains(&call.server.as_str()) {
-                    servers.push(call.server.as_str());
-                }
-            }
-            let mut options = vec!["All servers"];
-            options.extend(servers.iter().copied());
+            let option_refs = server_options
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
             self.filter_server
-                .set_model(Some(&gtk::StringList::new(&options)));
+                .set_model(Some(&gtk::StringList::new(&option_refs)));
             let selected = previous
                 .as_deref()
-                .and_then(|previous| servers.iter().position(|server| *server == previous))
-                .map(|index| index as u32 + 1)
+                .and_then(|previous| server_options.iter().position(|server| server == previous))
+                .map(|index| index as u32)
                 .unwrap_or(0);
             self.filter_server.set_selected(selected);
+            *self.filter_server_options.borrow_mut() = server_options;
             self.updating_filters.set(false);
         }
 
         *self.last_snapshot.borrow_mut() = Some(snapshot);
         self.render_recent();
-        self.render_identities();
+        if identities_changed {
+            self.render_identities();
+        }
         self.render_savings();
-        self.render_security();
+        if security_changed {
+            self.render_security();
+        }
         let snapshot = self
             .last_snapshot
             .borrow()
@@ -2598,30 +3439,63 @@ impl ActivityPage {
             .expect("the snapshot was stored above");
 
         if snapshot.server_stats.is_empty() {
+            self.expanded_stat_servers.borrow_mut().clear();
+            self.server_stat_order.borrow_mut().clear();
             self.stats_list.append(&empty_activity_label(
                 "Per-server statistics appear once calls are retained.",
             ));
         } else {
-            for stat in &snapshot.server_stats {
-                self.stats_list.append(&server_stat_row(stat));
+            let mut stats = snapshot.server_stats.clone();
+            let current_servers = stats.iter().map(stat_server_name).collect::<Vec<_>>();
+            let positions = {
+                let mut order = self.server_stat_order.borrow_mut();
+                order.retain(|server| current_servers.contains(server));
+                for server in current_servers {
+                    if !order.contains(&server) {
+                        order.push(server);
+                    }
+                }
+                order
+                    .iter()
+                    .enumerate()
+                    .map(|(index, server)| (server.clone(), index))
+                    .collect::<std::collections::HashMap<_, _>>()
+            };
+            stats.sort_by_key(|stat| {
+                positions
+                    .get(&stat_server_name(stat))
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            });
+            for stat in &stats {
+                self.stats_list
+                    .append(&server_stat_row(stat, self.expanded_stat_servers.clone()));
             }
         }
-        if snapshot.search_traces.is_empty() {
-            self.search_list.append(&empty_activity_label(
-                "No lazy-discovery searches retained.",
-            ));
-        } else {
-            for trace in snapshot.search_traces {
-                self.search_list.append(&search_trace_card(&trace));
+        if traces_changed {
+            if snapshot.search_traces.is_empty() {
+                self.search_list.append(&empty_activity_label(
+                    "No lazy-discovery searches retained.",
+                ));
+            } else {
+                for trace in &snapshot.search_traces {
+                    self.search_list.append(&search_trace_card(
+                        trace,
+                        self.expanded_activity_rows.clone(),
+                    ));
+                }
             }
         }
-        if snapshot.inspect_calls.is_empty() {
-            self.inspect_list.append(&empty_activity_label(
-                "Live inspection is off or has not captured a call.",
-            ));
-        } else {
-            for capture in snapshot.inspect_calls {
-                self.inspect_list.append(&inspect_card(&capture));
+        if inspect_changed {
+            if snapshot.inspect_calls.is_empty() {
+                self.inspect_list.append(&empty_activity_label(
+                    "Live inspection is off or has not captured a call.",
+                ));
+            } else {
+                for capture in &snapshot.inspect_calls {
+                    self.inspect_list
+                        .append(&inspect_card(capture, self.expanded_activity_rows.clone()));
+                }
             }
         }
     }
@@ -2635,6 +3509,9 @@ impl ActivityPage {
             self.security_list.remove(&child);
         }
         if snapshot.security_events.is_empty() {
+            self.set_security_status(&[]);
+            self.security_expander
+                .set_label(Some("Protection history · Clear"));
             self.security_list.append(&empty_activity_label(
                 "No definition drift or injection events retained.",
             ));
@@ -2644,10 +3521,13 @@ impl ActivityPage {
             let dismissed = self.security_dismissed.borrow();
             crate::integrity::dedupe_security(&snapshot.security_events)
                 .into_iter()
-                .filter(|event| !dismissed.contains(&crate::integrity::security_key(event)))
+                .filter(|event| !security_event_is_dismissed(event, &dismissed))
                 .collect()
         };
         if live.is_empty() {
+            self.set_security_status(&[]);
+            self.security_expander
+                .set_label(Some("Protection history · Reviewed"));
             // The calm "you're protected" state: a protection the user never
             // sees builds no trust.
             self.security_list.append(&empty_activity_label(
@@ -2662,6 +3542,18 @@ impl ActivityPage {
                 crate::integrity::event_severity(event) == "high"
                     && !crate::integrity::security_event_is_new_tool(event)
             });
+        let loud = security_attention_incidents(&loud);
+        let loud_count = crate::integrity::collapse_security_by_identity(&loud).len();
+        let quiet_count = crate::integrity::collapse_security_by_identity(&quiet).len();
+        self.set_security_status(&loud);
+        self.security_expander.set_label(Some(&if loud_count > 0 {
+            format!(
+                "Protection history · {loud_count} important, {} total",
+                loud_count + quiet_count
+            )
+        } else {
+            format!("Protection history · {quiet_count} routine changes")
+        }));
         for (event, count) in crate::integrity::collapse_security_by_identity(&loud)
             .into_iter()
             .take(10)
@@ -2681,12 +3573,18 @@ impl ActivityPage {
                 }
             )));
             expander.add_css_class("toolport-card");
+            bind_activity_expander(
+                &expander,
+                "security:quiet-history".to_string(),
+                self.expanded_activity_rows.clone(),
+                false,
+            );
             let list = gtk::Box::new(gtk::Orientation::Vertical, 8);
             list.set_margin_top(8);
             let dismiss_all = gtk::Button::with_label("Dismiss all");
             dismiss_all.add_css_class("flat");
             dismiss_all.set_halign(gtk::Align::Start);
-            let keys: Vec<String> = quiet.iter().map(crate::integrity::security_key).collect();
+            let keys: Vec<String> = quiet.iter().map(security_dismissal_key).collect();
             let page_for_dismiss_all = self.clone();
             dismiss_all.connect_clicked(move |_| {
                 page_for_dismiss_all.dismiss_security(keys.clone());
@@ -2698,6 +3596,60 @@ impl ActivityPage {
             expander.set_child(Some(&list));
             self.security_list.append(&expander);
         }
+    }
+
+    fn set_security_status(&self, important: &[serde_json::Value]) {
+        self.security_status.remove_css_class("attention");
+        self.security_status_icon.remove_css_class("attention");
+        if important.is_empty() {
+            self.security_status_title.set_label("Protection active");
+            self.security_status_detail
+                .set_label("No important findings need review.");
+            self.security_status
+                .set_tooltip_text(Some("Open security and diagnostic history"));
+            return;
+        }
+        self.security_status.add_css_class("attention");
+        self.security_status_icon.add_css_class("attention");
+        let incidents = security_attention_incidents(important);
+        let collapsed = crate::integrity::collapse_security_by_identity(&incidents);
+        self.security_status_title.set_label(&format!(
+            "{} security {} to review",
+            collapsed.len(),
+            if collapsed.len() == 1 {
+                "finding"
+            } else {
+                "findings"
+            }
+        ));
+        self.security_status_detail
+            .set_label(&security_status_detail(&collapsed));
+        self.security_status
+            .set_tooltip_text(Some("Open the important findings in Protection history"));
+    }
+
+    fn reveal_security(&self) {
+        self.diagnostics_expander.set_expanded(true);
+        self.security_expander.set_expanded(true);
+        let target = self.security_expander.clone();
+        let scroller = self.scroller.clone();
+        gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(180), move || {
+            target.grab_focus();
+            let Some(content) = scroller.child() else {
+                return;
+            };
+            let Some(bounds) = target.compute_bounds(&content) else {
+                return;
+            };
+            let adjustment = scroller.vadjustment();
+            adjustment.set_value(aligned_scroll_value(
+                adjustment.value(),
+                f64::from(bounds.y()),
+                adjustment.lower(),
+                adjustment.upper(),
+                adjustment.page_size(),
+            ));
+        });
     }
 
     /// Remember dismissed finding identities (deduped, capped, persisted) and
@@ -2768,6 +3720,7 @@ impl ActivityPage {
         }
         if snapshot.recent.is_empty() {
             self.filter_count.set_label("");
+            self.show_more_calls.set_visible(false);
             self.list.append(&state_card(
                 "view-list-symbolic",
                 "No activity yet",
@@ -2779,13 +3732,9 @@ impl ActivityPage {
         let server = self.selected_filter_server();
         let errors_only = self.errors_only.is_active();
         let filtered = filter_calls(&snapshot.recent, server.as_deref(), errors_only);
-        self.filter_count
-            .set_label(&if filtered.len() == snapshot.recent.len() {
-                format!("{} calls", filtered.len())
-            } else {
-                format!("{} of {} calls", filtered.len(), snapshot.recent.len())
-            });
         if filtered.is_empty() {
+            self.filter_count.set_label("0 matching calls");
+            self.show_more_calls.set_visible(false);
             self.list.append(&state_card(
                 "edit-find-symbolic",
                 "No matching calls",
@@ -2794,7 +3743,29 @@ impl ActivityPage {
             ));
             return;
         }
-        for activity in filtered {
+        let match_count = filtered.len();
+        let visible_count = if self.show_all_recent.get() {
+            match_count
+        } else {
+            match_count.min(RECENT_CALL_PREVIEW_LIMIT)
+        };
+        self.filter_count
+            .set_label(&if visible_count < match_count {
+                format!("Showing {visible_count} of {match_count} calls")
+            } else if match_count == snapshot.recent.len() {
+                format!("{match_count} calls")
+            } else {
+                format!("{match_count} of {} calls", snapshot.recent.len())
+            });
+        self.show_more_calls
+            .set_visible(match_count > RECENT_CALL_PREVIEW_LIMIT);
+        let show_more_label = if self.show_all_recent.get() {
+            "Show fewer".to_string()
+        } else {
+            format!("Show all {match_count} calls")
+        };
+        self.show_more_calls.set_label(&show_more_label);
+        for activity in filtered.into_iter().take(visible_count) {
             self.list.append(&activity_card(activity));
         }
     }
@@ -2836,8 +3807,12 @@ impl ActivityPage {
         }
         for (server, identities) in groups {
             // A search forces matches open so they are visible without a click.
-            self.identity_list
-                .append(&tool_identity_group(&server, identities, !query.is_empty()));
+            self.identity_list.append(&tool_identity_group(
+                &server,
+                identities,
+                !query.is_empty(),
+                self.expanded_activity_rows.clone(),
+            ));
         }
     }
 
@@ -2901,7 +3876,7 @@ impl ActivityPage {
 fn empty_activity_label(message: &str) -> gtk::Label {
     gtk::Label::builder()
         .label(message)
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
         .css_classes(["toolport-muted"])
@@ -2928,11 +3903,136 @@ fn save_security_dismissed(keys: &[String]) {
     }
 }
 
-/// One loud (or quiet-lane) security finding: badge, subject, recurrence count,
-/// evidence excerpt, and a dismissal that is durable by finding identity.
-fn security_notice_card(event: &serde_json::Value, count: usize, page: ActivityPage) -> gtk::Box {
-    let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
+fn aligned_scroll_value(current: f64, target_y: f64, lower: f64, upper: f64, page: f64) -> f64 {
+    let desired = current + target_y - 12.0;
+    let maximum = (upper - page).max(lower);
+    desired.clamp(lower, maximum)
+}
+
+fn security_event_kind(event: &serde_json::Value) -> &'static str {
+    match event.get("type").and_then(serde_json::Value::as_str) {
+        Some("result_injection_blocked") => "Toolport blocked an injected tool result",
+        Some("result_injection") => "Toolport detected instructions inside a tool result",
+        Some("tool_poison_flag") => "Toolport found suspicious content in a tool definition",
+        Some("pins_load_failed") => "The tool integrity baseline could not be verified",
+        Some("tool_drift") => "A previously known tool definition changed",
+        _ => "A security finding was recorded",
+    }
+}
+
+fn security_status_detail(collapsed: &[(serde_json::Value, usize)]) -> String {
+    let Some((event, _)) = collapsed.first() else {
+        return "No important findings need review.".to_string();
+    };
+    let timestamp = event
+        .get("ts")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let mut detail = format!(
+        "{} · {}",
+        security_event_kind(event),
+        relative_activity_time(timestamp)
+    );
+    if collapsed.len() > 1 {
+        detail.push_str(&format!(" · {} more", collapsed.len() - 1));
+    }
+    detail
+}
+
+fn security_dismissal_key(event: &serde_json::Value) -> String {
+    let identity = crate::integrity::security_key(event);
+    if crate::integrity::event_severity(event) != "high" {
+        return identity;
+    }
+    let timestamp = event
+        .get("ts")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    format!("{identity}@{timestamp}")
+}
+
+fn security_event_is_dismissed(event: &serde_json::Value, dismissed: &[String]) -> bool {
+    let identity = crate::integrity::security_key(event);
+    if crate::integrity::event_severity(event) != "high" {
+        return dismissed.contains(&identity);
+    }
+    let timestamp = event
+        .get("ts")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let prefix = format!("{identity}@");
+    dismissed.iter().any(|marker| {
+        marker
+            .strip_prefix(&prefix)
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|reviewed_through| reviewed_through >= timestamp)
+    })
+}
+
+type ActivityExpansionState = std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>;
+
+fn activity_section_changed<T: PartialEq>(previous: Option<&[T]>, current: &[T]) -> bool {
+    previous != Some(current)
+}
+
+fn activity_row_key(namespace: &str, value: &serde_json::Value) -> String {
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let timestamp = value
+        .get("ts")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    format!(
+        "{namespace}:{timestamp}:{}:{}:{}",
+        field("server"),
+        field("tool"),
+        field("query")
+    )
+}
+
+fn bind_activity_expander(
+    expander: &gtk::Expander,
+    key: String,
+    expanded_rows: ActivityExpansionState,
+    force_expanded: bool,
+) {
+    let expanded = force_expanded || expanded_rows.borrow().contains(&key);
+    expander.set_expanded(expanded);
+    expander.connect_expanded_notify(move |expander| {
+        remember_activity_expansion(
+            &mut expanded_rows.borrow_mut(),
+            &key,
+            expander.is_expanded(),
+        );
+    });
+}
+
+fn remember_activity_expansion(
+    expanded_rows: &mut std::collections::HashSet<String>,
+    key: &str,
+    expanded: bool,
+) {
+    if expanded {
+        expanded_rows.insert(key.to_string());
+    } else {
+        expanded_rows.remove(key);
+    }
+}
+
+/// One loud (or quiet-lane) security finding. The summary stays compact; expanding
+/// it reveals the evidence Toolport retained for review.
+fn security_notice_card(
+    event: &serde_json::Value,
+    count: usize,
+    page: ActivityPage,
+) -> gtk::Expander {
+    let card = gtk::Expander::new(None);
     card.add_css_class("toolport-card");
+    card.set_tooltip_text(Some("Click to review what changed"));
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let kind = event
         .get("type")
@@ -2952,23 +4052,10 @@ fn security_notice_card(event: &serde_json::Value, count: usize, page: ActivityP
         .or_else(|| event.get("server"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("integrity baseline");
-    let mut title = subject.to_string();
-    if let Some(signatures) = event
-        .get("signatures")
-        .and_then(serde_json::Value::as_array)
-    {
-        let names: Vec<&str> = signatures
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .collect();
-        if !names.is_empty() {
-            title.push_str(&format!(" ({})", names.join(", ")));
-        }
-    }
     row.append(
         &gtk::Label::builder()
-            .label(title)
-            .halign(gtk::Align::Start)
+            .label(subject)
+            .halign(gtk::Align::Fill)
             .hexpand(true)
             .xalign(0.0)
             .wrap(true)
@@ -2998,29 +4085,160 @@ fn security_notice_card(event: &serde_json::Value, count: usize, page: ActivityP
     );
     let dismiss = gtk::Button::builder()
         .icon_name("window-close-symbolic")
-        .tooltip_text("Dismiss this notice; it stays dismissed even if the same finding recurs")
+        .tooltip_text("Mark this occurrence reviewed; a later important recurrence will reappear")
         .css_classes(["flat"])
         .build();
-    let key = crate::integrity::security_key(event);
-    dismiss.connect_clicked(move |_| page.dismiss_security(vec![key.clone()]));
+    let key = security_dismissal_key(event);
+    let expansion_key = format!("security:{key}");
+    let page_for_dismiss = page.clone();
+    let expansion_key_for_dismiss = expansion_key.clone();
+    dismiss.connect_clicked(move |_| {
+        page_for_dismiss
+            .expanded_activity_rows
+            .borrow_mut()
+            .remove(&expansion_key_for_dismiss);
+        page_for_dismiss.dismiss_security(vec![key.clone()]);
+    });
     row.append(&dismiss);
-    card.append(&row);
+    card.set_label_widget(Some(&row));
+
+    let details = gtk::Box::new(gtk::Orientation::Vertical, 5);
+    details.set_margin_top(10);
+    for line in security_review_lines(event) {
+        details.append(
+            &gtk::Label::builder()
+                .label(line)
+                .halign(gtk::Align::Fill)
+                .xalign(0.0)
+                .wrap(true)
+                .selectable(true)
+                .css_classes(["toolport-muted", "caption"])
+                .build(),
+        );
+    }
+    card.set_child(Some(&details));
+    bind_activity_expander(
+        &card,
+        expansion_key,
+        page.expanded_activity_rows.clone(),
+        false,
+    );
+    card
+}
+
+fn security_review_lines(event: &serde_json::Value) -> Vec<String> {
+    let event_type = event
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("security_event");
+    let change = event
+        .get("change")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let mut lines = Vec::new();
+
+    match (event_type, change) {
+        ("tool_drift", "changed") => {
+            lines.push("Definition changed since Toolport's trusted baseline.".to_string());
+            let fields: Vec<&str> = event
+                .get("changed_fields")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            for field in &fields {
+                let label = match *field {
+                    "description" => "Description",
+                    "input_schema" => "Input schema",
+                    "output_schema" => "Output schema",
+                    "annotations" => "Annotations",
+                    other => other,
+                };
+                lines.push(format!("Changed field: {label}"));
+            }
+            let annotation_lines = annotation_review_lines(event);
+            if fields.is_empty() && annotation_lines.is_empty() {
+                lines.push(
+                    "This older event does not contain field-level change details.".to_string(),
+                );
+            }
+            lines.extend(annotation_lines);
+        }
+        ("tool_drift", "added") => {
+            lines.push("Tool was added to an established server definition.".to_string());
+        }
+        ("tool_drift", "removed") => {
+            lines.push("Tool was removed from an established server definition.".to_string());
+        }
+        ("result_injection_blocked", _) => lines.push(
+            "Toolport blocked this result before it reached the requesting agent.".to_string(),
+        ),
+        ("result_injection", _) => {
+            lines.push("A tool result matched prompt-injection patterns.".to_string())
+        }
+        ("tool_poison_flag", _) => {
+            lines.push("The tool definition matched suspicious instruction patterns.".to_string())
+        }
+        ("pins_load_failed", _) => lines.push(
+            "Toolport could not read the trusted definition baseline and failed closed."
+                .to_string(),
+        ),
+        _ => lines.push("Toolport retained this security event for review.".to_string()),
+    }
+
+    if let Some(signatures) = event
+        .get("signatures")
+        .and_then(serde_json::Value::as_array)
+    {
+        let signatures: Vec<String> = signatures
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(|signature| signature.replace('_', " "))
+            .collect();
+        if !signatures.is_empty() {
+            lines.push(format!("Matched signals: {}", signatures.join(", ")));
+        }
+    }
+    if let Some(score) = event.get("score").and_then(serde_json::Value::as_f64) {
+        lines.push(format!("Detection score: {score:.2}"));
+    }
     if let Some(evidence) = event
         .get("evidence")
         .and_then(serde_json::Value::as_str)
         .filter(|evidence| !evidence.is_empty())
     {
-        card.append(
-            &gtk::Label::builder()
-                .label(format!("matched: {evidence}"))
-                .halign(gtk::Align::Start)
-                .xalign(0.0)
-                .wrap(true)
-                .css_classes(["toolport-muted", "caption", "monospace"])
-                .build(),
-        );
+        lines.push(format!("Matched text: {evidence}"));
     }
-    card
+    lines
+}
+
+fn annotation_review_lines(event: &serde_json::Value) -> Vec<String> {
+    [
+        ("readOnlyHint", "prev_ro", "new_ro"),
+        ("destructiveHint", "prev_dh", "new_dh"),
+    ]
+    .into_iter()
+    .filter_map(|(label, previous, next)| {
+        let previous = event.get(previous);
+        let next = event.get(next);
+        (previous != next).then(|| {
+            format!(
+                "{label}: {} to {}",
+                security_hint_value(previous),
+                security_hint_value(next)
+            )
+        })
+    })
+    .collect()
+}
+
+fn security_hint_value(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::Bool(value)) => value.to_string(),
+        Some(serde_json::Value::Null) | None => "not set".to_string(),
+        Some(value) => value.to_string(),
+    }
 }
 
 /// The collapsed header line for one discovery trace.
@@ -3179,7 +4397,10 @@ fn trace_token_line(trace: &serde_json::Value) -> String {
     line
 }
 
-fn search_trace_card(trace: &serde_json::Value) -> gtk::Expander {
+fn search_trace_card(
+    trace: &serde_json::Value,
+    expanded_rows: ActivityExpansionState,
+) -> gtk::Expander {
     let expander = gtk::Expander::new(Some(&trace_summary_line(trace)));
     expander.add_css_class("toolport-card");
     let trace_for_expand = trace.clone();
@@ -3198,7 +4419,7 @@ fn search_trace_card(trace: &serde_json::Value) -> gtk::Expander {
             list.append(
                 &gtk::Label::builder()
                     .label(line)
-                    .halign(gtk::Align::Start)
+                    .halign(gtk::Align::Fill)
                     .xalign(0.0)
                     .wrap(true)
                     .css_classes(["toolport-muted", "caption", "monospace"])
@@ -3208,7 +4429,7 @@ fn search_trace_card(trace: &serde_json::Value) -> gtk::Expander {
         list.append(
             &gtk::Label::builder()
                 .label(trace_token_line(&trace_for_expand))
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
                 .css_classes(["toolport-muted", "caption"])
@@ -3216,10 +4437,16 @@ fn search_trace_card(trace: &serde_json::Value) -> gtk::Expander {
         );
         expander.set_child(Some(&list));
     });
+    bind_activity_expander(
+        &expander,
+        activity_row_key("trace", trace),
+        expanded_rows,
+        false,
+    );
     expander
 }
 
-fn inspect_card(capture: &serde_json::Value) -> gtk::Box {
+fn inspect_card(capture: &serde_json::Value, expanded_rows: ActivityExpansionState) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
     card.add_css_class("toolport-card");
     let server = capture
@@ -3242,7 +4469,7 @@ fn inspect_card(capture: &serde_json::Value) -> gtk::Box {
     card.append(
         &gtk::Label::builder()
             .label(format!("{server} / {tool}"))
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["heading"])
@@ -3282,12 +4509,17 @@ fn inspect_card(capture: &serde_json::Value) -> gtk::Box {
         .min_content_height(120)
         .max_content_height(280)
         .build();
-    card.append(
-        &gtk::Expander::builder()
-            .label("Inspect request and response")
-            .child(&scroll)
-            .build(),
+    let details = gtk::Expander::builder()
+        .label("Inspect request and response")
+        .child(&scroll)
+        .build();
+    bind_activity_expander(
+        &details,
+        activity_row_key("inspect", capture),
+        expanded_rows,
+        false,
     );
+    card.append(&details);
     card
 }
 
@@ -3306,23 +4538,21 @@ const SAVINGS_MODELS: &[(&str, f64)] = &[
 ];
 
 fn savings_dollar_line(tokens_saved: u64, model_index: usize) -> String {
-    let (label, price) = SAVINGS_MODELS
+    let (_, price) = SAVINGS_MODELS
         .get(model_index)
         .copied()
         .unwrap_or(("Claude Sonnet", 3.0));
     let dollars = tokens_saved as f64 / 1_000_000.0 * price;
-    format!("≈ ${dollars:.2} at {label} input prices")
+    format!("≈ ${dollars:.2}")
 }
 
 fn savings_detail_line(list_loads: u64, peak_catalog: u64, since: Option<String>) -> String {
     let mut parts = vec![format!(
-        "across {list_loads} tool-list {}",
+        "{list_loads} catalog {}",
         if list_loads == 1 { "load" } else { "loads" }
     )];
     if peak_catalog > 4 {
-        parts.push(format!(
-            "biggest catalog collapsed {peak_catalog} tools to a handful"
-        ));
+        parts.push(format!("peak {peak_catalog} tools"));
     }
     if let Some(since) = since {
         parts.push(format!("since {since}"));
@@ -3393,7 +4623,7 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     copy.append(
         &gtk::Label::builder()
             .label(format!("{} / {}", activity.server, activity.tool))
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["heading"])
@@ -3410,7 +4640,7 @@ fn activity_card(activity: &state::ActivityView) -> gtk::Box {
     copy.append(
         &gtk::Label::builder()
             .label(detail.join(" · "))
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["toolport-muted"])
@@ -3473,23 +4703,60 @@ fn stat_metrics_line(stat: &serde_json::Value) -> String {
 
 /// One server's row in the per-server breakdown. Expanding it reveals the
 /// per-tool breakdown, built on first expansion like the identity groups.
-fn server_stat_row(stat: &serde_json::Value) -> gtk::Expander {
-    let server = stat
-        .get("server")
+fn stat_server_name(stat: &serde_json::Value) -> String {
+    stat.get("server")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("Unknown server");
-    let expander = gtk::Expander::new(Some(&format!("{server} · {}", stat_metrics_line(stat))));
+        .map(str::trim)
+        .filter(|server| !server.is_empty())
+        .unwrap_or("Unknown server")
+        .to_string()
+}
+
+fn server_stat_row(
+    stat: &serde_json::Value,
+    expanded_servers: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+) -> gtk::Expander {
+    let server = stat_server_name(stat);
+    let expander = gtk::Expander::new(None);
     expander.add_css_class("toolport-card");
+    let title = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    title.append(
+        &gtk::Label::builder()
+            .label(&server)
+            .halign(gtk::Align::Start)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["heading"])
+            .build(),
+    );
+    title.append(
+        &gtk::Label::builder()
+            .label(stat_metrics_line(stat))
+            .halign(gtk::Align::End)
+            .xalign(1.0)
+            .css_classes(["toolport-muted", "caption", "toolport-stat-metrics"])
+            .build(),
+    );
+    expander.set_label_widget(Some(&title));
     let tools = stat
         .get("tools")
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
     let pending = std::rc::Rc::new(std::cell::RefCell::new(Some(tools)));
+    let server_for_expansion = server.clone();
+    let expanded_for_notify = expanded_servers.clone();
     expander.connect_expanded_notify(move |expander| {
         if !expander.is_expanded() {
+            expanded_for_notify
+                .borrow_mut()
+                .remove(&server_for_expansion);
             return;
         }
+        expanded_for_notify
+            .borrow_mut()
+            .insert(server_for_expansion.clone());
         let Some(tools) = pending.borrow_mut().take() else {
             return;
         };
@@ -3503,18 +4770,33 @@ fn server_stat_row(stat: &serde_json::Value) -> gtk::Expander {
                 .get("tool")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("Unknown tool");
-            list.append(
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+            row.add_css_class("toolport-stat-row");
+            row.append(
                 &gtk::Label::builder()
-                    .label(format!("{name} · {}", stat_metrics_line(&tool)))
+                    .label(name)
                     .halign(gtk::Align::Start)
                     .xalign(0.0)
-                    .wrap(true)
-                    .css_classes(["toolport-muted", "caption"])
+                    .hexpand(true)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .css_classes(["toolport-muted"])
                     .build(),
             );
+            row.append(
+                &gtk::Label::builder()
+                    .label(stat_metrics_line(&tool))
+                    .halign(gtk::Align::End)
+                    .xalign(1.0)
+                    .css_classes(["toolport-muted", "caption", "toolport-stat-metrics"])
+                    .build(),
+            );
+            list.append(&row);
         }
         expander.set_child(Some(&list));
     });
+    if expanded_servers.borrow().contains(&server) {
+        expander.set_expanded(true);
+    }
     expander
 }
 
@@ -3542,6 +4824,18 @@ fn short_fingerprint(fingerprint: &str) -> String {
 /// One server's pinned tools, collapsed by default so many servers read as a few
 /// lines. The rows are built on first expansion: a real install pins thousands of
 /// tools, and building every row up front would make the Activity page unusable.
+/// Stable filter choices. Keeping this model unchanged prevents an open dropdown
+/// from being dismissed by an unrelated live-metrics refresh.
+fn activity_server_filter_options(calls: &[state::ActivityView]) -> Vec<String> {
+    let mut options = vec!["All servers".to_string()];
+    for call in calls {
+        if !options.iter().any(|server| server == &call.server) {
+            options.push(call.server.clone());
+        }
+    }
+    options
+}
+
 /// Which of the recent calls the current filter keeps.
 fn filter_calls<'a>(
     calls: &'a [state::ActivityView],
@@ -3579,6 +4873,7 @@ fn tool_identity_group(
     server: &str,
     identities: Vec<crate::integrity::ToolIdentity>,
     expanded: bool,
+    expanded_rows: ActivityExpansionState,
 ) -> gtk::Expander {
     let count = identities.len();
     let quarantined = identities
@@ -3609,9 +4904,12 @@ fn tool_identity_group(
         }
         expander.set_child(Some(&list));
     });
-    if expanded {
-        expander.set_expanded(true);
-    }
+    bind_activity_expander(
+        &expander,
+        format!("identity:{server}"),
+        expanded_rows,
+        expanded,
+    );
     expander
 }
 
@@ -3620,7 +4918,7 @@ fn tool_identity_row(identity: &crate::integrity::ToolIdentity) -> gtk::Box {
     let title = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let alias = gtk::Label::builder()
         .label(&identity.alias)
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .hexpand(true)
         .xalign(0.0)
         .wrap(true)
@@ -3654,7 +4952,7 @@ fn tool_identity_row(identity: &crate::integrity::ToolIdentity) -> gtk::Box {
     row.append(
         &gtk::Label::builder()
             .label(detail.join(" · "))
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["toolport-muted", "caption"])
@@ -3746,14 +5044,15 @@ impl RulesPage {
             .build();
         let page = gtk::Box::new(gtk::Orientation::Vertical, 14);
         page.add_css_class("toolport-page");
-        page.set_margin_top(28);
-        page.set_margin_bottom(28);
-        page.set_margin_start(28);
-        page.set_margin_end(28);
+        page.set_margin_top(20);
+        page.set_margin_bottom(20);
+        page.set_margin_start(20);
+        page.set_margin_end(20);
         page.append(
             &gtk::Label::builder()
                 .label("One set of instructions across your AI clients")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
+                .xalign(0.0)
                 .wrap(true)
                 .css_classes(["title-2"])
                 .build(),
@@ -3761,7 +5060,7 @@ impl RulesPage {
         page.append(
             &gtk::Label::builder()
                 .label("Choose an active rule set, then opt in each client. Toolport previews the exact file before the first write and removes only content it owns.")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
                 .css_classes(["toolport-muted"])
@@ -3897,13 +5196,19 @@ impl RulesPage {
         );
         self.project_count
             .set_label(&view.projects.len().to_string());
-        self.feedback
-            .set_label(match view.active_set_id.as_deref() {
-                Some(_) => "The active set is reconciled with every opted-in client.",
-                None => "Choose an active set before enabling a client.",
-            });
+        // Only the no-active-set case is worth a banner: it is a next step. The
+        // other message restated the lede in permanent green, which left no
+        // room for the real "Applied rules to X" feedback to stand out.
         self.feedback.remove_css_class("error");
-        self.feedback.add_css_class("success");
+        self.feedback.remove_css_class("success");
+        match view.active_set_id.as_deref() {
+            Some(_) => self.feedback.set_visible(false),
+            None => {
+                self.feedback
+                    .set_label("Choose an active set before enabling a client.");
+                self.feedback.set_visible(true);
+            }
+        }
 
         if view.sets.is_empty() {
             self.set_list.append(&state_card(
@@ -3927,20 +5232,29 @@ impl RulesPage {
             .and_then(|id| view.sets.iter().find(|set| set.id == id))
             .cloned();
         self.reapply_button.set_sensitive(active_set.is_some());
-        let clients = view
+        // Split the way the Clients page does, so "who has my rules" is a glance
+        // rather than a scan, and the group that still needs action sits above
+        // the group that is already done.
+        let (opted_in, not_opted_in): (Vec<_>, Vec<_>) = view
             .clients
             .iter()
             .filter(|client| client.path.is_some())
-            .collect::<Vec<_>>();
-        if clients.is_empty() {
+            .partition(|client| client.enabled);
+        if opted_in.is_empty() && not_opted_in.is_empty() {
             self.client_list.append(&state_card(
                 "computer-symbolic",
                 "No supported clients installed",
                 "Installed clients with a rules location will appear here.",
                 false,
             ));
-        } else {
-            for client in clients {
+        }
+        for (title, group) in [("Not opted in", &not_opted_in), ("Opted in", &opted_in)] {
+            if group.is_empty() {
+                continue;
+            }
+            self.client_list
+                .append(&client_section_title(title, group.len()));
+            for client in group.iter() {
                 self.client_list.append(&rules_client_card(
                     client,
                     active_set.as_ref(),
@@ -3949,20 +5263,35 @@ impl RulesPage {
             }
         }
         // Clients Toolport cannot write global rules for are said out loud, not
-        // silently dropped: the user can still paste the set in by hand.
-        for client in view.clients.iter().filter(|client| client.path.is_none()) {
-            self.client_list.append(
+        // silently dropped: the user can still paste the set in by hand. Said
+        // once and then named, rather than the same sentence per client.
+        let unsupported = view
+            .clients
+            .iter()
+            .filter(|client| client.path.is_none())
+            .map(|client| client.name.as_str())
+            .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            let note = gtk::Box::new(gtk::Orientation::Vertical, 3);
+            note.append(
                 &gtk::Label::builder()
-                    .label(format!(
-                        "No rules file Toolport can write for {}. Paste your rules in by hand.",
-                        client.name
-                    ))
-                    .halign(gtk::Align::Start)
+                    .label("No rules file Toolport can write for these. Paste your set in by hand.")
+                    .halign(gtk::Align::Fill)
                     .xalign(0.0)
                     .wrap(true)
                     .css_classes(["toolport-muted", "caption"])
                     .build(),
             );
+            note.append(
+                &gtk::Label::builder()
+                    .label(unsupported.join(" · "))
+                    .halign(gtk::Align::Fill)
+                    .xalign(0.0)
+                    .wrap(true)
+                    .css_classes(["caption"])
+                    .build(),
+            );
+            self.client_list.append(&note);
         }
         if view.projects.is_empty() {
             self.project_list.append(&state_card(
@@ -3983,13 +5312,18 @@ impl RulesPage {
         self.feedback.set_label(&format!("Rules error: {error}"));
         self.feedback.remove_css_class("success");
         self.feedback.add_css_class("error");
+        self.feedback.set_visible(true);
     }
 
     fn finish_mutation(&self, result: Result<crate::rules::RulesView, String>, success: &str) {
         match result {
             Ok(view) => {
+                // `render` hides the banner when there is nothing standing to
+                // report, so the outcome of this action has to re-show it.
                 self.render(view);
                 self.feedback.set_label(success);
+                self.feedback.add_css_class("success");
+                self.feedback.set_visible(true);
             }
             Err(error) => self.show_error(&error),
         }
@@ -4091,6 +5425,8 @@ fn rules_client_card(
             .css_classes(["heading"])
             .build(),
     );
+    // The state is said once, in the subtitle. It used to be repeated verbatim
+    // in a chip on the same row.
     let (state_label, badge_class) = rule_apply_state(client.state);
     copy.append(
         &gtk::Label::builder()
@@ -4100,16 +5436,17 @@ fn rules_client_card(
                 "Not enabled"
             })
             .halign(gtk::Align::Start)
-            .css_classes(["toolport-muted"])
+            .css_classes([if client.enabled {
+                state_text_class(badge_class)
+            } else {
+                "toolport-muted"
+            }])
             .build(),
     );
-    card.append(&copy);
-    if client.enabled {
-        let badge = gtk::Label::new(Some(state_label));
-        badge.add_css_class("toolport-badge");
-        badge.add_css_class(badge_class);
-        card.append(&badge);
+    if let Some(path) = client.path.as_deref() {
+        copy.set_tooltip_text(Some(path));
     }
+    card.append(&copy);
     let preview = gtk::Button::builder()
         .icon_name("document-properties-symbolic")
         .tooltip_text(format!(
@@ -4163,13 +5500,22 @@ fn rules_client_card(
     let client_id = client.id.clone();
     let client_name = client.name.clone();
     let page_for_toggle = page.clone();
+    let resetting = std::rc::Rc::new(std::cell::Cell::new(false));
     toggle.connect_state_set(move |toggle, enabled| {
+        // A restore after an abandoned preview re-emits this signal; it is not
+        // the user asking to disable the client.
+        if resetting.get() {
+            return gtk::glib::Propagation::Stop;
+        }
         toggle.set_sensitive(false);
         if enabled {
             preview_rules_client(
                 &client_id,
                 &client_name,
-                Some(toggle.clone()),
+                Some(PendingRulesToggle {
+                    switch: toggle.clone(),
+                    resetting: resetting.clone(),
+                }),
                 page_for_toggle.clone(),
             );
         } else {
@@ -4485,7 +5831,7 @@ fn rules_project_file_row(
     copy.append(
         &gtk::Label::builder()
             .label(clients)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["toolport-muted"])
@@ -4873,6 +6219,15 @@ fn confirm_remove_rules_project(project_id: &str, project_name: &str, page: Rule
     dialog.present();
 }
 
+/// The badge variants as plain text colours, for the row subtitle.
+fn state_text_class(badge_class: &str) -> &'static str {
+    match badge_class {
+        "success" => "toolport-state-success",
+        "review" => "toolport-state-review",
+        _ => "toolport-state-muted",
+    }
+}
+
 fn rule_apply_state(state: crate::instructions::ApplyState) -> (&'static str, &'static str) {
     match state {
         crate::instructions::ApplyState::Applied => ("Applied", "success"),
@@ -4885,10 +6240,32 @@ fn rule_apply_state(state: crate::instructions::ApplyState) -> (&'static str, &'
     }
 }
 
+/// The switch that started an enable flow, carried through the preview so every
+/// path that abandons the flow can put it back. Clicking a `GtkSwitch` moves the
+/// knob immediately; the handler returning `Propagation::Stop` only stops the
+/// backend `state` following, so abandoning the preview used to leave a client
+/// reading "Not enabled" under a switch that looked on.
+#[derive(Clone)]
+struct PendingRulesToggle {
+    switch: gtk::Switch,
+    /// `set_active` re-emits `state-set`, which would otherwise be read as the
+    /// user switching the client off and would write and report a disable.
+    resetting: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl PendingRulesToggle {
+    fn restore(&self) {
+        self.resetting.set(true);
+        self.switch.set_active(false);
+        self.resetting.set(false);
+        self.switch.set_sensitive(true);
+    }
+}
+
 fn preview_rules_client(
     client_id: &str,
     client_name: &str,
-    toggle: Option<gtk::Switch>,
+    toggle: Option<PendingRulesToggle>,
     page: RulesPage,
 ) {
     page.feedback
@@ -4900,9 +6277,9 @@ fn preview_rules_client(
         let result =
             gtk::gio::spawn_blocking(move || crate::rules::preview(&client_id_for_preview, None))
                 .await;
-        let restore = |toggle: &Option<gtk::Switch>| {
+        let restore = |toggle: &Option<PendingRulesToggle>| {
             if let Some(toggle) = toggle {
-                toggle.set_sensitive(true);
+                toggle.restore();
             }
         };
         match result {
@@ -4985,12 +6362,12 @@ fn open_rules_client_preview(
     preview: crate::rules::RulesPreview,
     client_id: String,
     client_name: String,
-    toggle: Option<gtk::Switch>,
+    toggle: Option<PendingRulesToggle>,
     page: RulesPage,
 ) {
     let Some(parent) = page.app.active_window() else {
         if let Some(toggle) = &toggle {
-            toggle.set_sensitive(true);
+            toggle.restore();
         }
         return;
     };
@@ -5028,7 +6405,7 @@ fn open_rules_client_preview(
         body.append(
             &gtk::Label::builder()
                 .label(format!("This write will be refused: {reason}."))
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
                 .css_classes(["toolport-feedback", "error"])
@@ -5062,8 +6439,10 @@ fn open_rules_client_preview(
 
     let toggle_for_close = toggle.clone();
     window.connect_close_request(move |_| {
+        // Closing from the titlebar or with Escape abandons the enable just as
+        // much as Cancel does.
         if let Some(toggle) = &toggle_for_close {
-            toggle.set_sensitive(true);
+            toggle.restore();
         }
         gtk::glib::Propagation::Proceed
     });
@@ -5072,7 +6451,7 @@ fn open_rules_client_preview(
     let toggle_for_cancel = toggle.clone();
     cancel.connect_clicked(move |_| {
         if let Some(toggle) = &toggle_for_cancel {
-            toggle.set_sensitive(true);
+            toggle.restore();
         }
         window_for_cancel.close();
     });
@@ -5164,7 +6543,8 @@ fn open_rule_set_editor_draft(
         "Saving reconciles this content with every opted-in client when the set is active.",
     ));
     let feedback = gtk::Label::builder()
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
+        .xalign(0.0)
         .wrap(true)
         .visible(false)
         .css_classes(["toolport-feedback", "error"])
@@ -5312,12 +6692,13 @@ impl ApprovalPage {
     fn new(app: &adw::Application, broker: crate::approval_broker::ApprovalBroker) -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
         root.add_css_class("toolport-approvals");
+        root.add_css_class("toolport-global-alert");
         root.set_visible(false);
 
         let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         heading.append(
             &gtk::Label::builder()
-                .label("Pending approvals")
+                .label("Approval required")
                 .halign(gtk::Align::Start)
                 .hexpand(true)
                 .css_classes(["heading"])
@@ -5370,7 +6751,8 @@ impl ApprovalPage {
             .collect::<Vec<_>>();
         self.reconcile_notifications(&pending);
         self.root.set_visible(!pending.is_empty());
-        self.count.set_label(&pending.len().to_string());
+        self.count.set_visible(pending.len() > 1);
+        self.count.set_label(&format!("{} pending", pending.len()));
         if *self.rendered.borrow() == signature {
             self.update_deadlines();
             return;
@@ -5380,7 +6762,9 @@ impl ApprovalPage {
             self.list.remove(&child);
         }
         self.deadlines.borrow_mut().clear();
-        for view in pending {
+        // One decision at a time keeps an approval burst from taking over the
+        // window. Resolving the oldest immediately advances the queue.
+        for view in pending.into_iter().take(1) {
             let (card, deadline) = approval_card(view.clone(), self.clone());
             self.deadlines
                 .borrow_mut()
@@ -5401,31 +6785,25 @@ impl ApprovalPage {
         tray::set_pending(pending.len());
         let current = pending
             .iter()
-            .map(|view| view.id.as_str())
+            .map(|view| view.id.clone())
             .collect::<std::collections::HashSet<_>>();
         let mut notified = self.notified.borrow_mut();
-        for id in notified
-            .iter()
-            .filter(|id| !current.contains(id.as_str()))
-            .cloned()
-            .collect::<Vec<_>>()
-        {
-            self.app.withdraw_notification(&format!("approval-{id}"));
-            notified.remove(&id);
+        if *notified == current {
+            return;
         }
-        for view in pending {
-            if notified.insert(view.id.clone()) {
-                let (title, body) = approval_notification(view);
-                let notification = gtk::gio::Notification::new(&title);
-                notification.set_body(Some(&body));
-                // The urgent priority is the Wayland-era stand-in for the
-                // shipping app's taskbar-attention flash: a held call must not
-                // vanish as a transient banner.
-                notification.set_priority(gtk::gio::NotificationPriority::Urgent);
-                self.app
-                    .send_notification(Some(&format!("approval-{}", view.id)), &notification);
-            }
+        *notified = current;
+        if pending.is_empty() {
+            self.app.withdraw_notification("toolport-approvals");
+            return;
         }
+        let (title, body) = approval_queue_notification(pending)
+            .expect("a non-empty approval queue has notification copy");
+        let notification = gtk::gio::Notification::new(&title);
+        notification.set_body(Some(&body));
+        notification.set_priority(gtk::gio::NotificationPriority::Urgent);
+        notification.set_default_action("app.show-approvals");
+        self.app
+            .send_notification(Some("toolport-approvals"), &notification);
     }
 
     fn decide(&self, id: &str, approved: bool) {
@@ -5473,7 +6851,8 @@ fn approval_card(
     let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     let title = gtk::Label::builder()
         .label(format!("{} / {}", view.server, view.tool))
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
+        .xalign(0.0)
         .hexpand(true)
         .wrap(true)
         .css_classes(["heading"])
@@ -5531,7 +6910,7 @@ fn approval_card(
         card.append(
             &gtk::Label::builder()
                 .label(format!("Would send to {}:\n{values}", release.server))
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
                 .selectable(true)
@@ -5574,7 +6953,7 @@ fn approval_card(
                 actions.append(
                     &gtk::Label::builder()
                         .label(format!("Browser link refused: {error}"))
-                        .halign(gtk::Align::Start)
+                        .halign(gtk::Align::Fill)
                         .xalign(0.0)
                         .wrap(true)
                         .css_classes(["toolport-feedback", "error"])
@@ -5603,7 +6982,7 @@ fn approval_card(
             .tooltip_text("Approve this definition without asking again")
             .build();
         remember.add_css_class("toolport-secondary-action");
-        let popover = gtk::Popover::new();
+        let popover = toolport_menu_popover();
         let choices = gtk::Box::new(gtk::Orientation::Vertical, 4);
         choices.set_margin_top(6);
         choices.set_margin_bottom(6);
@@ -5613,8 +6992,7 @@ fn approval_card(
             ("For this session", "session"),
             ("Always for this definition", "always"),
         ] {
-            let choice = gtk::Button::with_label(label);
-            choice.add_css_class("flat");
+            let choice = toolport_menu_button(label);
             let id = view.id.clone();
             let page = page.clone();
             let remember = remember.clone();
@@ -5685,21 +7063,61 @@ fn build_content(
     let add_server = gtk::Button::builder()
         .icon_name("list-add-symbolic")
         .tooltip_text("Add server")
-        .css_classes(["suggested-action"])
+        .css_classes(["flat", "toolport-header-add"])
         .build();
     header.pack_end(&add_server);
-    let menu = gtk::gio::Menu::new();
-    menu.append(Some("Import setup…"), Some("app.import-setup"));
-    menu.append(Some("Import pasted setup…"), Some("app.paste-setup"));
-    menu.append(Some("Export setup…"), Some("app.export-setup"));
-    menu.append(Some("Share setup…"), Some("app.share-setup"));
-    menu.append(Some("Run setup assistant…"), Some("app.show-onboarding"));
-    menu.append(Some("Quit Toolport"), Some("app.quit"));
+    let menu_popover = gtk::Popover::new();
+    menu_popover.add_css_class("toolport-main-menu");
+    menu_popover.set_has_arrow(false);
+    let menu_content = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let menu_action = |label: &str, action: &str, shortcut: Option<&str>| {
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 18);
+        content.append(
+            &gtk::Label::builder()
+                .label(label)
+                .halign(gtk::Align::Start)
+                .hexpand(true)
+                .build(),
+        );
+        if let Some(shortcut) = shortcut {
+            content.append(
+                &gtk::Label::builder()
+                    .label(shortcut)
+                    .css_classes(["toolport-menu-shortcut"])
+                    .build(),
+            );
+        }
+        let button = gtk::Button::builder()
+            .child(&content)
+            .css_classes(["flat", "toolport-main-menu-item"])
+            .build();
+        button.set_action_name(Some(action));
+        button
+    };
+    for (label, action) in [
+        ("Import setup…", "app.import-setup"),
+        ("Import pasted setup…", "app.paste-setup"),
+        ("Export setup…", "app.export-setup"),
+        ("Share setup…", "app.share-setup"),
+    ] {
+        menu_content.append(&menu_action(label, action, None));
+    }
+    menu_content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    menu_content.append(&menu_action(
+        "Run setup assistant…",
+        "app.show-onboarding",
+        None,
+    ));
+    menu_content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let quit = menu_action("Quit Toolport", "app.quit", Some("Ctrl+Q"));
+    quit.add_css_class("toolport-main-menu-quit");
+    menu_content.append(&quit);
+    menu_popover.set_child(Some(&menu_content));
     let menu_button = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
-        .menu_model(&menu)
         .tooltip_text("Toolport menu")
         .build();
+    menu_button.set_popover(Some(&menu_popover));
     header.pack_end(&menu_button);
     root.append(&header);
 
@@ -5709,14 +7127,15 @@ fn build_content(
         .build();
     let page = gtk::Box::new(gtk::Orientation::Vertical, 14);
     page.add_css_class("toolport-page");
-    page.set_margin_top(28);
-    page.set_margin_bottom(28);
-    page.set_margin_start(28);
-    page.set_margin_end(28);
+    page.set_margin_top(20);
+    page.set_margin_bottom(20);
+    page.set_margin_start(20);
+    page.set_margin_end(20);
 
     let intro = gtk::Label::builder()
         .label("One local gateway for every AI client")
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
+        .xalign(0.0)
         .wrap(true)
         .css_classes(["title-2"])
         .build();
@@ -5724,7 +7143,7 @@ fn build_content(
 
     let description = gtk::Label::builder()
         .label("Your MCP servers, available everywhere. This native preview follows the active Omarchy palette and behaves like a regular Hyprland window.")
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .wrap(true)
         .xalign(0.0)
         .css_classes(["toolport-muted"])
@@ -5741,21 +7160,21 @@ fn build_content(
     page.append(&feedback);
 
     let approval_page = ApprovalPage::new(app, broker);
-    page.append(&approval_page.root);
 
-    let summary = gtk::FlowBox::new();
+    let summary = gtk::Grid::new();
     summary.add_css_class("toolport-summary");
     summary.set_column_spacing(10);
-    summary.set_row_spacing(10);
-    summary.set_min_children_per_line(1);
-    summary.set_max_children_per_line(3);
-    summary.set_homogeneous(true);
-    summary.set_selection_mode(gtk::SelectionMode::None);
+    summary.set_column_homogeneous(true);
     let mut values = Vec::new();
-    for (value, label) in [("0", "Servers"), ("0", "Enabled"), ("1", "Profiles")] {
+    for (column, (value, label)) in [("0", "Servers"), ("0", "Enabled"), ("1", "Profiles")]
+        .into_iter()
+        .enumerate()
+    {
         let (item, value) = summary_item(value, label);
+        item.set_size_request(0, -1);
+        item.set_hexpand(true);
         values.push(value);
-        summary.insert(&item, -1);
+        summary.attach(&item, column as i32, 0, 1, 1);
     }
     page.append(&summary);
 
@@ -5791,17 +7210,15 @@ fn build_content(
         .tooltip_text("Profile actions")
         .build();
     profile_actions.add_css_class("flat");
-    let profile_popover = gtk::Popover::new();
+    let profile_popover = toolport_menu_popover();
     let profile_action_list = gtk::Box::new(gtk::Orientation::Vertical, 4);
     profile_action_list.set_margin_top(6);
     profile_action_list.set_margin_bottom(6);
     profile_action_list.set_margin_start(6);
     profile_action_list.set_margin_end(6);
-    let enable_all = gtk::Button::with_label("Enable all reviewed servers");
-    enable_all.add_css_class("flat");
+    let enable_all = toolport_menu_button("Enable all reviewed servers");
     profile_action_list.append(&enable_all);
-    let disable_all = gtk::Button::with_label("Disable all servers");
-    disable_all.add_css_class("flat");
+    let disable_all = toolport_menu_button("Disable all servers");
     profile_action_list.append(&disable_all);
     profile_popover.set_child(Some(&profile_action_list));
     profile_actions.set_popover(Some(&profile_popover));
@@ -5816,7 +7233,7 @@ fn build_content(
     page.append(&section_title);
 
     let posture = gtk::Label::builder()
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
         .visible(false)
@@ -5844,6 +7261,10 @@ fn build_content(
             enabled_count: values.remove(0),
             profile_count: values.remove(0),
             profile_dropdown: profile_dropdown.clone(),
+            profile_options: std::rc::Rc::new(std::cell::RefCell::new(vec![(
+                "default".to_string(),
+                "Default".to_string(),
+            )])),
             add_profile: add_profile.clone(),
             delete_profile: delete_profile.clone(),
             section_title,
@@ -5853,6 +7274,7 @@ fn build_content(
             list,
             last_snapshot: std::rc::Rc::new(std::cell::RefCell::new(None)),
             updating_profile: std::rc::Rc::new(std::cell::Cell::new(false)),
+            feedback_timer: std::rc::Rc::new(std::cell::RefCell::new(None)),
             health_rows: std::rc::Rc::new(
                 std::cell::RefCell::new(std::collections::HashMap::new()),
             ),
@@ -6026,7 +7448,7 @@ fn share_setup(page: ServerPage) {
         "Keychain values, inline credentials, and the local gateway are always excluded. Share links expire after 90 days.",
     ));
     let feedback = gtk::Label::builder()
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
         .visible(false)
@@ -6296,7 +7718,7 @@ fn open_paste_import(page: ServerPage) {
         "Paste the JSON someone exported. Nothing is imported until you review it.",
     ));
     let feedback = gtk::Label::builder()
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
         .visible(false)
@@ -6387,9 +7809,8 @@ fn choose_setup_export(page: ServerPage) {
             })
             .await;
             match result {
-                Ok(Ok(())) => page.show_feedback(
+                Ok(Ok(())) => page.show_confirmation(
                     "Exported the setup without keychain values or inline credentials.",
-                    false,
                 ),
                 Ok(Err(error)) => page.show_feedback(&format!("Export failed: {error}"), true),
                 Err(_) => page.show_feedback("The export stopped unexpectedly.", true),
@@ -6483,7 +7904,7 @@ fn show_setup_import_review(
         row.append(
             &gtk::Label::builder()
                 .label(setup_import_target(&item))
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
                 .css_classes(["toolport-muted"])
@@ -6495,7 +7916,7 @@ fn show_setup_import_review(
             row.append(
                 &gtk::Label::builder()
                     .label(warning)
-                    .halign(gtk::Align::Start)
+                    .halign(gtk::Align::Fill)
                     .xalign(0.0)
                     .wrap(true)
                     .css_classes(["toolport-feedback", "error", "caption"])
@@ -6536,13 +7957,10 @@ fn show_setup_import_review(
                 })
                 .await;
                 match result {
-                    Ok(Ok((_, added))) => page.show_feedback(
-                        &format!(
-                            "Imported {added} server{}. Review credentials before enabling them.",
-                            if added == 1 { "" } else { "s" }
-                        ),
-                        false,
-                    ),
+                    Ok(Ok((_, added))) => page.show_confirmation(&format!(
+                        "Imported {added} server{}. Review credentials before enabling them.",
+                        if added == 1 { "" } else { "s" }
+                    )),
                     Ok(Err(error)) => page.show_feedback(&format!("Import failed: {error}"), true),
                     Err(_) => page.show_feedback("The import stopped unexpectedly.", true),
                 }
@@ -6604,7 +8022,7 @@ fn run_profile_mutation(
                     state::RegistrySnapshot::from_registry(registry),
                 ));
                 page.add_profile.set_sensitive(true);
-                page.show_feedback(success, false);
+                page.show_confirmation(success);
             }
             Ok(Err(error)) => page.restore_after_error(&format!("Profile error: {error}")),
             Err(_) => page.restore_after_error("Profile update stopped unexpectedly"),
@@ -6613,49 +8031,52 @@ fn run_profile_mutation(
 }
 
 fn open_profile_editor(page: ServerPage) {
-    let window = adw::Window::builder()
-        .application(&page.app)
-        .title("Create profile")
-        .default_width(440)
-        .default_height(220)
-        .modal(true)
-        .build();
-    if let Some(parent) = page.app.active_window() {
-        window.set_transient_for(Some(&parent));
-    }
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let header = adw::HeaderBar::new();
-    header.set_title_widget(Some(&gtk::Label::new(Some("Create profile"))));
-    let create = gtk::Button::with_label("Create");
-    create.add_css_class("suggested-action");
-    header.pack_end(&create);
-    root.append(&header);
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    content.add_css_class("toolport-dialog-content");
-    content.append(&section_heading(
-        "Profile name",
-        "A new profile starts with every server disabled.",
-    ));
+    #[allow(deprecated)]
+    let dialog = adw::MessageDialog::new(
+        page.app.active_window().as_ref(),
+        Some("Create a profile"),
+        Some("Profiles let you switch between server sets for different workflows. New profiles start with every server disabled."),
+    );
+    dialog.add_css_class("toolport-native");
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("create", "Create profile");
+    dialog.set_close_response("cancel");
+    dialog.set_default_response(Some("create"));
+    dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
+    dialog.set_response_enabled("create", false);
+
+    let field = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    field.add_css_class("toolport-form-section");
+    field.append(
+        &gtk::Label::builder()
+            .label("Profile name")
+            .halign(gtk::Align::Start)
+            .css_classes(["toolport-field-label"])
+            .build(),
+    );
     let name = gtk::Entry::builder()
         .placeholder_text("Work")
+        .activates_default(true)
+        .width_chars(28)
         .css_classes(["toolport-input"])
         .build();
-    content.append(&name);
-    root.append(&content);
-    window.set_content(Some(&root));
-    let window_for_create = window.clone();
-    create.connect_clicked(move |_| {
-        let value = name.text().to_string();
-        if value.trim().is_empty() {
-            name.grab_focus();
-            return;
-        }
-        window_for_create.close();
-        run_profile_mutation(page.clone(), "Created profile", move || {
-            crate::registry_controller::create_profile(&value)
-        });
+    field.append(&name);
+    dialog.set_extra_child(Some(&field));
+
+    let dialog_for_name = dialog.clone();
+    name.connect_changed(move |name| {
+        dialog_for_name.set_response_enabled("create", !name.text().trim().is_empty());
     });
-    window.present();
+    dialog.connect_response(None, move |dialog, response| {
+        if response == "create" {
+            let value = name.text().trim().to_string();
+            run_profile_mutation(page.clone(), "Created profile", move || {
+                crate::registry_controller::create_profile(&value)
+            });
+        }
+        dialog.close();
+    });
+    dialog.present();
 }
 
 fn confirm_delete_profile(page: ServerPage) {
@@ -6720,14 +8141,13 @@ fn summary_item(value: &str, label: &str) -> (gtk::Box, gtk::Label) {
     (item, value)
 }
 
-/// Window geometry persisted across launches. Only size and maximized state:
-/// position and stacking belong to the compositor (the tiling contract), and a
-/// tiling compositor is free to ignore the size hint too.
+/// Window size persisted across launches. Position, stacking, and maximized
+/// state belong to the compositor. Restoring a stale maximized flag made
+/// Hyprland sometimes reuse the previous tile geometry in a different layout.
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct WindowState {
     width: i32,
     height: i32,
-    maximized: bool,
 }
 
 fn window_state_path() -> Option<std::path::PathBuf> {
@@ -6751,7 +8171,6 @@ fn save_window_state(window: &adw::ApplicationWindow) {
     let state = WindowState {
         width: window.width(),
         height: window.height(),
-        maximized: window.is_maximized(),
     };
     if state.width < 200 || state.height < 200 {
         // Not realized yet (hidden launch) - keep the previous saved state.
@@ -6803,6 +8222,25 @@ fn approval_notification(view: &crate::approval_broker::PendingView) -> (String,
             view.server, view.tool
         ),
     )
+}
+
+fn approval_queue_notification(
+    pending: &[crate::approval_broker::PendingView],
+) -> Option<(String, String)> {
+    let first = pending.first()?;
+    let (title, mut body) = approval_notification(first);
+    if pending.len() == 1 {
+        return Some((title, body));
+    }
+    let remaining = pending.len() - 1;
+    body.push_str(&format!(
+        " {remaining} more {} waiting.",
+        if remaining == 1 { "is" } else { "are" }
+    ));
+    Some((
+        format!("Toolport: {} approvals required", pending.len()),
+        body,
+    ))
 }
 
 /// One row's health line and badge class from a finished probe.
@@ -6888,12 +8326,7 @@ fn server_card(
     card.set_margin_top(1);
     card.set_margin_bottom(1);
 
-    let icon = gtk::Image::from_icon_name(match server.transport.as_str() {
-        "Remote HTTP" | "Remote SSE" => "network-server-symbolic",
-        "Local stdio" => "utilities-terminal-symbolic",
-        _ => "applications-system-symbolic",
-    });
-    icon.add_css_class("toolport-card-icon");
+    let icon = branding::server_logo(&server.name, &server.transport);
     card.append(&icon);
 
     let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -6905,19 +8338,19 @@ fn server_card(
             .css_classes(["heading"])
             .build(),
     );
-    text.append(
-        &gtk::Label::builder()
-            .label(&server.transport)
-            .halign(gtk::Align::Start)
-            .css_classes(["toolport-muted"])
-            .build(),
-    );
+    // Transport and health share one line: a card per server is already the
+    // densest thing on the page, and a third stacked line made each row read as
+    // a paragraph.
     let health = gtk::Label::builder()
-        .label("Checking…")
+        .label(if server.enabled && !server.requires_review {
+            format!("{} · Checking…", server.transport)
+        } else {
+            server.transport.clone()
+        })
         .halign(gtk::Align::Start)
         .xalign(0.0)
-        .visible(server.enabled && !server.requires_review)
-        .css_classes(["toolport-muted", "caption"])
+        .wrap(true)
+        .css_classes(["toolport-muted"])
         .build();
     text.append(&health);
     card.append(&text);
@@ -6968,14 +8401,15 @@ fn server_card(
             server.id.clone(),
             HealthRow {
                 label: health.clone(),
+                transport: server.transport.clone(),
                 authenticate: authenticate.clone(),
                 copy_error: copy_error.clone(),
             },
         );
         // Show the last known result immediately; the in-flight round replaces it.
         if let Some(previous) = page.probe_results.borrow().get(&server.id) {
-            let (line, class) = probe_status_line(previous);
-            health.set_label(&line);
+            let (status, class) = probe_status_line(previous);
+            health.set_label(&format!("{} · {status}", server.transport));
             health.add_css_class(class);
             authenticate.set_visible(previous.auth_required);
             copy_error.set_visible(!previous.ok && previous.error.is_some());
@@ -7034,13 +8468,10 @@ fn server_card(
                         page.render(state::RegistryState::Ready(
                             state::RegistrySnapshot::from_registry(registry),
                         ));
-                        page.show_feedback(
-                            &format!(
-                                "{} {server_name}",
-                                if enabled { "Enabled" } else { "Disabled" }
-                            ),
-                            false,
-                        );
+                        page.show_confirmation(&format!(
+                            "{} {server_name}",
+                            if enabled { "Enabled" } else { "Disabled" }
+                        ));
                     }
                     Ok(Err(error)) => {
                         page.restore_after_error(&format!(
@@ -7144,6 +8575,7 @@ fn server_card(
     actions.append(&remove);
     let popover = gtk::Popover::new();
     popover.add_css_class("toolport-action-menu");
+    popover.add_css_class("toolport-menu");
     popover.set_child(Some(&actions));
     let menu = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
@@ -7192,7 +8624,7 @@ fn open_profile_tool_scope(
     ));
     let feedback = gtk::Label::builder()
         .label("Loading server tools…")
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
         .css_classes(["toolport-feedback"])
@@ -7243,7 +8675,7 @@ fn open_profile_tool_scope(
                     page.render(state::RegistryState::Ready(
                         state::RegistrySnapshot::from_registry(registry),
                     ));
-                    page.show_feedback("Updated the active profile's tool scope.", false);
+                    page.show_confirmation("Updated the active profile's tool scope.");
                     window.close();
                 }
                 Ok(Err(error)) => {
@@ -7358,7 +8790,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
         "Paste a bearer token for this server. Toolport stores it in the system keychain and never displays it again.",
     ));
     let feedback = gtk::Label::builder()
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
         .css_classes(["toolport-feedback"])
@@ -7369,7 +8801,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
     // What the server actually wants, probed live so the user does not have to
     // guess between a token paste and a browser sign-in.
     let guidance = gtk::Label::builder()
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
         .visible(false)
@@ -7467,7 +8899,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
     // registry one: a lost/locked keychain must not read as "stored", and
     // unknown must not read as absent (SBS-722).
     let secret_status = gtk::Label::builder()
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
         .xalign(0.0)
         .wrap(true)
         .visible(false)
@@ -7721,7 +9153,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                     feedback.remove_css_class("error");
                     feedback.add_css_class("success");
                     remove.set_sensitive(true);
-                    page.show_feedback(&format!("Authenticated {server_name}"), false);
+                    page.show_confirmation(&format!("Authenticated {server_name}"));
                 }
                 Ok(Err(error)) => {
                     feedback.set_label(&error);
@@ -7771,7 +9203,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                     feedback.remove_css_class("error");
                     feedback.add_css_class("success");
                     remove.set_sensitive(true);
-                    page.show_feedback(&format!("Updated authentication for {server_name}"), false);
+                    page.show_confirmation(&format!("Updated authentication for {server_name}"));
                 }
                 Ok(Err(error)) => {
                     feedback.set_label(&error);
@@ -7811,7 +9243,7 @@ fn open_authentication_editor(server: state::ServerView, page: ServerPage) {
                     feedback.set_label("No bearer token is stored for this server.");
                     feedback.remove_css_class("error");
                     feedback.add_css_class("success");
-                    page.show_feedback(&format!("Removed authentication for {server_name}"), false);
+                    page.show_confirmation(&format!("Removed authentication for {server_name}"));
                 }
                 Ok(Err(error)) => {
                     button.set_sensitive(true);
@@ -7842,18 +9274,15 @@ fn test_server_connection(server: &state::ServerView, button: &gtk::Button, page
                 .await;
         button.set_sensitive(true);
         match result {
-            Ok(Ok(probe)) if probe.ok => page.show_feedback(
-                &format!(
-                    "{server_name} connected and exposed {} {}",
-                    probe.tool_count,
-                    if probe.tool_count == 1 {
-                        "tool"
-                    } else {
-                        "tools"
-                    }
-                ),
-                false,
-            ),
+            Ok(Ok(probe)) if probe.ok => page.show_confirmation(&format!(
+                "{server_name} connected and exposed {} {}",
+                probe.tool_count,
+                if probe.tool_count == 1 {
+                    "tool"
+                } else {
+                    "tools"
+                }
+            )),
             Ok(Ok(probe)) if probe.auth_required => page.show_feedback(
                 &format!("{server_name} needs credentials before it can connect"),
                 true,
@@ -7927,7 +9356,8 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
     );
     content.append(&intro);
     let feedback = gtk::Label::builder()
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
+        .xalign(0.0)
         .wrap(true)
         .visible(false)
         .css_classes(["toolport-feedback", "error"])
@@ -7944,7 +9374,7 @@ fn open_credentials_editor(server: state::ServerView, page: ServerPage) {
         stored.append(
             &gtk::Label::builder()
                 .label("No credential keys are declared for this server.")
-                .halign(gtk::Align::Start)
+                .halign(gtk::Align::Fill)
                 .xalign(0.0)
                 .wrap(true)
                 .css_classes(["toolport-muted"])
@@ -8159,7 +9589,7 @@ fn finish_credential_update(
             page.render(state::RegistryState::Ready(
                 state::RegistrySnapshot::from_registry(registry),
             ));
-            page.show_feedback(&format!("{action} credential"), false);
+            page.show_confirmation(&format!("{action} credential"));
             editor.close();
         }
         Ok(Err(error)) => {
@@ -8177,7 +9607,7 @@ fn finish_credential_update(
 
 fn open_server_editor(server: Option<state::ServerView>, page: ServerPage) {
     let server_id = server.as_ref().map(|server| server.id.clone());
-    open_server_editor_prefilled(server, server_id, page)
+    open_server_editor_prefilled(server, server_id, page, None);
 }
 
 /// Duplicate-for-another-account: the Add editor prefilled from an existing
@@ -8197,7 +9627,7 @@ fn open_duplicate_server_editor(server: &state::ServerView, page: ServerPage) {
         .unwrap_or_default();
     let mut copy = server.clone();
     copy.name = duplicate_server_name(&server.name, &existing);
-    open_server_editor_prefilled(Some(copy), None, page)
+    open_server_editor_prefilled(Some(copy), None, page, None);
 }
 
 /// The next free "Name (N)" among existing names, case-insensitively; an
@@ -8226,35 +9656,34 @@ fn duplicate_server_name(name: &str, existing: &[String]) -> String {
     }
 }
 
+/// `url_placeholder` overrides the generic URL example for catalog entries that
+/// carry a `url_hint`: the user has to supply their own instance endpoint, so
+/// the hint is a placeholder, never prefilled text they could save verbatim.
+/// Returns the editor window so callers can refresh once it closes.
 fn open_server_editor_prefilled(
     server: Option<state::ServerView>,
     server_id: Option<String>,
     page: ServerPage,
-) {
-    let Some(parent) = page.app.active_window() else {
-        return;
-    };
+    url_placeholder: Option<&str>,
+) -> Option<adw::Window> {
+    let parent = page.app.active_window()?;
     let editing = server_id.is_some();
     let editor = adw::Window::builder()
         .application(&page.app)
         .transient_for(&parent)
         .modal(true)
         .title(if editing { "Edit server" } else { "Add server" })
-        .default_width(640)
-        .default_height(700)
+        .default_width(620)
+        .default_height(660)
         .build();
     editor.add_css_class("toolport-editor");
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = adw::HeaderBar::new();
-    let cancel = gtk::Button::with_label("Cancel");
-    cancel.add_css_class("toolport-secondary-action");
     let test = gtk::Button::with_label("Test connection");
     test.add_css_class("toolport-secondary-action");
     let save = gtk::Button::with_label(if editing { "Save" } else { "Add" });
     save.add_css_class("suggested-action");
-    header.pack_start(&cancel);
-    header.pack_start(&test);
     header.pack_end(&save);
     root.append(&header);
 
@@ -8262,24 +9691,21 @@ fn open_server_editor_prefilled(
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
         .build();
-    let form = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    let form = gtk::Box::new(gtk::Orientation::Vertical, 12);
     form.add_css_class("toolport-editor-body");
-    form.append(&editor_intro(
-        if editing {
-            "document-edit-symbolic"
-        } else {
-            "list-add-symbolic"
-        },
-        if editing {
-            "Edit server"
-        } else {
-            "Add a server"
-        },
-        "Connect a local command or a remote MCP endpoint to every Toolport client.",
-    ));
+    form.append(
+        &gtk::Label::builder()
+            .label("Connect a local command or remote MCP endpoint to every Toolport client.")
+            .halign(gtk::Align::Fill)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["toolport-editor-lede"])
+            .build(),
+    );
 
     let feedback = gtk::Label::builder()
-        .halign(gtk::Align::Start)
+        .halign(gtk::Align::Fill)
+        .xalign(0.0)
         .wrap(true)
         .visible(false)
         .css_classes(["toolport-feedback", "error"])
@@ -8302,7 +9728,7 @@ fn open_server_editor_prefilled(
         .placeholder_text("My MCP server")
         .css_classes(["toolport-input"])
         .build();
-    let identity = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    let identity = gtk::Box::new(gtk::Orientation::Vertical, 8);
     identity.add_css_class("toolport-form-section");
     identity.append(&section_heading(
         "Identity",
@@ -8313,7 +9739,7 @@ fn open_server_editor_prefilled(
         // Soft warning only: multiple accounts under one name are legitimate,
         // the user just needs to know a second entry is what they will get.
         let duplicate_warning = gtk::Label::builder()
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .visible(false)
@@ -8355,7 +9781,7 @@ fn open_server_editor_prefilled(
             _ => 0,
         },
     );
-    let connection = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let connection = gtk::Box::new(gtk::Orientation::Vertical, 10);
     connection.add_css_class("toolport-form-section");
     connection.append(&section_heading(
         "Connection",
@@ -8419,12 +9845,14 @@ fn open_server_editor_prefilled(
                 .and_then(|server| server.url.as_deref())
                 .unwrap_or(""),
         )
-        .placeholder_text("https://example.com/mcp")
+        .placeholder_text(url_placeholder.unwrap_or("https://example.com/mcp"))
         .hexpand(true)
         .css_classes(["toolport-input"])
         .build();
     let url_row = editor_field("Server URL", &url);
     connection.append(&url_row);
+    test.set_halign(gtk::Align::End);
+    connection.append(&test);
     form.append(&connection);
 
     let credentials = gtk::Label::builder()
@@ -8441,12 +9869,21 @@ fn open_server_editor_prefilled(
     form.append(&credentials);
 
     if !editing {
-        let paste = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        paste.add_css_class("toolport-form-section");
-        paste.append(&section_heading(
-            "Start from a pasted config",
-            "Paste a JSON, TOML, or YAML MCP snippet, or a claude mcp add command, and Toolport fills the fields.",
-        ));
+        let paste = gtk::Expander::new(Some("Start from a pasted config"));
+        paste.add_css_class("toolport-paste-expander");
+        let paste_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        paste_content.set_margin_top(6);
+        paste_content.set_margin_bottom(12);
+        paste_content.append(
+            &gtk::Label::builder()
+                .label("Paste JSON, TOML, YAML, or a claude mcp add command and Toolport will fill the form.")
+                .halign(gtk::Align::Fill)
+                .hexpand(true)
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["toolport-muted"])
+                .build(),
+        );
         let snippet = gtk::TextView::new();
         snippet.set_monospace(true);
         snippet.set_wrap_mode(gtk::WrapMode::WordChar);
@@ -8456,14 +9893,15 @@ fn open_server_editor_prefilled(
         snippet.set_right_margin(8);
         let snippet_scroller = gtk::ScrolledWindow::builder()
             .child(&snippet)
-            .min_content_height(88)
+            .min_content_height(64)
             .build();
         snippet_scroller.add_css_class("toolport-text-area");
-        paste.append(&snippet_scroller);
+        paste_content.append(&snippet_scroller);
         let fill = gtk::Button::with_label("Fill from snippet");
         fill.add_css_class("toolport-secondary-action");
         fill.set_halign(gtk::Align::Start);
-        paste.append(&fill);
+        paste_content.append(&fill);
+        paste.set_child(Some(&paste_content));
         form.insert_child_after(&paste, Some(&feedback));
 
         let feedback_for_fill = feedback.clone();
@@ -8552,16 +9990,13 @@ fn open_server_editor_prefilled(
     });
 
     let clamp = adw::Clamp::builder()
-        .maximum_size(720)
+        .maximum_size(680)
         .tightening_threshold(520)
         .child(&form)
         .build();
     scroller.set_child(Some(&clamp));
     root.append(&scroller);
     editor.set_content(Some(&root));
-
-    let editor_for_cancel = editor.clone();
-    cancel.connect_clicked(move |_| editor_for_cancel.close());
 
     let server_id_for_test = server_id.clone();
     let feedback_for_test = feedback.clone();
@@ -8677,15 +10112,17 @@ fn open_server_editor_prefilled(
                     page.render(state::RegistryState::Ready(
                         state::RegistrySnapshot::from_registry(registry),
                     ));
-                    page.show_feedback(
-                        &server_saved_feedback(
-                            editing,
-                            &display_name,
-                            &declared_without_value,
-                            &failed_env,
-                        ),
-                        !failed_env.is_empty(),
+                    let message = server_saved_feedback(
+                        editing,
+                        &display_name,
+                        &declared_without_value,
+                        &failed_env,
                     );
+                    if failed_env.is_empty() {
+                        page.show_confirmation(&message);
+                    } else {
+                        page.show_feedback(&message, true);
+                    }
                     editor.close();
                 }
                 Ok(Err(error)) => {
@@ -8702,6 +10139,7 @@ fn open_server_editor_prefilled(
         });
     });
     editor.present();
+    Some(editor)
 }
 
 fn editor_field(label: &str, child: &impl IsA<gtk::Widget>) -> gtk::Box {
@@ -8807,7 +10245,7 @@ fn editor_intro(icon: &str, title: &str, subtitle: &str) -> gtk::Box {
     copy.append(
         &gtk::Label::builder()
             .label(title)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["title-2"])
@@ -8816,7 +10254,7 @@ fn editor_intro(icon: &str, title: &str, subtitle: &str) -> gtk::Box {
     copy.append(
         &gtk::Label::builder()
             .label(subtitle)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["toolport-muted"])
@@ -8838,7 +10276,7 @@ fn section_heading(title: &str, subtitle: &str) -> gtk::Box {
     heading.append(
         &gtk::Label::builder()
             .label(subtitle)
-            .halign(gtk::Align::Start)
+            .halign(gtk::Align::Fill)
             .xalign(0.0)
             .wrap(true)
             .css_classes(["toolport-muted", "caption"])
@@ -8896,7 +10334,7 @@ fn confirm_remove_server(server_id: &str, server_name: &str, page: ServerPage) {
                     page.render(state::RegistryState::Ready(
                         state::RegistrySnapshot::from_registry(registry),
                     ));
-                    page.show_feedback(&format!("Removed {server_name}"), false);
+                    page.show_confirmation(&format!("Removed {server_name}"));
                 }
                 Ok(Err(error)) => {
                     page.restore_after_error(&format!("Could not remove {server_name}: {error}"));
@@ -8945,6 +10383,90 @@ fn state_card(icon_name: &str, title: &str, body: &str, error: bool) -> gtk::Box
 mod tests {
     use super::*;
 
+    #[test]
+    fn unchanged_activity_sections_do_not_rebuild_open_rows() {
+        let rows = vec![serde_json::json!({"ts": 1, "tool": "linear__save_issue"})];
+        assert!(!activity_section_changed(Some(&rows), &rows));
+        assert!(activity_section_changed(None, &rows));
+        assert!(activity_section_changed(
+            Some(&rows),
+            &[serde_json::json!({"ts": 2, "tool": "linear__save_issue"})]
+        ));
+    }
+
+    #[test]
+    fn rebuilt_activity_rows_restore_each_expansion_independently() {
+        let mut expanded = std::collections::HashSet::new();
+        remember_activity_expansion(&mut expanded, "security:linear", true);
+        remember_activity_expansion(&mut expanded, "trace:42", true);
+        assert!(expanded.contains("security:linear"));
+        assert!(expanded.contains("trace:42"));
+
+        remember_activity_expansion(&mut expanded, "security:linear", false);
+        assert!(!expanded.contains("security:linear"));
+        assert!(expanded.contains("trace:42"));
+    }
+
+    #[test]
+    fn drift_review_explains_changed_fields_and_annotation_values() {
+        let event = serde_json::json!({
+            "type": "tool_drift",
+            "change": "changed",
+            "changed_fields": ["description", "annotations"],
+            "prev_ro": true,
+            "new_ro": false,
+            "prev_dh": null,
+            "new_dh": null
+        });
+        assert_eq!(
+            security_review_lines(&event),
+            vec![
+                "Definition changed since Toolport's trusted baseline.",
+                "Changed field: Description",
+                "Changed field: Annotations",
+                "readOnlyHint: true to false",
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_drift_review_is_honest_about_missing_detail() {
+        let event = serde_json::json!({
+            "type": "tool_drift",
+            "change": "changed",
+            "prev_ro": null,
+            "new_ro": null,
+            "prev_dh": null,
+            "new_dh": null
+        });
+        assert_eq!(
+            security_review_lines(&event),
+            vec![
+                "Definition changed since Toolport's trusted baseline.",
+                "This older event does not contain field-level change details.",
+            ]
+        );
+    }
+
+    #[test]
+    fn injection_review_exposes_detection_context() {
+        let event = serde_json::json!({
+            "type": "result_injection_blocked",
+            "signatures": ["instruction_override"],
+            "score": 0.94,
+            "evidence": "ignore previous instructions"
+        });
+        assert_eq!(
+            security_review_lines(&event),
+            vec![
+                "Toolport blocked this result before it reached the requesting agent.",
+                "Matched signals: instruction override",
+                "Detection score: 0.94",
+                "Matched text: ignore previous instructions",
+            ]
+        );
+    }
+
     fn call(server: &str, ok: bool) -> state::ActivityView {
         state::ActivityView {
             timestamp_ms: 0,
@@ -8972,6 +10494,10 @@ mod tests {
         assert_eq!(filter_calls(&calls, Some("github"), true).len(), 1);
         assert_eq!(filter_calls(&calls, None, true).len(), 2);
         assert_eq!(filter_calls(&calls, Some("missing"), false).len(), 0);
+        assert_eq!(
+            activity_server_filter_options(&calls),
+            vec!["All servers", "github", "jira"]
+        );
     }
 
     #[test]
@@ -9041,19 +10567,13 @@ mod tests {
 
     #[test]
     fn savings_lines_price_detail_and_share_read_like_the_shipping_banner() {
-        assert_eq!(
-            savings_dollar_line(2_000_000, 1),
-            "≈ $6.00 at Claude Sonnet input prices"
-        );
-        assert_eq!(
-            savings_dollar_line(2_000_000, 999),
-            "≈ $6.00 at Claude Sonnet input prices"
-        );
+        assert_eq!(savings_dollar_line(2_000_000, 1), "≈ $6.00");
+        assert_eq!(savings_dollar_line(2_000_000, 999), "≈ $6.00");
         assert_eq!(
             savings_detail_line(12, 80, Some("Mar 4".to_string())),
-            "across 12 tool-list loads · biggest catalog collapsed 80 tools to a handful · since Mar 4"
+            "12 catalog loads · peak 80 tools · since Mar 4"
         );
-        assert_eq!(savings_detail_line(1, 3, None), "across 1 tool-list load");
+        assert_eq!(savings_detail_line(1, 3, None), "1 catalog load");
         assert_eq!(
             savings_share_line(41_100),
             "Toolport keeps ~41.1k tokens of MCP tool definitions out of my agent's context \
@@ -9128,15 +10648,24 @@ mod tests {
         let state = WindowState {
             width: 1280,
             height: 800,
-            maximized: true,
         };
         let encoded = serde_json::to_string(&state).unwrap();
         assert_eq!(parse_window_state(&encoded), Some(state));
-        assert_eq!(
-            parse_window_state("{\"width\":10,\"height\":800,\"maximized\":false}"),
-            None
-        );
+        assert_eq!(parse_window_state("{\"width\":10,\"height\":800}"), None);
         assert_eq!(parse_window_state("not json"), None);
+    }
+
+    #[test]
+    fn security_review_scroll_aligns_the_header_instead_of_jumping_to_the_bottom() {
+        assert_eq!(
+            aligned_scroll_value(900.0, -300.0, 0.0, 2000.0, 600.0),
+            588.0
+        );
+        assert_eq!(aligned_scroll_value(10.0, -100.0, 0.0, 2000.0, 600.0), 0.0);
+        assert_eq!(
+            aligned_scroll_value(1300.0, 400.0, 0.0, 2000.0, 600.0),
+            1400.0
+        );
     }
 
     #[test]
@@ -9174,6 +10703,148 @@ mod tests {
                     .to_string()
             )
         );
+
+        let queue = vec![
+            view.clone(),
+            crate::approval_broker::PendingView {
+                id: "2".into(),
+                tool: "delete_issue".into(),
+                url_elicitation: None,
+                ..view
+            },
+        ];
+        assert_eq!(
+            approval_queue_notification(&queue),
+            Some((
+                "Toolport: 2 approvals required".to_string(),
+                "github requested an external browser interaction. Review it in Toolport. 1 more is waiting."
+                    .to_string()
+            ))
+        );
+        assert_eq!(approval_queue_notification(&[]), None);
+    }
+
+    #[test]
+    fn quarantine_alert_identity_is_stable_across_poll_order() {
+        let a = serde_json::json!({
+            "profile": "work",
+            "server": "linear",
+            "tool": "save_issue"
+        });
+        let b = serde_json::json!({
+            "profile": "",
+            "server": "github",
+            "tool": "delete_repo"
+        });
+        assert_eq!(
+            quarantine_signature(&[a.clone(), b.clone()]),
+            quarantine_signature(&[b, a])
+        );
+    }
+
+    #[test]
+    fn security_watch_baselines_startup_and_only_announces_new_attention() {
+        let injection = serde_json::json!({
+            "ts": 1000,
+            "type": "result_injection",
+            "server": "linear",
+            "tool": "get_issue",
+            "change": "result",
+            "severity": "high"
+        });
+        let (baseline, startup) =
+            newly_observed_security_events(None, std::slice::from_ref(&injection), &[]);
+        assert!(startup.is_empty());
+        let (_, unchanged) =
+            newly_observed_security_events(Some(&baseline), std::slice::from_ref(&injection), &[]);
+        assert!(unchanged.is_empty());
+
+        let mut later = injection.clone();
+        later["ts"] = serde_json::json!(2000);
+        let (_, newcomers) = newly_observed_security_events(Some(&baseline), &[later], &[]);
+        assert_eq!(newcomers.len(), 1);
+    }
+
+    #[test]
+    fn quarantine_suppresses_duplicate_drift_alerts_but_not_injection_alerts() {
+        let quarantine = serde_json::json!({
+            "server": "linear",
+            "tool": "linear__save_issue",
+            "change": "changed"
+        });
+        let drift = serde_json::json!({
+            "ts": 1000,
+            "type": "tool_drift",
+            "server": "linear",
+            "tool": "linear__save_issue",
+            "change": "changed",
+            "severity": "high"
+        });
+        let injection = serde_json::json!({
+            "ts": 1001,
+            "type": "result_injection_blocked",
+            "server": "linear",
+            "tool": "linear__save_issue",
+            "change": "result",
+            "severity": "high"
+        });
+        assert!(security_event_covered_by_quarantine(
+            &drift,
+            std::slice::from_ref(&quarantine)
+        ));
+        assert!(!security_event_covered_by_quarantine(
+            &injection,
+            &[quarantine]
+        ));
+    }
+
+    #[test]
+    fn a_blocked_injection_is_one_user_facing_incident() {
+        let detected = serde_json::json!({
+            "ts": 1000,
+            "type": "result_injection",
+            "server": "linear",
+            "tool": "get_issue",
+            "change": "result",
+            "severity": "high"
+        });
+        let blocked = serde_json::json!({
+            "ts": 1001,
+            "type": "result_injection_blocked",
+            "server": "linear",
+            "tool": "get_issue",
+            "change": "result",
+            "severity": "high"
+        });
+        let incidents = security_attention_incidents(&[detected, blocked.clone()]);
+        assert_eq!(incidents, vec![blocked.clone()]);
+        assert_eq!(
+            security_alert_copy(&incidents),
+            (
+                "Toolport: security finding".to_string(),
+                "Toolport blocked an injected tool result. Review the retained details in Activity."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn reviewing_a_high_finding_does_not_hide_a_later_recurrence() {
+        let finding = |ts| {
+            serde_json::json!({
+                "ts": ts,
+                "type": "result_injection",
+                "server": "linear",
+                "tool": "get_issue",
+                "change": "result",
+                "severity": "high"
+            })
+        };
+        let reviewed = finding(1000);
+        let markers = vec![security_dismissal_key(&reviewed)];
+        assert!(security_event_is_dismissed(&finding(999), &markers));
+        assert!(security_event_is_dismissed(&reviewed, &markers));
+        assert!(!security_event_is_dismissed(&finding(1001), &markers));
     }
 
     #[test]
@@ -9324,6 +10995,10 @@ mod tests {
         );
         let without_latency = serde_json::json!({ "calls": 1, "errors": 0 });
         assert_eq!(stat_metrics_line(&without_latency), "1 call · 0 errors");
+        assert_eq!(
+            stat_server_name(&serde_json::json!({ "server": "" })),
+            "Unknown server"
+        );
     }
 
     #[test]

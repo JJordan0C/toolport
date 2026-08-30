@@ -581,6 +581,16 @@ fn catalog_server(entry: crate::catalog::CatalogEntry) -> ServerEntry {
 }
 
 pub fn add_catalog_entry(entry: crate::catalog::CatalogEntry) -> Result<Registry, String> {
+    // Self-hosted entries carry a url_hint instead of a url, because the
+    // endpoint is the user's own instance. Committing one here would write a
+    // server with no way to reach anything, so both shells send these through
+    // the prefilled server editor and this stays a backstop.
+    if entry.url.is_none() && entry.command.is_none() {
+        return Err(format!(
+            "{} needs its own endpoint URL. Open it from the catalog to enter one.",
+            entry.name
+        ));
+    }
     let server = catalog_server(entry);
     let (registry, _) = registry::update(|registry| Ok(apply_add_entry(registry, server)))?;
     Ok(registry)
@@ -1771,6 +1781,30 @@ fn set_server_enabled_at(
 mod tests {
     use super::*;
     use crate::registry::ServerEntry;
+
+    /// Every self-hosted catalog entry must be rejected by the one-click add,
+    /// because it has no endpoint yet. Both shells route these to the server
+    /// editor; this proves nothing can slip past into an unusable server.
+    #[test]
+    fn self_hosted_catalog_entries_are_refused_by_the_one_click_add() {
+        let self_hosted = crate::catalog::curated()
+            .into_iter()
+            .filter(|entry| entry.url_hint.is_some())
+            .collect::<Vec<_>>();
+        assert!(
+            !self_hosted.is_empty(),
+            "expected self-hosted catalog entries"
+        );
+        for entry in self_hosted {
+            let name = entry.name.clone();
+            let error = add_catalog_entry(entry)
+                .expect_err(&format!("{name} was added without an endpoint"));
+            assert!(
+                error.contains(&name),
+                "error should name the server: {error}"
+            );
+        }
+    }
 
     fn server(id: &str) -> ServerEntry {
         ServerEntry {

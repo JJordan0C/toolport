@@ -13,7 +13,7 @@ use serde_json::Value;
 const REGISTRY_URL: &str = "https://registry.modelcontextprotocol.io/v0/servers";
 
 /// One addable server: enough to create a registry entry, plus display metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogEntry {
     pub name: String,
@@ -342,7 +342,7 @@ fn filter_catalog(list: Vec<CatalogEntry>, query: &str) -> Vec<CatalogEntry> {
 }
 
 /// Popular entries (user + curated) matching a query.
-fn popular_matching(query: &str) -> Vec<CatalogEntry> {
+pub fn search_curated(query: &str) -> Vec<CatalogEntry> {
     filter_catalog(popular(), query)
 }
 
@@ -351,7 +351,7 @@ fn popular_matching(query: &str) -> Vec<CatalogEntry> {
 /// name. This is why popular picks like Vercel always surface even when the
 /// registry's own search doesn't return them.
 pub fn search(query: &str) -> Result<Vec<CatalogEntry>, String> {
-    let mut out = popular_matching(query);
+    let mut out = search_curated(query);
     let mut seen: std::collections::HashSet<String> =
         out.iter().map(|e| e.name.to_lowercase()).collect();
     if !query.trim().is_empty() {
@@ -364,7 +364,44 @@ pub fn search(query: &str) -> Result<Vec<CatalogEntry>, String> {
             }
         }
     }
+    rank_search_results(&mut out, query);
     Ok(out)
+}
+
+fn rank_search_results(entries: &mut [CatalogEntry], query: &str) {
+    let query = query.trim().to_lowercase();
+    entries.sort_by(|a, b| {
+        catalog_match_score(b, &query)
+            .cmp(&catalog_match_score(a, &query))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+
+fn catalog_match_score(entry: &CatalogEntry, query: &str) -> i32 {
+    let name = entry.name.to_lowercase();
+    let description = entry.description.to_lowercase();
+    let category = entry.category.to_lowercase();
+    let mut score = if entry.source == "curated" { 10_000 } else { 0 };
+    if name == query {
+        score += 5_000;
+    } else if name.starts_with(query) {
+        score += 3_000;
+    } else if name.contains(query) {
+        score += 2_000;
+    } else if query.split_whitespace().all(|term| name.contains(term)) {
+        score += 1_500;
+    } else if category.contains(query) {
+        score += 800;
+    } else if description.contains(query) {
+        score += 500;
+    }
+    if entry.url.is_some() {
+        score += 100;
+    }
+    if entry.homepage.is_some() {
+        score += 25;
+    }
+    score
 }
 
 /// npm/yarn/pnpm remote specs that `npx -y` will fetch outside the registry.
@@ -608,6 +645,14 @@ fn is_latest(item: &Value) -> bool {
         .unwrap_or(true)
 }
 
+fn is_active(item: &Value) -> bool {
+    item.get("_meta")
+        .and_then(|m| m.get("io.modelcontextprotocol.registry/official"))
+        .and_then(|o| o.get("status"))
+        .and_then(|v| v.as_str())
+        .is_none_or(|status| status == "active")
+}
+
 /// Search the official MCP Registry. Empty query lists popular/recent servers.
 pub fn search_registry(query: &str) -> Result<Vec<CatalogEntry>, String> {
     let q = query.trim();
@@ -637,7 +682,7 @@ pub fn search_registry(query: &str) -> Result<Vec<CatalogEntry>, String> {
 
     Ok(items
         .iter()
-        .filter(|item| is_latest(item))
+        .filter(|item| is_latest(item) && is_active(item))
         .filter_map(|item| map_server(item.get("server").unwrap_or(item)))
         .collect())
 }
@@ -680,6 +725,37 @@ mod tests {
             .any(|e| e.name == "Neon"));
         // Empty query returns the full set.
         assert_eq!(filter_catalog(curated(), "").len(), curated().len());
+    }
+
+    #[test]
+    fn search_ranking_prefers_curated_and_exact_name_matches() {
+        let stripe = curated()
+            .into_iter()
+            .find(|entry| entry.name == "Stripe")
+            .unwrap();
+        let mut registry_prefix = stripe.clone();
+        registry_prefix.name = "Stripe helper".into();
+        registry_prefix.source = "registry".into();
+        let mut results = vec![registry_prefix, stripe];
+        rank_search_results(&mut results, "stripe");
+        assert_eq!(results[0].name, "Stripe");
+    }
+
+    #[test]
+    fn registry_lifecycle_filter_excludes_inactive_entries() {
+        let item = |status| {
+            json!({
+                "_meta": {
+                    "io.modelcontextprotocol.registry/official": {
+                        "status": status,
+                        "isLatest": true
+                    }
+                }
+            })
+        };
+        assert!(is_active(&item("active")));
+        assert!(!is_active(&item("deprecated")));
+        assert!(!is_active(&item("deleted")));
     }
 
     #[test]

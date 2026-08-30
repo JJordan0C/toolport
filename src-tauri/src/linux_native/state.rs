@@ -74,11 +74,7 @@ impl ActivitySnapshot {
                         .get("ts")
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0),
-                    server: entry
-                        .get("server")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("Unknown server")
-                        .to_string(),
+                    server: activity_server(&entry),
                     tool: entry
                         .get("tool")
                         .and_then(serde_json::Value::as_str)
@@ -126,6 +122,24 @@ impl ActivitySnapshot {
             server_stats: Vec::new(),
         }
     }
+}
+
+fn activity_server(entry: &serde_json::Value) -> String {
+    if let Some(server) = entry
+        .get("server")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|server| !server.is_empty())
+    {
+        return server.to_string();
+    }
+    entry
+        .get("tool")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|tool| tool.split_once("__").map(|(server, _)| server.trim()))
+        .filter(|server| !server.is_empty())
+        .unwrap_or("Unknown server")
+        .to_string()
 }
 
 /// Group provenance rows by source server for display, preserving the incoming
@@ -198,8 +212,20 @@ fn activity_error_message(value: &serde_json::Value) -> Option<&str> {
 }
 
 pub(super) fn load_activity_snapshot() -> Result<ActivitySnapshot, String> {
-    let entries = crate::audit::read_all()
+    let mut entries = crate::audit::read_all()
         .map_err(|error| format!("could not read retained activity: {error}"))?;
+    for entry in &mut entries {
+        let server = activity_server(entry);
+        let needs_server = entry
+            .get("server")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|server| server.trim().is_empty());
+        if needs_server {
+            if let Some(object) = entry.as_object_mut() {
+                object.insert("server".to_string(), serde_json::Value::String(server));
+            }
+        }
+    }
     let server_stats = crate::audit::stats_for_entries(&entries)
         .get("servers")
         .and_then(serde_json::Value::as_array)
@@ -463,7 +489,7 @@ impl RegistrySnapshot {
     }
 }
 
-fn transport_label(transport: &str) -> &'static str {
+pub(super) fn transport_label(transport: &str) -> &'static str {
     match transport {
         "stdio" => "Local stdio",
         "http" => "Remote HTTP",
@@ -750,6 +776,24 @@ mod tests {
         assert_eq!(snapshot.recent.len(), 100);
         assert_eq!(snapshot.error_count, 1);
         assert_eq!(snapshot.average_duration_ms, Some(10));
+    }
+
+    #[test]
+    fn blank_activity_servers_use_the_qualified_tool_prefix() {
+        let snapshot = ActivitySnapshot::from_entries(
+            vec![serde_json::json!({
+                "server": "",
+                "tool": "cloudflare_full_api__create_pages_domain",
+                "ok": false
+            })],
+            100,
+        );
+
+        assert_eq!(snapshot.recent[0].server, "cloudflare_full_api");
+        assert_eq!(
+            activity_server(&serde_json::json!({ "tool": "unqualified" })),
+            "Unknown server"
+        );
     }
 
     #[test]

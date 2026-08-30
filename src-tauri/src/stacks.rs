@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::catalog::{self, CatalogEntry};
 
 /// One curated stack: a use-case bundle the user can set up in one flow.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Stack {
     /// Stable id (kebab-case), e.g. "fullstack-web".
