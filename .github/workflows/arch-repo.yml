@@ -41,27 +41,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Require a published, non-prerelease tag
+      - name: Check the tag is publishable
         run: |
-          # Listed, not `gh release view`: a draft has no published tag
-          # association, so viewing it by tag reports "not found" and the check
-          # would fail for exactly the release a dry run wants to validate.
-          state="$(gh api --paginate "repos/${{ github.repository }}/releases" \
-            --jq ".[] | select(.tag_name == \"$TAG\") | {draft, prerelease}" | head -1)"
-          if [ -z "$state" ]; then
-            echo "::error::$TAG has no GitHub release, draft or otherwise."
-            exit 1
+          # A dry run only needs the git tag: it builds from the tarball that tag
+          # produces and publishes nothing, so it deliberately does not consult
+          # the release API at all. GITHUB_TOKEN cannot see draft releases, and
+          # validating before publishing is the whole point of a dry run.
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            gh api "repos/${{ github.repository }}/git/ref/tags/$TAG" >/dev/null 2>&1 || {
+              echo "::error::$TAG is not a tag in this repository."; exit 1; }
+            echo "dry run: building from tag $TAG, publishing nothing"
+            exit 0
           fi
-          echo "release state: $state"
-          [ "$(echo "$state" | jq -r .prerelease)" = "false" ] || {
+          # A real publish must correspond to a release users can actually see.
+          state="$(gh release view "$TAG" --json isDraft,isPrerelease 2>/dev/null)" || {
+            echo "::error::$TAG has no published GitHub release. Publish it first."; exit 1; }
+          [ "$(echo "$state" | jq -r .isDraft)" = "false" ] || {
+            echo "::error::$TAG is still a draft. Publish it, or re-run with dry_run to validate only."; exit 1; }
+          [ "$(echo "$state" | jq -r .isPrerelease)" = "false" ] || {
             echo "::error::$TAG is a prerelease; the pacman repo is stable-only."; exit 1; }
-          # A dry run is what you want BEFORE publishing, so a draft is allowed
-          # there. A real publish requires it live: the repo must never serve a
-          # package for a release users cannot see.
-          if [ "$(echo "$state" | jq -r .draft)" = "true" ] && [ "${{ inputs.dry_run }}" != "true" ]; then
-            echo "::error::$TAG is still a draft. Publish it, or re-run with dry_run to validate only."
-            exit 1
-          fi
 
       # The committed PKGBUILD is the single source of truth for what gets built.
       # If it does not describe this tag, something was not updated at release
