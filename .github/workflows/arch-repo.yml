@@ -78,9 +78,9 @@ jobs:
             exit 1
           fi
 
-      # A real chroot-equivalent build. --nodeps is deliberate: GTK and libadwaita
-      # are runtime dependencies this container never has to satisfy to prove the
-      # package builds and lays its files down correctly.
+      # A real chroot-equivalent build. Dependencies are installed rather than
+      # skipped: the shell LINKS against gtk4 and libadwaita, so they are build
+      # requirements, not just runtime ones, and cargo comes from makedepends.
       - name: Build the package in an Arch container
         run: |
           mkdir -p pkgout
@@ -91,7 +91,7 @@ jobs:
             useradd -m builder
             cp /src/packaging/linux/native/PKGBUILD /build/
             chown -R builder /build /out
-            sudo -u builder makepkg --noconfirm --nocheck --syncdeps --nodeps
+            sudo -u builder makepkg --noconfirm --nocheck --syncdeps
             namcap PKGBUILD || true
             pkg=$(ls -1 *.pkg.tar.zst | grep -v -- "-debug-" | head -1)
             echo "built $pkg"
