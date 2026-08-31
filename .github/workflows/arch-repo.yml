@@ -44,9 +44,15 @@ jobs:
       - name: Require a published, non-prerelease tag
         run: |
           state="$(gh release view "$TAG" --json isDraft,isPrerelease,tagName 2>/dev/null)" || {
-            echo "::error::$TAG has no GitHub release. Publish it first."; exit 1; }
-          [ "$(echo "$state" | jq -r .isDraft)" = "false" ] || {
-            echo "::error::$TAG is still a draft. The repo must only serve published releases."; exit 1; }
+            echo "::error::$TAG has no GitHub release."; exit 1; }
+          # A dry run is exactly what you want BEFORE publishing, so it is allowed
+          # against a draft. Only a real publish requires the release to be live,
+          # because the repo must never serve a package for a release users cannot
+          # see.
+          if [ "$(echo "$state" | jq -r .isDraft)" = "true" ] && [ "${{ inputs.dry_run }}" != "true" ]; then
+            echo "::error::$TAG is still a draft. Publish it, or re-run with dry_run to validate only."
+            exit 1
+          fi
           [ "$(echo "$state" | jq -r .isPrerelease)" = "false" ] || {
             echo "::error::$TAG is a prerelease; the pacman repo is stable-only."; exit 1; }
 
