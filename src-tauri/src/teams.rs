@@ -2082,6 +2082,13 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
 
     let transport = str_field("transport").unwrap_or("stdio").to_string();
     let command = str_field("command").map(String::from);
+    let request_timeout_ms = match s.get("requestTimeoutMs").filter(|value| !value.is_null()) {
+        Some(value) => match value.as_u64().filter(|milliseconds| *milliseconds > 0) {
+            Some(milliseconds) => Some(milliseconds),
+            None => return TeamClass::Blocked,
+        },
+        None => None,
+    };
     let mut entry = ServerEntry {
         id,
         name: name.to_string(),
@@ -2097,6 +2104,7 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         // silently downgraded the member to interactive OAuth, which is exactly
         // what this flow exists to avoid; the secret is still theirs to add.
         client_credentials,
+        request_timeout_ms,
         unknown_fields: serde_json::Map::new(),
     };
 
@@ -2821,6 +2829,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         let active = r.active_profile_id.clone().unwrap();
@@ -2848,7 +2857,7 @@ mod tests {
         let mut r = base_registry();
         let cfg = json!({ "servers": [
             { "id": "github", "name": "GitHub", "transport": "http", "url": "https://1.2.3.4/mcp",
-              "env": [{ "key": "TOKEN", "secret": true }] },
+              "env": [{ "key": "TOKEN", "secret": true }], "requestTimeoutMs": 90_000 },
             { "id": "stripe", "name": "Stripe", "transport": "http", "url": "https://1.2.3.5/mcp" }
         ]});
         assert_eq!(apply_team_config(&mut r, "t1", &cfg).applied, 2);
@@ -2860,6 +2869,7 @@ mod tests {
         let gh = r.servers.iter().find(|s| s.id == "team_github").unwrap();
         assert_eq!(gh.source.as_deref(), Some("team:t1"));
         assert_eq!(gh.env[0].key, "TOKEN");
+        assert_eq!(gh.request_timeout_ms, Some(90_000));
         assert!(
             gh.env[0].value.is_none(),
             "no secret value carried from the team"
@@ -3000,6 +3010,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         let cfg = json!({ "servers": [
@@ -3137,6 +3148,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         apply_team_config(
@@ -3764,6 +3776,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         // A team-sourced server: excluded too (don't echo the team's own set back).
@@ -3779,6 +3792,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         let servers = team_server_export(&r);
@@ -4128,6 +4142,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         };
         let fp = consent_fingerprint(&base);

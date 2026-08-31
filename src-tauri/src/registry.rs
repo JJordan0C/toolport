@@ -484,6 +484,10 @@ pub struct ServerEntry {
     /// interactive OAuth and pasted-token behaviour exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_credentials: Option<ClientCredentials>,
+    /// Total deadline for each HTTP request to this server, in milliseconds.
+    /// Unset preserves the historical 30-second default. Only applies to HTTP/SSE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
     /// Per-server fields written by a newer build that this binary doesn't know
     /// about. Captured on load and re-emitted on save so a mixed-version binary
     /// never strips them (same contract as `Registry::unknown_fields`).
@@ -3904,6 +3908,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -4666,6 +4671,23 @@ mod tests {
         assert_eq!(loaded.servers, r.servers);
         assert_eq!(loaded.profiles, r.profiles);
         assert_eq!(loaded.active_profile_id, r.active_profile_id);
+    }
+
+    #[test]
+    fn server_request_timeout_is_optional_and_round_trips_in_milliseconds() {
+        let server = sample_server("remote");
+        let without_timeout = serde_json::to_value(&server).unwrap();
+        assert!(
+            without_timeout.get("requestTimeoutMs").is_none(),
+            "the historical default must not add a registry field"
+        );
+
+        let mut configured = server;
+        configured.request_timeout_ms = Some(75_000);
+        let json = serde_json::to_value(&configured).unwrap();
+        assert_eq!(json["requestTimeoutMs"], 75_000);
+        let loaded: ServerEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded.request_timeout_ms, Some(75_000));
     }
 
     #[test]
@@ -5707,6 +5729,7 @@ mod tests {
             disabled_tools: vec![],
             cwd: None,
             client_credentials: None,
+            request_timeout_ms: None,
             unknown_fields: serde_json::Map::new(),
         });
         // Inject a per-server field this binary's ServerEntry doesn't define.

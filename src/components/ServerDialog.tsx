@@ -225,6 +225,7 @@ export function ServerDialog({
       url: isStdio ? null : form.url.trim() || null,
       source: initial?.source ?? "manual",
       cwd: isStdio ? form.cwd.trim() || null : null,
+      requestTimeoutMs: isStdio ? null : initial?.requestTimeoutMs,
     };
   }
 

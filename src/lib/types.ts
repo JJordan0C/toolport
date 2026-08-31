@@ -345,6 +345,8 @@ export interface ServerEntry {
   /** Headless outbound OAuth (SBS-524). Present = this server uses the
    * client-credentials flow instead of the interactive browser one. */
   clientCredentials?: ClientCredentials | null;
+  /** Total deadline for each HTTP request, in milliseconds. Unset = 30 seconds. */
+  requestTimeoutMs?: number | null;
 }
 
 /** Non-secret client-credentials config. The client SECRET is never here: it
