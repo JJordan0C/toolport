@@ -89,6 +89,11 @@ jobs:
             -w /build archlinux:base-devel bash -euc '
             pacman -Syu --noconfirm --needed archlinux-keyring namcap git > /dev/null
             useradd -m builder
+            # makepkg --syncdeps shells out to `sudo pacman`, and builder has no
+            # sudoers entry in the base image, so dependency installation fails
+            # with a bare "could not resolve all dependencies".
+            echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+            chmod 440 /etc/sudoers.d/builder
             cp /src/packaging/linux/native/PKGBUILD /build/
             chown -R builder /build /out
             sudo -u builder makepkg --noconfirm --nocheck --syncdeps
