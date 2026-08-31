@@ -178,7 +178,7 @@ jobs:
             -u "$(id -u):$(id -g)" \
             -v "$PWD/pkgout:/repo" \
             -w /repo archlinux:base \
-            repo-add toolport.db.tar.gz *.pkg.tar.zst
+            bash -c 'repo-add toolport.db.tar.gz *.pkg.tar.zst'
           # pacman fetches `toolport.db` and verifies `toolport.db.sig`, so each
           # database needs a detached signature under the name clients request.
           cd pkgout
