@@ -70,9 +70,8 @@ One-time setup and how to publish by hand are in
 is deliberately NOT checked in: it pins one release's checksum, so a tracked copy
 would only ever be stale.
 
-Publishing is also when the **Homebrew tap** must be bumped. There is no
-workflow for this next to `winget.yml` (SBS-260 is the backlog for automating
-it). `brew install --cask tsouth89/toolport/toolport` and
+Publishing is also when the **Homebrew tap** is bumped, and that is now
+automatic. `brew install --cask tsouth89/toolport/toolport` and
 `brew upgrade --cask toolport` install the version + sha256 pinned in
 [`tsouth89/homebrew-toolport`](https://github.com/tsouth89/homebrew-toolport)
 `Casks/toolport.rb`. The `livecheck` / `github_latest` block in that cask only
@@ -80,35 +79,29 @@ feeds `brew livecheck`; it does not move the pin. The copy at
 `packaging/homebrew/toolport.rb` in this repo is a snapshot `brew install` does
 not read.
 
-After the GitHub release is **published** (the `.dmg` URLs 404 while the
-release is still a draft, same reason `winget.yml` waits for `released`):
+That tap's own `bump.yml` workflow tracks the latest published release, computes
+both digests from the DMGs GitHub actually serves, and commits the result. It
+runs every six hours, so it lands on its own; to have it immediately after a
+release, dispatch it:
 
 ```bash
-# Hashes must come from the published assets. Do not reuse the previous
-# release's sha256, and do not invent one. Verified for v1.14.0: GitHub's
-# asset digest matched shasum of the downloaded dmgs. --clobber prevents
-# versionless files left by an earlier run from being reused.
-gh release download vX.Y.Z --repo tsouth89/toolport --pattern 'Toolport_*apple-darwin.dmg' --clobber
-shasum -a 256 Toolport_aarch64-apple-darwin.dmg Toolport_x86_64-apple-darwin.dmg
+gh workflow run bump.yml --repo tsouth89/homebrew-toolport
 ```
 
-Then in `tsouth89/homebrew-toolport` `Casks/toolport.rb` (and the snapshot
-here):
+It is a no-op when the cask already matches, and it only ever tracks
+`releases/latest`, which excludes drafts and prereleases. It lives in the tap
+rather than beside `winget.yml` because that repo's own `GITHUB_TOKEN` can write
+to it, where a workflow here would need a cross-repo token.
 
-1. Set `version` to the tag without the `v`.
-2. Set the `on_arm` sha256 to the `Toolport_aarch64-apple-darwin.dmg` digest.
-3. Set the `on_intel` sha256 to the `Toolport_x86_64-apple-darwin.dmg` digest.
-4. Keep both zap roots: `~/Library/Application Support/Conduit` (legacy
-   installs that have not migrated) and `~/Library/Application Support/Toolport`
-   (current `data_dir_leaf_name` in `src-tauri/src/brand.rs`). Cache/pref zap
-   paths stay `com.tsout.conduit` because the bundle id is intentionally
-   unchanged.
-5. Open a PR on the tap. `brew install` keeps serving the old pin until that
-   change is on the tap's default branch.
+Do not hand-edit the tap's version or sha256. The url interpolates `version`, so
+changing the version alone repoints every download at new artifacts while the
+old digests stay behind, and brew then rejects the file it just downloaded. That
+is the exact failure the workflow exists to prevent.
 
-`src/test/homebrew-cask.test.ts` fails CI if the in-repo snapshot version
-drifts from `package.json`, so a release bump that skips this file is loud.
-It cannot see the live tap; that is this checklist.
+The snapshot at `packaging/homebrew/toolport.rb` is still updated by hand at
+release time; `src/test/homebrew-cask.test.ts` fails CI if its version drifts
+from `package.json`, so skipping it is loud. Its checksums are cosmetic (nothing
+installs from it), but keep them honest by copying what the tap landed.
 
 The **gateway container image** (`ghcr.io/tsouth89/toolport-gateway`) publishes
 separately on every push to `main` via `docker-publish.yml` — no tag required.

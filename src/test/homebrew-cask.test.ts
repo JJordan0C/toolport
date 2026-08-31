@@ -53,10 +53,15 @@ describe("homebrew cask snapshot (packaging/homebrew/toolport.rb)", () => {
 });
 
 describe("RELEASING.md Homebrew tap step", () => {
-  it("names the live tap and the hash-from-assets checklist", () => {
+  it("names the live tap and the workflow that bumps it", () => {
+    // The hashing used to be a manual `shasum` step here. It is now the tap's
+    // own bump.yml, which computes both digests from the published DMGs; this
+    // guards that the doc keeps pointing at the real mechanism.
     expect(releasing).toContain("tsouth89/homebrew-toolport");
     expect(releasing).toContain("Casks/toolport.rb");
-    expect(releasing).toContain("shasum -a 256");
-    expect(releasing).toContain("Toolport_*apple-darwin.dmg");
+    expect(releasing).toContain("bump.yml");
+    expect(releasing).toContain(
+      "gh workflow run bump.yml --repo tsouth89/homebrew-toolport",
+    );
   });
 });
