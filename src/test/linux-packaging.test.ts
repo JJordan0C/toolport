@@ -405,13 +405,12 @@ describe("the AUR package ships to Arch", () => {
   });
 });
 
-describe("install.sh installs the AppImage on Arch", () => {
+describe("install.sh installs the pacman package on Arch", () => {
   const installer = read("scripts", "install.sh");
 
   it("does not reach for an AUR helper on the user's behalf", () => {
-    // The AppImage works on Mesa as of 1.16.0, so the AUR detour is gone. It
-    // mattered most under `curl ... | bash`, where a helper's PKGBUILD review
-    // prompt reads stdin - which IS the rest of this script.
+    // It mattered most under `curl ... | bash`, where a helper's PKGBUILD
+    // review prompt reads stdin - which IS the rest of this script.
     for (const helper of ["paru", "yay", "pamac", "pikaur", "trizen"]) {
       expect(installer).not.toMatch(new RegExp(`^\\s*"?\\$?${helper}\\b.*-S`, "m"));
     }
@@ -419,21 +418,37 @@ describe("install.sh installs the AppImage on Arch", () => {
     expect(installer).not.toContain("--skipreview");
   });
 
-  it("still points Arch users at toolport-bin if they want a package", () => {
-    expect(installer).toContain("command -v pacman");
-    expect(installer).toContain("toolport-bin");
+  it("adds the signed repository and installs the package", () => {
+    expect(installer).toContain("install_arch_repo");
+    expect(installer).toContain("[toolport]");
+    expect(installer).toContain("pacman-key --lsign-key");
+    expect(installer).toMatch(/pacman -Sy .*\btoolport\b/);
   });
 
-  it("falls through to the AppImage install", () => {
-    const arch = installer.slice(installer.indexOf("command -v pacman"));
-    expect(arch).toContain("Installed the AppImage");
+  it("pins the signing key instead of trusting whatever the URL serves", () => {
+    // --lsign-key only trusts the fingerprint it is handed, so a key swapped at
+    // the host cannot become trusted. The pin is what makes that true.
+    expect(installer).toMatch(/^REPO_SIGNING_KEY="[A-F0-9]{40}"$/m);
+    expect(installer).toContain('--lsign-key "$repo_key_id"');
+  });
+
+  it("detects Arch from os-release, not from pacman being present", () => {
+    // A Debian box can have pacman installed; os-release is the honest signal,
+    // and ID_LIKE is what catches Omarchy, EndeavourOS and Manjaro.
+    expect(installer).toMatch(/\^\(ID\|ID_LIKE\)=.*arch/);
+  });
+
+  it("still falls through to the AppImage everywhere else", () => {
+    expect(installer).toContain("Installed the AppImage");
   });
 
   it("is covered by the bash installer tests, with pacman shimmed", () => {
     // Without the shim, running those tests on an Arch box would exercise the
     // host's real package manager mid-test.
     const harness = read("scripts", "install.Tests.bash");
-    expect(harness).toContain('cat > "$shim_dir/pacman"');
+    expect(harness).toContain('cat > "$arch_shim/pacman"');
+    expect(harness).toContain('cat > "$arch_shim/pacman-key"');
     expect(harness).toContain("no AUR helper was invoked");
+    expect(harness).toContain("repository added to pacman.conf");
   });
 });
