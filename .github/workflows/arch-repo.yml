@@ -109,6 +109,10 @@ jobs:
               || { echo "::error::desktop entry missing from $pkg"; exit 1; }
             cp *.pkg.tar.zst /out/
           '
+          # The container chowns the mount to its own build user, so the runner
+          # loses write access to it and later steps cannot drop signatures
+          # alongside the packages.
+          sudo chown -R "$(id -u):$(id -g)" pkgout
           ls -la pkgout
 
       - name: Sign the package
