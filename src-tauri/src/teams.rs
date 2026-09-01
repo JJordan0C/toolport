@@ -1665,6 +1665,14 @@ fn team_server_export(reg: &Registry) -> Value {
                 })
                 .collect();
             let url = s.url.as_deref().map(crate::redact_url_userinfo);
+            // A command-bearing entry is executed locally even if its transport
+            // label says otherwise. Do not publish a remote-only setting that
+            // cannot affect that server.
+            let request_timeout_ms = if s.transport == "stdio" || s.command.is_some() {
+                None
+            } else {
+                s.request_timeout_ms
+            };
             serde_json::json!({
                 "id": s.id,
                 "name": s.name,
@@ -1674,7 +1682,7 @@ fn team_server_export(reg: &Registry) -> Value {
                 "url": url,
                 "env": s.env.iter().map(|e| serde_json::json!({ "key": e.key, "secret": e.secret })).collect::<Vec<_>>(),
                 "disabledTools": s.disabled_tools,
-                "requestTimeoutMs": s.request_timeout_ms,
+                "requestTimeoutMs": request_timeout_ms,
                 // Non-secret by construction: client id, method and scopes only.
                 // The client SECRET is vaulted per member and is never in this
                 // payload, so a teammate importing this gets a server that tells
@@ -2083,18 +2091,6 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
 
     let transport = str_field("transport").unwrap_or("stdio").to_string();
     let command = str_field("command").map(String::from);
-    let request_timeout_ms = match s.get("requestTimeoutMs").filter(|value| !value.is_null()) {
-        Some(value) => match value
-            .as_u64()
-            .and_then(|milliseconds| {
-                crate::registry::validate_request_timeout_ms(milliseconds).ok()
-            })
-        {
-            Some(milliseconds) => Some(milliseconds),
-            None => return TeamClass::Blocked,
-        },
-        None => None,
-    };
     let mut entry = ServerEntry {
         id,
         name: name.to_string(),
@@ -2110,7 +2106,7 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         // silently downgraded the member to interactive OAuth, which is exactly
         // what this flow exists to avoid; the secret is still theirs to add.
         client_credentials,
-        request_timeout_ms,
+        request_timeout_ms: None,
         unknown_fields: serde_json::Map::new(),
     };
 
@@ -2139,6 +2135,15 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
         return TeamClass::Blocked;
     }
     entry.url = Some(url.to_string());
+    entry.request_timeout_ms = match s.get("requestTimeoutMs").filter(|value| !value.is_null()) {
+        Some(value) => match value.as_u64().and_then(|milliseconds| {
+            crate::registry::validate_request_timeout_ms(milliseconds).ok()
+        }) {
+            Some(milliseconds) => Some(milliseconds),
+            None => return TeamClass::Blocked,
+        },
+        None => None,
+    };
     // Loopback / LAN (RFC1918) is a legit internal server, but require opt-in like stdio.
     if crate::oauth::host_is_private(&host) {
         return TeamClass::Review(entry);
@@ -3661,16 +3666,69 @@ mod tests {
             ),
             TeamClass::Blocked
         ));
-        match classify_team_server(
-            &server(crate::registry::MAX_REQUEST_TIMEOUT_MS),
-            "team:t1",
-        ) {
+        match classify_team_server(&server(crate::registry::MAX_REQUEST_TIMEOUT_MS), "team:t1") {
             TeamClass::Review(imported) | TeamClass::Ready(imported) => assert_eq!(
                 imported.request_timeout_ms,
                 Some(crate::registry::MAX_REQUEST_TIMEOUT_MS)
             ),
             _ => panic!("the maximum request timeout must be accepted"),
         }
+    }
+
+    #[test]
+    fn team_import_ignores_request_timeout_for_local_commands() {
+        for request_timeout_ms in [
+            Value::from(0),
+            Value::from("not-a-number"),
+            Value::from(crate::registry::MAX_REQUEST_TIMEOUT_MS + 1),
+        ] {
+            let server = serde_json::json!({
+                "id": "local",
+                "name": "Local",
+                "transport": "stdio",
+                "command": "local-server",
+                "requestTimeoutMs": request_timeout_ms,
+            });
+            match classify_team_server(&server, "team:t1") {
+                TeamClass::Review(imported) => assert_eq!(imported.request_timeout_ms, None),
+                _ => panic!("a local server must not be blocked by an irrelevant timeout"),
+            }
+        }
+
+        let command_bearing_http = serde_json::json!({
+            "id": "local-http",
+            "name": "Local HTTP wrapper",
+            "transport": "http",
+            "command": "local-server",
+            "url": "https://mcp.example.com/mcp",
+            "requestTimeoutMs": 0,
+        });
+        match classify_team_server(&command_bearing_http, "team:t1") {
+            TeamClass::Review(imported) => assert_eq!(imported.request_timeout_ms, None),
+            _ => panic!("command-bearing entries must use local-server semantics"),
+        }
+    }
+
+    #[test]
+    fn team_export_clears_request_timeout_for_local_commands() {
+        let mut reg = base_registry();
+        let server = reg
+            .servers
+            .iter_mut()
+            .find(|s| s.id == "mine")
+            .expect("fixture server");
+        server.request_timeout_ms = Some(crate::registry::MAX_REQUEST_TIMEOUT_MS + 1);
+
+        let exported = team_server_export(&reg);
+        let entry = exported
+            .as_array()
+            .and_then(|servers| {
+                servers
+                    .iter()
+                    .find(|server| server.get("id").and_then(Value::as_str) == Some("mine"))
+            })
+            .expect("the server must be exported");
+        assert_eq!(entry.get("requestTimeoutMs"), Some(&Value::Null));
     }
 
     #[test]

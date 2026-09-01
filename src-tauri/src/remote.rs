@@ -30,8 +30,9 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn request_timeout(server: &ServerEntry) -> Result<Duration, String> {
     match server.request_timeout_ms {
-        Some(milliseconds) => crate::registry::validate_request_timeout_ms(milliseconds)
-            .map(Duration::from_millis),
+        Some(milliseconds) => {
+            crate::registry::validate_request_timeout_ms(milliseconds).map(Duration::from_millis)
+        }
         None => Ok(DEFAULT_REQUEST_TIMEOUT),
     }
 }
@@ -875,13 +876,8 @@ fn authed_transport(
     // The resolver enforces the SSRF policy at connect time (DNS-rebind safe); it
     // mirrors `guard_connect_target`: link-local/metadata blocked for all, private
     // blocked only for untrusted-provenance servers.
-    let mut transport = HttpTransport::guarded_with_timeout(
-        url,
-        token,
-        refresh,
-        block_private,
-        request_timeout,
-    );
+    let mut transport =
+        HttpTransport::guarded_with_timeout(url, token, refresh, block_private, request_timeout);
     transport.set_scope_reauthorize(scope_reauthorize);
     // Declared per request only while the flow is actually in use, which is what
     // the extension requires. Keyed off vaulted state rather than registry config

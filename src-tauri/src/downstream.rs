@@ -9861,7 +9861,10 @@ mod tests {
             true,
         );
 
-        assert!(result.is_err(), "the delayed response must exceed the configured timeout");
+        assert!(
+            result.is_err(),
+            "the delayed response must exceed the configured timeout"
+        );
         assert!(
             started.elapsed() < Duration::from_millis(800),
             "the custom timeout was not applied: {:?}",
@@ -11726,14 +11729,10 @@ mod tests {
             }
         }
         transport.url = format!("http://127.0.0.1:{recovery_port}/");
-        transport.agent = super::guarded_agent_with_timeout(
-            false,
-            super::DEFAULT_HTTP_REQUEST_TIMEOUT,
-        );
-        transport.inline_agent = super::guarded_agent_with_timeout(
-            false,
-            super::DEFAULT_HTTP_REQUEST_TIMEOUT,
-        );
+        transport.agent =
+            super::guarded_agent_with_timeout(false, super::DEFAULT_HTTP_REQUEST_TIMEOUT);
+        transport.inline_agent =
+            super::guarded_agent_with_timeout(false, super::DEFAULT_HTTP_REQUEST_TIMEOUT);
         let result = transport
             .request("tools/call", json!({ "name": "after-cancel" }))
             .expect("restored transport accepts a fresh request");
