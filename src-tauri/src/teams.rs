@@ -1674,6 +1674,7 @@ fn team_server_export(reg: &Registry) -> Value {
                 "url": url,
                 "env": s.env.iter().map(|e| serde_json::json!({ "key": e.key, "secret": e.secret })).collect::<Vec<_>>(),
                 "disabledTools": s.disabled_tools,
+                "requestTimeoutMs": s.request_timeout_ms,
                 // Non-secret by construction: client id, method and scopes only.
                 // The client SECRET is vaulted per member and is never in this
                 // payload, so a teammate importing this gets a server that tells
@@ -2083,7 +2084,12 @@ fn classify_team_server(s: &Value, tag: &str) -> TeamClass {
     let transport = str_field("transport").unwrap_or("stdio").to_string();
     let command = str_field("command").map(String::from);
     let request_timeout_ms = match s.get("requestTimeoutMs").filter(|value| !value.is_null()) {
-        Some(value) => match value.as_u64().filter(|milliseconds| *milliseconds > 0) {
+        Some(value) => match value
+            .as_u64()
+            .and_then(|milliseconds| {
+                crate::registry::validate_request_timeout_ms(milliseconds).ok()
+            })
+        {
             Some(milliseconds) => Some(milliseconds),
             None => return TeamClass::Blocked,
         },
@@ -3597,6 +3603,73 @@ mod tests {
                 );
             }
             _ => panic!("expected the http server to import"),
+        }
+    }
+
+    #[test]
+    fn request_timeout_round_trips_through_team_import_and_export() {
+        let mut reg = base_registry();
+        let server = reg
+            .servers
+            .iter_mut()
+            .find(|s| s.id == "mine")
+            .expect("fixture server");
+        server.transport = "http".into();
+        server.command = None;
+        server.url = Some("https://mcp.example.com/mcp".into());
+        server.request_timeout_ms = Some(90_000);
+
+        let exported = team_server_export(&reg);
+        let entry = exported
+            .as_array()
+            .and_then(|servers| {
+                servers
+                    .iter()
+                    .find(|server| server.get("id").and_then(Value::as_str) == Some("mine"))
+            })
+            .expect("the server must be exported");
+        assert_eq!(entry.get("requestTimeoutMs"), Some(&Value::from(90_000)));
+
+        match classify_team_server(entry, "team:t1") {
+            TeamClass::Review(imported) | TeamClass::Ready(imported) => {
+                assert_eq!(imported.request_timeout_ms, Some(90_000));
+            }
+            _ => panic!("expected the http server to import"),
+        }
+    }
+
+    #[test]
+    fn team_import_enforces_request_timeout_bounds() {
+        let server = |request_timeout_ms| {
+            serde_json::json!({
+                "id": "s",
+                "name": "S",
+                "transport": "http",
+                "url": "https://mcp.example.com/mcp",
+                "requestTimeoutMs": request_timeout_ms,
+            })
+        };
+
+        assert!(matches!(
+            classify_team_server(&server(0), "team:t1"),
+            TeamClass::Blocked
+        ));
+        assert!(matches!(
+            classify_team_server(
+                &server(crate::registry::MAX_REQUEST_TIMEOUT_MS + 1),
+                "team:t1"
+            ),
+            TeamClass::Blocked
+        ));
+        match classify_team_server(
+            &server(crate::registry::MAX_REQUEST_TIMEOUT_MS),
+            "team:t1",
+        ) {
+            TeamClass::Review(imported) | TeamClass::Ready(imported) => assert_eq!(
+                imported.request_timeout_ms,
+                Some(crate::registry::MAX_REQUEST_TIMEOUT_MS)
+            ),
+            _ => panic!("the maximum request timeout must be accepted"),
         }
     }
 

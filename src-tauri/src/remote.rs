@@ -30,8 +30,8 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn request_timeout(server: &ServerEntry) -> Result<Duration, String> {
     match server.request_timeout_ms {
-        Some(0) => Err("requestTimeoutMs must be greater than zero".to_string()),
-        Some(milliseconds) => Ok(Duration::from_millis(milliseconds)),
+        Some(milliseconds) => crate::registry::validate_request_timeout_ms(milliseconds)
+            .map(Duration::from_millis),
         None => Ok(DEFAULT_REQUEST_TIMEOUT),
     }
 }
@@ -1480,6 +1480,21 @@ mod tests {
         assert_eq!(
             request_timeout(&server).unwrap_err(),
             "requestTimeoutMs must be greater than zero"
+        );
+
+        server.request_timeout_ms = Some(crate::registry::MAX_REQUEST_TIMEOUT_MS);
+        assert_eq!(
+            request_timeout(&server).unwrap(),
+            Duration::from_millis(crate::registry::MAX_REQUEST_TIMEOUT_MS)
+        );
+
+        server.request_timeout_ms = Some(crate::registry::MAX_REQUEST_TIMEOUT_MS + 1);
+        assert_eq!(
+            request_timeout(&server).unwrap_err(),
+            format!(
+                "requestTimeoutMs must not exceed {} (24 hours)",
+                crate::registry::MAX_REQUEST_TIMEOUT_MS
+            )
         );
     }
 
